@@ -269,15 +269,62 @@ All robot-mode responses are pure JSON on stdout:
 
 ### Hook Mode vs Robot Mode
 
-**Hook mode** (default when no subcommand) follows the Claude Code protocol:
-- Always exits 0 (hook protocol requirement)
-- JSON on stdout for denials, empty for allows
-- Rich output on stderr for human visibility
+**Hook mode** (default when no subcommand) follows the active hook protocol:
+- Claude Code, Gemini CLI, Copilot CLI, and compatible JSON-hook protocols emit
+  JSON on stdout for denials and empty stdout for allows.
+- Codex CLI 0.125.0+ uses strict hook parsing, so dcg denies with exit code 2
+  and a stderr reason instead of stdout JSON.
+- Rich output always goes to stderr for human visibility.
 
 **Robot mode** with subcommands uses standardized exit codes:
 - Exit 1 for denials (allows scripting with `$?`)
 - Pure JSON on stdout
 - Silent stderr
+
+## Rich Output and Agent Compatibility
+
+dcg keeps agent-facing output and human-facing output on separate streams. This
+is the compatibility contract for rich terminal formatting.
+
+| Stream | Purpose | Hook-mode content | Robot-mode content |
+|--------|---------|-------------------|--------------------|
+| stdout | Agent and script parsing | Protocol JSON for JSON-hook denials, empty for allows, empty for Codex denies | JSON only |
+| stderr | Human-visible diagnostics | Rich or plain text warning boxes and Codex deny reasons | Silent |
+
+Rich output is display-only. It must never be parsed by agents and must never be
+written to stdout. When dcg prints Unicode boxes, colors, highlighted commands,
+or suggestion panels, that output belongs on stderr.
+
+### Rich Output Selection
+
+dcg uses rich terminal formatting only when the runtime is suitable. It falls
+back to plain output when any of these controls are active:
+
+| Control | Effect |
+|---------|--------|
+| `DCG_NO_RICH=1` | Disable rich formatting while keeping normal command behavior |
+| `--legacy-output` or `DCG_LEGACY_OUTPUT=1` | Force legacy/plain rendering paths |
+| `NO_COLOR=1` or `DCG_NO_COLOR=1` | Disable colorized output |
+| `TERM=dumb` | Use dumb-terminal-safe output |
+| `CI=1` | Suppress rich interactive formatting in CI |
+| non-TTY stdout | Prefer plain output for pipeline-friendly behavior |
+| `--robot` or `DCG_ROBOT=1` | Emit machine-readable stdout and keep stderr silent |
+
+### Wrapper Guidance
+
+Agent wrappers should choose the interface that matches their parser:
+
+```bash
+# Hook integration: preserve both streams.
+dcg < hook-input.json >hook-stdout.json 2>human-warning.txt
+
+# Scripting integration: use robot mode and parse stdout only.
+dcg --robot test "rm -rf /" >decision.json 2>/dev/null
+```
+
+For Codex hook integrations, treat exit code 2 plus non-empty stderr as a deny.
+For Claude-compatible JSON hook integrations, parse stdout when it is non-empty
+and treat empty stdout as allow.
 
 ### Example: Agent Integration
 
