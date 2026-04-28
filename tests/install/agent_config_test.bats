@@ -640,6 +640,21 @@ log_codex_hooks_transition() {
     log_test "Codex hooks after: $(cat "$CODEX_SETTINGS" 2>/dev/null || echo 'missing')"
 }
 
+codex_post_tool_use_json() {
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    python3 - "$CODEX_SETTINGS" <<'PYEOF'
+import json
+import sys
+
+with open(sys.argv[1], "r") as f:
+    config = json.load(f)
+
+post_tool_use = config.get("hooks", {}).get("PostToolUse")
+print(json.dumps(post_tool_use, sort_keys=True, separators=(",", ":")))
+PYEOF
+}
+
 @test "configure_codex: skips when not installed" {
     log_test "Testing Codex detection when not installed..."
 
@@ -847,6 +862,185 @@ EOF
     if grep -q "$DEST/dcg" "$CODEX_SETTINGS"; then
         return 1
     fi
+}
+
+@test "configure_codex + unconfigure_codex: clean setup round-trips idempotently" {
+    log_test "Testing Codex clean install/uninstall repeated round trip..."
+
+    setup_mock_codex
+
+    configure_codex
+    log_test "First CODEX_STATUS: $CODEX_STATUS"
+    log_codex_hooks_transition
+
+    [ "$CODEX_STATUS" = "created" ]
+    assert_codex_hooks_has_current_dcg
+    assert_codex_first_bash_hook_command "$DEST/dcg"
+
+    run unconfigure_codex
+    log_test "First unconfigure status: $status"
+    log_test "First unconfigure output: $output"
+    log_codex_hooks_transition
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"removed"* ]]
+    assert_codex_hooks_deleted
+
+    configure_codex
+    log_test "Second CODEX_STATUS: $CODEX_STATUS"
+    log_codex_hooks_transition
+
+    [ "$CODEX_STATUS" = "created" ]
+    assert_codex_hooks_has_current_dcg
+    assert_codex_first_bash_hook_command "$DEST/dcg"
+
+    configure_codex
+    log_test "Third CODEX_STATUS: $CODEX_STATUS"
+    log_codex_hooks_transition
+
+    [ "$CODEX_STATUS" = "already" ]
+    assert_codex_hooks_has_current_dcg
+
+    local dcg_count
+    dcg_count=$(grep -oF "$DEST/dcg" "$CODEX_SETTINGS" | wc -l)
+    [ "$dcg_count" -eq 1 ]
+
+    run unconfigure_codex
+    log_test "Second unconfigure status: $status"
+    log_test "Second unconfigure output: $output"
+    log_codex_hooks_transition
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"removed"* ]]
+    assert_codex_hooks_deleted
+
+    run unconfigure_codex
+    log_test "Extra unconfigure status: $status"
+    log_test "Extra unconfigure output: $output"
+    log_codex_hooks_transition
+
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    assert_codex_hooks_deleted
+}
+
+@test "configure_codex + unconfigure_codex: preserves atuin PostToolUse" {
+    log_test "Testing Codex install/uninstall preserves atuin PostToolUse..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_codex
+    cat > "$CODEX_SETTINGS" <<'EOF'
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {"type": "command", "command": "atuin history end"}
+        ]
+      }
+    ]
+  }
+}
+EOF
+
+    local before_post
+    before_post="$(codex_post_tool_use_json)"
+    log_test "Before PostToolUse: $before_post"
+
+    configure_codex
+    log_test "CODEX_STATUS: $CODEX_STATUS"
+    log_codex_hooks_transition
+
+    [ "$CODEX_STATUS" = "merged" ]
+    assert_codex_hooks_has_current_dcg
+    assert_codex_first_bash_hook_command "$DEST/dcg"
+
+    local after_install_post
+    after_install_post="$(codex_post_tool_use_json)"
+    log_test "After install PostToolUse: $after_install_post"
+    [ "$after_install_post" = "$before_post" ]
+
+    run unconfigure_codex
+    log_test "unconfigure_codex status: $status"
+    log_test "unconfigure_codex output: $output"
+    log_codex_hooks_transition
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"removed"* ]]
+    assert_codex_hooks_not_contains "$DEST/dcg"
+    assert_codex_hooks_contains "PostToolUse"
+    assert_codex_hooks_contains "atuin history end"
+
+    local after_uninstall_post
+    after_uninstall_post="$(codex_post_tool_use_json)"
+    log_test "After uninstall PostToolUse: $after_uninstall_post"
+    [ "$after_uninstall_post" = "$before_post" ]
+}
+
+@test "configure_codex + unconfigure_codex: replaces stale dcg path then removes it" {
+    log_test "Testing Codex stale path update followed by uninstall..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_codex
+    cat > "$CODEX_SETTINGS" <<'EOF'
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {"type": "command", "command": "/old/bin/dcg"}
+        ]
+      }
+    ]
+  }
+}
+EOF
+
+    configure_codex
+    log_test "CODEX_STATUS: $CODEX_STATUS"
+    log_codex_hooks_transition
+
+    [ "$CODEX_STATUS" = "merged" ]
+    assert_codex_hooks_has_current_dcg
+    assert_codex_first_bash_hook_command "$DEST/dcg"
+    assert_codex_hooks_not_contains "/old/bin/dcg"
+
+    run unconfigure_codex
+    log_test "unconfigure_codex status: $status"
+    log_test "unconfigure_codex output: $output"
+    log_codex_hooks_transition
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"removed"* ]]
+    assert_codex_hooks_deleted
+}
+
+@test "configure_codex + unconfigure_codex: malformed installed hooks do not panic" {
+    log_test "Testing Codex uninstall after installed hooks become malformed..."
+
+    setup_mock_codex
+
+    configure_codex
+    log_test "CODEX_STATUS: $CODEX_STATUS"
+    log_codex_hooks_transition
+
+    [ "$CODEX_STATUS" = "created" ]
+    assert_codex_hooks_has_current_dcg
+
+    printf '%s\n' '{"command": "dcg",' > "$CODEX_SETTINGS"
+    save_codex_hooks_snapshot
+
+    run unconfigure_codex
+    log_test "unconfigure_codex status: $status"
+    log_test "unconfigure_codex output: $output"
+    log_codex_hooks_transition
+
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    [[ "$output" != *"Traceback"* ]]
+    assert_codex_hooks_unchanged
 }
 
 @test "unconfigure_codex: deletes hooks.json when only dcg is present" {
