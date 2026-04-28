@@ -272,7 +272,7 @@ JSON Input → Parse → Quick Reject (memchr) → Normalize → Safe Patterns �
 | `Cargo.toml` | Dependencies and release optimizations |
 | `build.rs` | Build script for version metadata (vergen) |
 | `rust-toolchain.toml` | Nightly toolchain requirement |
-| `scripts/e2e_test.sh` | End-to-end test script (120 tests) |
+| `scripts/e2e_test.sh` | End-to-end test script (hundreds of command scenarios) |
 
 ### Output Style
 

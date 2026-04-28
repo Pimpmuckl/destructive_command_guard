@@ -22,7 +22,7 @@ enabled = ["kubernetes", "database", "containers"]
 | [cloud](cloud.md) | 3 | AWS CLI, Google Cloud SDK, Azure CLI |
 | [containers](containers.md) | 3 | Docker, Docker Compose, Podman |
 | [core](core.md) | 2 | Core Git, Core Filesystem |
-| [database](database.md) | 5 | PostgreSQL, MySQL/MariaDB, MongoDB, ... |
+| [database](database.md) | 6 | PostgreSQL, MySQL/MariaDB, MongoDB, ... |
 | [dns](dns.md) | 3 | Cloudflare DNS, AWS Route53, Generic DNS Tools |
 | [email](email.md) | 4 | AWS SES, SendGrid, Mailgun, ... |
 | [featureflags](featureflags.md) | 4 | Flipt, LaunchDarkly, Split.io, ... |

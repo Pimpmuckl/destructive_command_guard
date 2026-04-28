@@ -689,7 +689,7 @@ This project uses Rust Edition 2024 features and requires the nightly toolchain.
 # Install Rust nightly if you don't have it
 rustup install nightly
 
-# Install directly from GitHub (package name required due to workspace)
+# Install directly from GitHub
 cargo +nightly install --git https://github.com/Dicklesworthstone/destructive_command_guard destructive_command_guard
 ```
 
@@ -2171,7 +2171,7 @@ cargo tarpaulin --out Html
 
 ### End-to-End Testing
 
-The repository includes a comprehensive E2E test script with 120 test cases:
+The repository includes a comprehensive E2E test script with hundreds of command scenarios:
 
 ```bash
 # Run full E2E test suite
