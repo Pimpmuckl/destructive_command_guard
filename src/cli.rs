@@ -958,6 +958,13 @@ pub struct SuggestAllowlistCommand {
     /// Example: --apply 1,3,5
     #[arg(long, value_delimiter = ',')]
     pub apply: Option<Vec<usize>>,
+
+    /// Permit `--apply` to write suggestions whose safety decision is
+    /// `RequireConfirmation` (e.g. patterns that touch system paths). Without
+    /// this flag those suggestions are skipped to preserve the safety
+    /// gate normally enforced in interactive mode.
+    #[arg(long)]
+    pub accept_risk: bool,
 }
 
 /// Output format for suggest-allowlist command.
@@ -5855,6 +5862,16 @@ fn get_git_diff_files_at(
 ) -> Result<Vec<std::path::PathBuf>, Box<dyn std::error::Error>> {
     ensure_git_repo(cwd)?;
 
+    // SECURITY: `rev_range` is user-supplied (`--git-diff <rev>`). Without
+    // validation it is forwarded as a positional arg to `git diff`, which
+    // happily interprets values starting with `-` as flags. A value like
+    // `--output=/etc/dcg/allowlist.toml` redirects the diff into that
+    // file (clobbering it); `--ext-diff` activates external diff drivers
+    // from `.git/config` (arbitrary command execution if an attacker
+    // controls the repo's gitconfig). Reject anything that looks like a
+    // flag or contains shell metacharacters.
+    validate_git_rev_range(rev_range)?;
+
     let output = std::process::Command::new("git")
         .current_dir(cwd)
         .args([
@@ -5873,6 +5890,41 @@ fn get_git_diff_files_at(
     }
 
     Ok(parse_git_name_status_z(&output.stdout))
+}
+
+/// Reject `rev_range` values that could be misinterpreted by `git diff` as
+/// flags (anything starting with `-`) or that contain shell metacharacters
+/// (`\0`, `\n`, `\r`, whitespace, `;`, `&`, `|`, etc.). Legitimate git
+/// rev-ranges look like `HEAD~3..HEAD`, `main..feature`,
+/// `release/1.0..HEAD`, `v1.2.3...v2.0`, or a single ref like `HEAD@{1}`.
+///
+/// We do *not* reject every character forbidden by `git check-ref-format`;
+/// the goal is to block the unambiguous flag/injection cases, not to
+/// reproduce git's full refname grammar in here. If git itself rejects a
+/// legitimate-looking value the underlying error is surfaced normally.
+fn validate_git_rev_range(rev_range: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if rev_range.is_empty() {
+        return Err("--git-diff value is empty".into());
+    }
+    if rev_range.starts_with('-') {
+        return Err(format!(
+            "--git-diff value {rev_range:?} starts with '-' (would be parsed by git as a flag)"
+        )
+        .into());
+    }
+    for ch in rev_range.chars() {
+        let bad = matches!(
+            ch,
+            '\0' | '\n' | '\r' | ' ' | '\t' | ';' | '&' | '|' | '`' | '$' | '<' | '>' | '(' | ')'
+        );
+        if bad {
+            return Err(format!(
+                "--git-diff value {rev_range:?} contains a disallowed character ({ch:?})"
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 fn ensure_git_repo(cwd: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -7623,7 +7675,7 @@ fn handle_suggest_allowlist_command(
 
     // --apply mode: apply specific suggestions by 1-based index, non-interactively
     if let Some(ref indices) = cmd.apply {
-        apply_suggestions_by_index(&suggestions, indices, &db);
+        apply_suggestions_by_index(&suggestions, indices, &db, cmd.accept_risk);
         return Ok(());
     }
 
@@ -7977,10 +8029,17 @@ fn output_suggestions_interactive(
 }
 
 /// Apply suggestions by 1-based index without interactive prompts.
+///
+/// `accept_risk` opts into writing suggestions whose `safety` decision is
+/// `RequireConfirmation`. Without it, those entries are skipped — interactive
+/// mode would have prompted for explicit confirmation, and `--apply` must not
+/// silently bypass that gate. `NeverSuggest` entries are already removed by
+/// `filter_suggestions_for_safety`, so they never reach this function.
 fn apply_suggestions_by_index(
     suggestions: &[AllowlistSuggestion],
     indices: &[usize],
     db: &HistoryDb,
+    accept_risk: bool,
 ) {
     let working_dir = std::env::current_dir()
         .ok()
@@ -8001,6 +8060,40 @@ fn apply_suggestions_by_index(
 
         let suggestion = &suggestions[idx - 1];
         let cluster = &suggestion.cluster;
+
+        if suggestion.safety.requires_confirmation() && !accept_risk {
+            let safety_reason = suggestion
+                .safety
+                .reason()
+                .unwrap_or("requires explicit confirmation");
+            eprintln!(
+                "[{idx}] Skipped (safety): {} — {safety_reason}. Re-run with --accept-risk to apply.",
+                cluster.proposed_pattern
+            );
+            let audit_entry = SuggestionAuditEntry {
+                timestamp: Utc::now(),
+                action: SuggestionAction::Rejected,
+                pattern: cluster.proposed_pattern.clone(),
+                final_pattern: None,
+                risk_level: suggestion.risk.as_str().to_string(),
+                risk_score: suggestion.risk.score(),
+                confidence_tier: suggestion.confidence.as_str().to_string(),
+                confidence_points: match suggestion.confidence {
+                    ConfidenceTier::High => 3,
+                    ConfidenceTier::Medium => 2,
+                    ConfidenceTier::Low => 1,
+                },
+                cluster_frequency: cluster.frequency,
+                unique_variants: cluster.unique_count,
+                sample_commands: serde_json::to_string(&cluster.commands).unwrap_or_default(),
+                rule_id: None,
+                session_id: None,
+                working_dir: working_dir.clone(),
+            };
+            let _ = db.log_suggestion_audit(&audit_entry);
+            skipped += 1;
+            continue;
+        }
 
         let reason = format!(
             "Auto-suggested ({} confidence, {} risk): {}",

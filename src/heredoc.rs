@@ -2067,6 +2067,21 @@ fn extract_heredoc_body(
                     .collect::<Vec<_>>()
                     .join("\n"),
                 HeredocType::IndentStripped => {
+                    // Compute the common leading-whitespace prefix in BYTES
+                    // and then walk each line back to a char boundary
+                    // before slicing. The naive `&l[min_indent..]` slice
+                    // panics when a line's `min_indent`-th byte falls in
+                    // the middle of a multi-byte UTF-8 codepoint — which
+                    // happens when one line uses ASCII spaces while
+                    // another uses a multi-byte whitespace such as NBSP
+                    // (`\u{00A0}`, 2 bytes) or the ideographic space
+                    // (`\u{3000}`, 3 bytes). Under `panic = "abort"` (the
+                    // release profile) such a panic crashes the hook
+                    // process, which AGENTS.md forbids — the hook must
+                    // fail open. If the boundary doesn't line up we fall
+                    // back to `trim_start()` for that line, which is the
+                    // conservative interpretation (strip ALL of its
+                    // leading whitespace).
                     let min_indent = body_lines
                         .iter()
                         .filter(|l| !l.trim().is_empty())
@@ -2077,7 +2092,7 @@ fn extract_heredoc_body(
                     body_lines
                         .iter()
                         .map(|l| {
-                            if l.len() >= min_indent {
+                            if l.len() >= min_indent && l.is_char_boundary(min_indent) {
                                 &l[min_indent..]
                             } else {
                                 l.trim_start()
@@ -2707,6 +2722,45 @@ mod tests {
                 assert_eq!(contents[0].heredoc_type, Some(HeredocType::IndentStripped));
             } else {
                 panic!("Expected Extracted result, got {result:?}");
+            }
+        }
+
+        #[test]
+        fn indent_stripped_heredoc_does_not_panic_on_multibyte_whitespace() {
+            // Regression: <<~ stripped `min_indent` BYTES off each line.
+            // If one line uses ASCII spaces (1 byte each) and another uses
+            // a multi-byte whitespace char (NBSP = 2 bytes, U+3000 = 3
+            // bytes), the byte offset can land in the middle of a UTF-8
+            // codepoint and panic the slice. Under release `panic = "abort"`
+            // that crashes the hook process — a fail-open violation.
+            //
+            // Each of these inputs would previously have triggered a
+            // `byte index N is not a char boundary` panic; after the fix
+            // they all extract successfully (with the conservative
+            // fallback of `trim_start()` on lines whose byte offset
+            // doesn't align to a char boundary).
+            let cases: &[&str] = &[
+                // ASCII line + NBSP-prefixed line. min_indent in bytes
+                // would be 2 (NBSP); slicing the 4-space line at byte 2
+                // is char-aligned so this case is safe — but the
+                // ideographic-space variant below is not.
+                "cat <<~ EOF\n  line1\n\u{00A0}line2\n  EOF",
+                // ASCII + ideographic space. U+3000 is 3 bytes; min_indent
+                // could be 2 (the ASCII line) and slicing `\u{3000}f` at
+                // byte 2 lands inside the codepoint.
+                "cat <<~ EOF\n  line1\n\u{3000}foo\n  EOF",
+                // Two multi-byte whitespace lines with different sequence
+                // lengths. min_indent picks the shorter byte-count; the
+                // longer-prefixed line's byte offset misaligns.
+                "cat <<~ EOF\n\u{00A0}line1\n\u{3000}line2\nEOF",
+            ];
+            for cmd in cases {
+                let result = extract_content(cmd, &ExtractionLimits::default());
+                // Whether content is "Extracted" or "NoContent" depends on
+                // what the upstream parser did; the only invariant we care
+                // about is "no panic, returns a value." Using a method
+                // call ensures we touch the result.
+                let _ = format!("{result:?}");
             }
         }
 

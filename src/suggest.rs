@@ -688,15 +688,54 @@ fn contains_path_wildcard(pattern: &str) -> bool {
 }
 
 fn is_high_risk_destructive_pattern(normalized: &str) -> bool {
-    normalized.contains("reset --hard")
+    // Git destructive verbs.
+    if normalized.contains("reset --hard")
         || normalized.contains("clean -f")
         || normalized.contains("clean -fd")
         || normalized.contains("branch -d")
         || normalized.contains("push --force")
         || normalized.contains("push -f")
-        || normalized.contains("drop ")
+    {
+        return true;
+    }
+    // SQL destructive verbs (already lowercased by the caller).
+    if normalized.contains("drop ")
         || normalized.contains("truncate ")
         || normalized.contains("delete ")
+    {
+        return true;
+    }
+    // Infrastructure / cloud / orchestration destructive verbs. Without
+    // these, a high-frequency `kubectl delete namespace prod` or `terraform
+    // destroy` cluster passes the safety filter and is auto-suggested for
+    // allowlisting — defeating the entire point of the safety gate. The
+    // list is intentionally short and substring-based; the suggestion path
+    // already lower-cases input via `normalize_safety_scan_target`.
+    let infra_destructive = [
+        "kubectl delete",
+        "kubectl drain",
+        "helm uninstall",
+        "helm delete",
+        "terraform destroy",
+        "terraform apply -auto-approve",
+        "pulumi destroy",
+        "aws ec2 terminate-instances",
+        "aws rds delete-db-instance",
+        "aws s3 rm",
+        "aws s3api delete-bucket",
+        "gcloud compute instances delete",
+        "gcloud sql instances delete",
+        "gsutil rm -r",
+        "az vm delete",
+        "az group delete",
+        "docker system prune",
+        "docker volume prune",
+        "podman system prune",
+        "kubectl exec",
+    ];
+    infra_destructive
+        .iter()
+        .any(|verb| normalized.contains(verb))
 }
 
 /// Analyze working directories to find path patterns.
@@ -1771,6 +1810,35 @@ mod tests {
                 assert!(reason.contains("broad"));
             }
             other => panic!("expected never-suggest decision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn safety_filter_blocks_high_risk_infra_verbs() {
+        // Regression: is_high_risk_destructive_pattern used to only cover
+        // git/SQL verbs. A high-frequency `kubectl delete namespace prod`
+        // cluster could pass the safety filter and be auto-suggested for
+        // allowlisting — exactly the failure mode dcg exists to prevent.
+        let infra_destructive_patterns = [
+            r"^kubectl\s+delete\s+namespace\s+\w+$",
+            r"^kubectl\s+drain\s+\w+$",
+            r"^helm\s+uninstall\s+\w+$",
+            r"^terraform\s+destroy$",
+            r"^terraform\s+apply\s+-auto-approve$",
+            r"^pulumi\s+destroy$",
+            r"^aws\s+ec2\s+terminate-instances\s+--instance-ids\s+\w+$",
+            r"^aws\s+rds\s+delete-db-instance\s+--db-instance-identifier\s+\w+$",
+            r"^aws\s+s3\s+rm\s+s3://\w+\s+--recursive$",
+            r"^gcloud\s+compute\s+instances\s+delete\s+\w+$",
+            r"^az\s+vm\s+delete\s+--name\s+\w+$",
+            r"^docker\s+system\s+prune\s+-a$",
+        ];
+        for pattern in infra_destructive_patterns {
+            let decision = check_suggestion_safety(pattern, RiskLevel::High);
+            assert!(
+                matches!(decision, SuggestionSafetyDecision::NeverSuggest { .. }),
+                "infra destructive pattern was NOT classified as NeverSuggest (would be auto-allowlisted!): {pattern} → {decision:?}"
+            );
         }
     }
 

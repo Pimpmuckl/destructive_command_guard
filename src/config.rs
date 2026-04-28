@@ -545,6 +545,17 @@ impl SeverityOverrides {
 }
 
 /// Configuration for the graduated response system.
+///
+/// `session_*` thresholds count occurrences in the current dcg process via
+/// [`crate::session`]. For shell hook usage (one process per `Bash` call),
+/// these effectively only ever reach `1`; they do escalate for long-lived
+/// callers like `dcg test`, the MCP server, or repeated CLI evaluations.
+///
+/// `history_soft_block` / `history_hard_block` / `history_window` are the
+/// cross-process thresholds backed by the history database. They are parsed
+/// and merged across config layers but are **not yet consulted** by
+/// [`crate::evaluator::determine_graduated_response`] — see the docstring
+/// there for the current scope and intended future wiring.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseConfig {
     #[serde(default)]
@@ -555,10 +566,16 @@ pub struct ResponseConfig {
     pub session_warning_count: u32,
     #[serde(default = "ResponseConfig::default_session_soft_block")]
     pub session_soft_block: u32,
+    /// Cross-session soft-block threshold (parsed from config; not yet wired
+    /// into the evaluator — see `ResponseConfig` docstring).
     #[serde(default = "ResponseConfig::default_history_soft_block")]
     pub history_soft_block: u32,
+    /// Cross-session hard-block threshold (parsed from config; not yet wired
+    /// into the evaluator — see `ResponseConfig` docstring).
     #[serde(default = "ResponseConfig::default_history_hard_block")]
     pub history_hard_block: u32,
+    /// Lookback window for history-backed thresholds (parsed from config;
+    /// not yet wired into the evaluator — see `ResponseConfig` docstring).
     #[serde(default = "ResponseConfig::default_history_window")]
     pub history_window: String,
     #[serde(default)]
@@ -2127,6 +2144,12 @@ impl GitAwarenessConfig {
     /// - Exact match: "main" matches "main"
     /// - Glob suffix: "release/*" matches "release/1.0", "release/2.0-beta"
     /// - Glob prefix: "*/hotfix" matches "team/hotfix"
+    ///
+    /// Important: glob patterns enforce a `/` boundary. `release/*` matches
+    /// `release/1.0` but NOT `release-rogue` or `releaseX` — without this
+    /// guard a malicious branch name could spoof a protected-branch glob and
+    /// inherit the strict policy of an unrelated branch family (or, worse,
+    /// dodge it via the relaxed-branches glob).
     fn branch_matches_pattern(branch: &str, pattern: &str) -> bool {
         if pattern == "*" {
             // Wildcard matches everything
@@ -2134,13 +2157,37 @@ impl GitAwarenessConfig {
         }
 
         if let Some(prefix) = pattern.strip_suffix("/*") {
-            // "release/*" pattern - matches anything starting with "release/"
-            return branch.starts_with(prefix) && branch.len() > prefix.len() + 1;
+            // `release/*` pattern: branch must start with `release/` and have
+            // at least one character after the slash. We re-add the `/` from
+            // the original pattern so a branch like `release-rogue` (no slash
+            // boundary) is correctly rejected.
+            if !branch.starts_with(prefix) {
+                return false;
+            }
+            let after_prefix = &branch[prefix.len()..];
+            return after_prefix.starts_with('/') && after_prefix.len() > 1;
         }
 
         if let Some(suffix) = pattern.strip_prefix("*/") {
-            // "*/hotfix" pattern - matches anything ending with "/hotfix"
-            return branch.ends_with(suffix) && branch.len() > suffix.len() + 1;
+            // `*/hotfix` pattern: branch must end with `/hotfix`, with a
+            // non-empty name before the slash (so `team/hotfix` matches but
+            // `/hotfix` and `team-hotfix` do not). The boundary check is the
+            // mirror of the prefix-glob branch above.
+            if !branch.ends_with(suffix) {
+                return false;
+            }
+            let before_suffix_len = branch.len() - suffix.len();
+            // Need at least two bytes before the suffix: one for the slash
+            // and at least one for the name segment (`x/hotfix` is the
+            // minimum legitimate match).
+            if before_suffix_len < 2 {
+                return false;
+            }
+            // Byte-safe: walk back one byte and confirm it's `/`. Branch
+            // names are ASCII per git's refname rules (no multi-byte
+            // separators), but we still index by bytes here to avoid any
+            // surprise slicing.
+            return branch.as_bytes()[before_suffix_len - 1] == b'/';
         }
 
         // Exact match
@@ -4066,6 +4113,76 @@ fn parse_timestamp_as_utc(value: &str) -> Option<DateTime<Utc>> {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    // ---------------------------------------------------------------------
+    // Branch glob regression tests for `GitAwarenessConfig::matches_any_pattern`
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn branch_glob_release_star_matches_only_with_slash_boundary() {
+        assert!(GitAwarenessConfig::branch_matches_pattern(
+            "release/1.0",
+            "release/*"
+        ));
+        assert!(GitAwarenessConfig::branch_matches_pattern(
+            "release/2.0-beta",
+            "release/*"
+        ));
+        // The bug this guards against: `release/*` used to match
+        // `release-rogue` because the boundary check was just
+        // `branch.len() > prefix.len() + 1` after stripping `/*`.
+        assert!(!GitAwarenessConfig::branch_matches_pattern(
+            "release-rogue",
+            "release/*"
+        ));
+        assert!(!GitAwarenessConfig::branch_matches_pattern(
+            "releaseX",
+            "release/*"
+        ));
+        assert!(!GitAwarenessConfig::branch_matches_pattern(
+            "release",
+            "release/*"
+        ));
+        assert!(!GitAwarenessConfig::branch_matches_pattern(
+            "release/",
+            "release/*"
+        ));
+    }
+
+    #[test]
+    fn branch_glob_star_hotfix_matches_only_with_slash_boundary() {
+        assert!(GitAwarenessConfig::branch_matches_pattern(
+            "team/hotfix",
+            "*/hotfix"
+        ));
+        assert!(GitAwarenessConfig::branch_matches_pattern(
+            "release/hotfix",
+            "*/hotfix"
+        ));
+        // Same bug class on the suffix glob side.
+        assert!(!GitAwarenessConfig::branch_matches_pattern(
+            "team-hotfix",
+            "*/hotfix"
+        ));
+        assert!(!GitAwarenessConfig::branch_matches_pattern(
+            "Xhotfix", "*/hotfix"
+        ));
+        assert!(!GitAwarenessConfig::branch_matches_pattern(
+            "hotfix", "*/hotfix"
+        ));
+        assert!(!GitAwarenessConfig::branch_matches_pattern(
+            "/hotfix", "*/hotfix"
+        ));
+    }
+
+    #[test]
+    fn branch_glob_exact_and_wildcard() {
+        assert!(GitAwarenessConfig::branch_matches_pattern("main", "main"));
+        assert!(!GitAwarenessConfig::branch_matches_pattern(
+            "mainline", "main"
+        ));
+        assert!(GitAwarenessConfig::branch_matches_pattern("anything", "*"));
+    }
 
     #[test]
     fn test_default_config() {

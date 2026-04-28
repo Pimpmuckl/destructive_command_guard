@@ -1131,6 +1131,17 @@ fn pattern_tree_node(pattern: &PackTreePattern, use_color: bool) -> TreeNode {
     TreeNode::new(label)
 }
 
+/// Maximum depth the recursive dependency tree renderer is allowed to descend.
+///
+/// External pack manifests are user-controlled YAML; without a bound, a long
+/// (or pathological) dependency chain `a -> b -> c -> ...` would recurse
+/// linearly and overflow the thread stack. The release profile uses
+/// `panic = "abort"`, so a stack overflow crashes the dcg process — a
+/// fail-open violation when triggered from a hook hot path. 32 levels is far
+/// deeper than any reasonable real-world pack hierarchy and keeps the
+/// renderer safe from adversarial inputs.
+const MAX_DEPENDENCY_TREE_DEPTH: usize = 32;
+
 /// Build a tree showing pack dependency relationships.
 #[must_use]
 pub fn pack_dependency_tree(items: &[DependencyTreeItem]) -> DcgTree {
@@ -1158,7 +1169,7 @@ pub fn pack_dependency_tree(items: &[DependencyTreeItem]) -> DcgTree {
         root = root.child(TreeNode::new("No dependencies to display").styled("[dim]"));
     } else {
         for item in roots {
-            root = root.child(dependency_root_node(item, &by_id, &mut Vec::new()));
+            root = root.child(dependency_root_node(item, &by_id, &mut Vec::new(), 0));
         }
     }
 
@@ -1169,12 +1180,22 @@ fn dependency_root_node<'a>(
     item: &'a DependencyTreeItem,
     by_id: &BTreeMap<&'a str, &'a DependencyTreeItem>,
     stack: &mut Vec<&'a str>,
+    depth: usize,
 ) -> TreeNode {
     stack.push(item.id.as_str());
     let mut node = TreeNode::new(format!("{} - {}", item.id, item.name)).styled("[cyan]");
 
-    for dependency in &item.dependencies {
-        node = node.child(dependency_edge_node(dependency, by_id, stack));
+    if depth >= MAX_DEPENDENCY_TREE_DEPTH {
+        node = node.child(
+            TreeNode::new(format!(
+                "... (depth limit {MAX_DEPENDENCY_TREE_DEPTH} reached)"
+            ))
+            .styled("[dim]"),
+        );
+    } else {
+        for dependency in &item.dependencies {
+            node = node.child(dependency_edge_node(dependency, by_id, stack, depth + 1));
+        }
     }
 
     stack.pop();
@@ -1185,9 +1206,17 @@ fn dependency_edge_node<'a>(
     dependency_id: &str,
     by_id: &BTreeMap<&'a str, &'a DependencyTreeItem>,
     stack: &mut Vec<&'a str>,
+    depth: usize,
 ) -> TreeNode {
     if stack.contains(&dependency_id) {
         return TreeNode::new(format!("extends {dependency_id} (cycle)")).styled("[red]");
+    }
+
+    if depth >= MAX_DEPENDENCY_TREE_DEPTH {
+        return TreeNode::new(format!(
+            "extends {dependency_id} (depth limit {MAX_DEPENDENCY_TREE_DEPTH} reached)"
+        ))
+        .styled("[dim]");
     }
 
     let Some(item) = by_id.get(dependency_id).copied() else {
@@ -1197,7 +1226,7 @@ fn dependency_edge_node<'a>(
     stack.push(item.id.as_str());
     let mut node = TreeNode::new(format!("extends {} - {}", item.id, item.name)).styled("[yellow]");
     for dependency in &item.dependencies {
-        node = node.child(dependency_edge_node(dependency, by_id, stack));
+        node = node.child(dependency_edge_node(dependency, by_id, stack, depth + 1));
     }
     stack.pop();
 
@@ -1722,6 +1751,36 @@ mod tests {
         assert!(output.contains("custom.pack - Custom Pack"));
         assert!(output.contains("extends core.filesystem - Filesystem"));
         assert!(output.contains("extends external.audit (missing)"));
+    }
+
+    #[test]
+    fn test_pack_dependency_tree_bounds_deep_chain() {
+        // External pack manifests are user-controlled YAML; without a
+        // depth bound a chain `a -> b -> c -> ... -> n` would recurse
+        // n times. The release profile uses `panic = "abort"`, so a stack
+        // overflow crashes dcg — a fail-open violation. This test feeds
+        // a 200-deep chain (well past MAX_DEPENDENCY_TREE_DEPTH = 32) and
+        // asserts the renderer terminates cleanly with a "depth limit"
+        // marker rather than overflowing the stack.
+        let mut items = Vec::new();
+        for i in 0..200 {
+            let id = format!("pack-{i:03}");
+            let next = format!("pack-{:03}", i + 1);
+            items.push(DependencyTreeItem::new(&id, &id).with_dependencies([next.as_str()]));
+        }
+        // Terminate the chain with a leaf (no dependencies).
+        items.push(DependencyTreeItem::new("pack-200", "pack-200"));
+
+        let lines = pack_dependency_tree(&items)
+            .guides(DcgTreeGuides::Ascii)
+            .render_plain();
+        let output = lines.join("\n");
+
+        assert!(output.contains("Pack Dependencies"));
+        assert!(
+            output.contains("depth limit"),
+            "expected depth-limit marker in output, got:\n{output}"
+        );
     }
 
     #[test]

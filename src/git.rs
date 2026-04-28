@@ -287,9 +287,10 @@ fn parse_head_content(head_content: &str) -> BranchInfo {
         return BranchInfo::DetachedHead(None);
     }
 
-    // It's a commit hash (detached HEAD)
-    // Validate it looks like a hash (40 hex chars for full, or shorter for abbreviated)
-    if trimmed.len() >= 7 && trimmed.len() <= 40 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+    // It's a commit hash (detached HEAD).
+    // Accept 7..=64 hex chars: 40 for SHA-1 (default), 64 for SHA-256 repos
+    // (`extensions.objectFormat = sha256`), and any abbreviated form between.
+    if trimmed.len() >= 7 && trimmed.len() <= 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
         // Return abbreviated hash (first 7 chars)
         let short_hash = if trimmed.len() > 7 {
             trimmed[..7].to_string()
@@ -299,8 +300,16 @@ fn parse_head_content(head_content: &str) -> BranchInfo {
         return BranchInfo::DetachedHead(Some(short_hash));
     }
 
-    // Couldn't parse HEAD - might be corrupted or unusual format
-    BranchInfo::NotGitRepo
+    // Couldn't parse HEAD as a symbolic ref or hex hash. We already proved
+    // `.git/HEAD` exists (the caller's `read_to_string` succeeded), so this
+    // IS a git repository — just one whose HEAD is in an unusual state
+    // (mid-rebase rewrite, packed refs we don't recognize, CRLF noise, an
+    // empty file mid-write, etc.). Returning `NotGitRepo` here would silently
+    // disable downstream branch-strictness policy (a fail-open relaxation
+    // of protection). `DetachedHead(None)` is the conservative classification
+    // — it preserves "this is a git repo" while indicating "no current
+    // branch known."
+    BranchInfo::DetachedHead(None)
 }
 
 /// Find the .git directory for a repository.
@@ -526,6 +535,48 @@ mod tests {
         assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
         let info = parse_head_content(hash);
         assert_eq!(info, BranchInfo::DetachedHead(Some("abc1234".to_string())));
+    }
+
+    #[test]
+    fn test_head_file_parsing_sha256_hash_is_detached_not_not_git_repo() {
+        // Repos using `extensions.objectFormat = sha256` store 64-hex-char
+        // commit hashes in HEAD. Before the fix the parser rejected
+        // anything > 40 chars and returned `NotGitRepo`, which silently
+        // disabled branch-strictness policy across every dcg invocation
+        // in such a repo (a fail-open relaxation of protection).
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(hash.len(), 64);
+        let info = parse_head_content(hash);
+        assert!(
+            matches!(info, BranchInfo::DetachedHead(Some(_))),
+            "SHA-256 HEAD should classify as DetachedHead, got {info:?}"
+        );
+        assert!(
+            info.is_in_git_repo(),
+            "SHA-256 HEAD must report is_in_git_repo() = true"
+        );
+    }
+
+    #[test]
+    fn test_head_file_parsing_unrecognized_content_falls_back_to_detached_not_not_git_repo() {
+        // The caller already proved `.git/HEAD` exists by reading it. If
+        // the content is not a symbolic ref and not hex (corrupted file,
+        // mid-write empty content, packed-refs symbolic line we don't yet
+        // support, CRLF noise...), fall back to `DetachedHead(None)` so
+        // downstream branch-strictness remains active. Returning
+        // `NotGitRepo` would silently disable protection on a real repo.
+        for unusual in [
+            "",                                  // empty file (mid-write race)
+            "not-a-hash-or-ref",                 // garbage
+            "ref: refs/something-weird/foo\r\n", // non-head ref with CRLF
+            "0123456789abcdefghij",              // looks hash-like but has non-hex char
+        ] {
+            let info = parse_head_content(unusual);
+            assert!(
+                info.is_in_git_repo(),
+                "unrecognized HEAD content must NOT be classified as NotGitRepo: input={unusual:?}, got {info:?}"
+            );
+        }
     }
 
     #[test]

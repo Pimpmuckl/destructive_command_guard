@@ -780,23 +780,79 @@ fn padding_for(text: &str, width: usize) -> String {
 }
 
 /// Strip ANSI escape codes from a string to get visible length.
+///
+/// Handles three sequence shapes:
+///
+/// - **CSI** (`ESC [ ...`): terminates on any byte in `0x40..=0x7E` (the
+///   "final byte" range that includes `m` for SGR, `K` for erase-line,
+///   `H` for cursor position, `J` for erase-display, etc.). The previous
+///   implementation only terminated on `m` and silently consumed the rest
+///   of the string when a non-SGR sequence (like `\x1b[K`) appeared,
+///   making downstream `padding_for` width calculations wrong and
+///   collapsing visible content into nothing.
+/// - **OSC** (`ESC ] ...`): terminates on `BEL` (`0x07`) or the two-byte
+///   ST sequence `ESC \\`. Used by hyperlink escapes (`\x1b]8;...\x1b\\text\x1b]8;;\x1b\\`).
+/// - **Two-byte ESC sequences** (`ESC <X>` where X is `0x40..=0x5F`):
+///   single-character terminator. Conservative fallback: drop the byte.
 #[cfg(not(feature = "rich-output"))]
 fn strip_ansi_codes(s: &str) -> String {
+    #[derive(Copy, Clone)]
+    enum State {
+        Normal,
+        EscOpen,   // saw ESC, awaiting next byte
+        Csi,       // inside ESC [ ... (terminator: 0x40..=0x7E)
+        Osc,       // inside ESC ] ... (terminator: BEL or ESC \)
+        OscWantSt, // inside OSC and just saw ESC, awaiting `\`
+    }
+
     let mut result = String::with_capacity(s.len());
-    let mut in_escape = false;
+    let mut state = State::Normal;
 
     for c in s.chars() {
-        if c == '\x1b' {
-            in_escape = true;
-            continue;
-        }
-        if in_escape {
-            if c == 'm' {
-                in_escape = false;
+        match state {
+            State::Normal => {
+                if c == '\x1b' {
+                    state = State::EscOpen;
+                } else {
+                    result.push(c);
+                }
             }
-            continue;
+            State::EscOpen => {
+                state = match c {
+                    '[' => State::Csi,
+                    ']' => State::Osc,
+                    // Other introducers (single-shift G2/G3, charset,
+                    // private-mode select, etc.) are 2-byte sequences;
+                    // dropping the byte is the conservative choice.
+                    _ => State::Normal,
+                };
+            }
+            State::Csi => {
+                let cp = c as u32;
+                // CSI sequences end on a byte in 0x40..=0x7E ("final byte").
+                if (0x40..=0x7E).contains(&cp) {
+                    state = State::Normal;
+                }
+                // Parameter and intermediate bytes (0x30..=0x3F, 0x20..=0x2F)
+                // are consumed silently.
+            }
+            State::Osc => {
+                if c == '\x07' {
+                    // BEL terminator
+                    state = State::Normal;
+                } else if c == '\x1b' {
+                    state = State::OscWantSt;
+                }
+            }
+            State::OscWantSt => {
+                state = if c == '\\' {
+                    State::Normal
+                } else {
+                    // Stray ESC inside OSC; treat as a new escape.
+                    State::EscOpen
+                };
+            }
         }
-        result.push(c);
     }
 
     result
@@ -1093,6 +1149,68 @@ mod tests {
         let stripped = strip_ansi_codes(with_codes);
 
         assert_eq!(stripped, "Red text and green");
+    }
+
+    #[test]
+    #[cfg(not(feature = "rich-output"))]
+    fn test_strip_ansi_codes_handles_non_sgr_csi_terminators() {
+        // Regression: the old implementation only terminated on `m`, so a
+        // non-SGR CSI like `\x1b[K` (erase-line) left in_escape stuck and
+        // silently consumed the rest of the string. With that bug,
+        // `padding_for` saw a much shorter "visible length" than reality
+        // and the rendered box border drifted off-screen.
+        let cases: &[(&str, &str, &str)] = &[
+            ("\x1b[Khello", "hello", "ESC [ K (erase line)"),
+            (
+                "before\x1b[2Jafter",
+                "beforeafter",
+                "ESC [ 2 J (erase display)",
+            ),
+            (
+                "before\x1b[1;2Hafter",
+                "beforeafter",
+                "ESC [ 1 ; 2 H (cursor position)",
+            ),
+            (
+                "\x1b[?25lhide cursor\x1b[?25h",
+                "hide cursor",
+                "DECSET / DECRST private mode",
+            ),
+        ];
+        for (input, expected, label) in cases {
+            assert_eq!(
+                strip_ansi_codes(input),
+                *expected,
+                "non-SGR sequence not stripped correctly ({label})"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "rich-output"))]
+    fn test_strip_ansi_codes_handles_osc_hyperlink() {
+        // OSC 8 hyperlinks: `\x1b]8;;URL\x1b\\TEXT\x1b]8;;\x1b\\`. The old
+        // implementation, looking only for `m`, would consume the entire
+        // tail past the first ESC and lose all the visible text.
+        let input = "\x1b]8;;https://example.com\x1b\\click here\x1b]8;;\x1b\\";
+        assert_eq!(strip_ansi_codes(input), "click here");
+
+        // BEL-terminated OSC variant.
+        let input = "\x1b]0;window title\x07visible text";
+        assert_eq!(strip_ansi_codes(input), "visible text");
+    }
+
+    #[test]
+    #[cfg(not(feature = "rich-output"))]
+    fn test_strip_ansi_codes_does_not_lose_text_after_truncated_escape() {
+        // A bare ESC followed by an incomplete sequence shouldn't eat the
+        // rest of the string. Two-byte ESC sequence (ESC followed by a
+        // single byte not in `[` or `]`) consumes exactly the next char
+        // and resumes normal output.
+        assert_eq!(strip_ansi_codes("foo\x1b=bar"), "foobar");
+        // A trailing ESC with nothing after it leaves us in EscOpen at end
+        // of input — no panic, just truncated.
+        assert_eq!(strip_ansi_codes("foo\x1b"), "foo");
     }
 
     #[test]

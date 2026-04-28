@@ -739,24 +739,61 @@ fn confidence_from_severity(pattern: &PatternMatch) -> Option<f64> {
     })
 }
 
-/// Strip ANSI escape codes from a string.
+/// Strip ANSI escape codes from a string. See `output::denial::strip_ansi_codes`
+/// for the rationale on why this needs to handle CSI/OSC/2-byte ESC sequences
+/// — the previous "terminate on `m`" logic dropped the rest of the string on
+/// any non-SGR sequence (erase-line, hyperlink, etc.).
 #[cfg(not(feature = "rich-output"))]
 fn strip_ansi_codes(s: &str) -> String {
+    #[derive(Copy, Clone)]
+    enum State {
+        Normal,
+        EscOpen,
+        Csi,
+        Osc,
+        OscWantSt,
+    }
+
     let mut result = String::with_capacity(s.len());
-    let mut in_escape = false;
+    let mut state = State::Normal;
 
     for c in s.chars() {
-        if c == '\x1b' {
-            in_escape = true;
-            continue;
-        }
-        if in_escape {
-            if c == 'm' {
-                in_escape = false;
+        match state {
+            State::Normal => {
+                if c == '\x1b' {
+                    state = State::EscOpen;
+                } else {
+                    result.push(c);
+                }
             }
-            continue;
+            State::EscOpen => {
+                state = match c {
+                    '[' => State::Csi,
+                    ']' => State::Osc,
+                    _ => State::Normal,
+                };
+            }
+            State::Csi => {
+                let cp = c as u32;
+                if (0x40..=0x7E).contains(&cp) {
+                    state = State::Normal;
+                }
+            }
+            State::Osc => {
+                if c == '\x07' {
+                    state = State::Normal;
+                } else if c == '\x1b' {
+                    state = State::OscWantSt;
+                }
+            }
+            State::OscWantSt => {
+                state = if c == '\\' {
+                    State::Normal
+                } else {
+                    State::EscOpen
+                };
+            }
         }
-        result.push(c);
     }
 
     result

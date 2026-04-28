@@ -914,6 +914,29 @@ impl BypassMethod {
 ///
 /// Uses the effective graduation mode for the given severity to decide thresholds.
 /// Returns `None` when graduation is disabled for this severity.
+///
+/// # Counter scope (important for hook usage)
+///
+/// `session_count` is sourced from [`crate::session::record_and_snapshot`],
+/// which lives in a process-local static. dcg runs as a fresh process per
+/// `Bash` hook invocation, so for hook callers `session_count` is effectively
+/// always `1`. Practical implications by mode:
+///
+/// - `Paranoid` / `WarningOnly`: behave as documented (threshold-free).
+/// - `Strict`: every hook invocation is a `SoftBlock`; `HardBlock` requires
+///   `session_soft_block` repetitions, which only occur in long-lived callers
+///   (`dcg test`, MCP server, repeated CLI evaluations within one process).
+/// - `Standard` / `Lenient`: the `Warning`/`SoftBlock` thresholds escalate
+///   only inside a single process. Cross-invocation escalation is governed
+///   by `history_soft_block` / `history_hard_block` / `history_window` in
+///   [`crate::config::ResponseConfig`], but those fields are not yet
+///   consulted here — wiring them in requires querying the history DB
+///   from the hook hot path and is tracked as future work.
+///
+/// Until history-backed escalation lands, treat `Standard`/`Lenient` as
+/// CLI-/MCP-oriented modes; for shell-hook integrations choose `Paranoid`,
+/// `WarningOnly`, or `Strict` depending on how strict a single occurrence
+/// should be.
 #[must_use]
 pub fn determine_graduated_response(
     session_count: u32,
@@ -940,7 +963,10 @@ pub fn determine_graduated_response(
             })
         }
         GraduationMode::Strict => {
-            // Strict: warn=1, soft_block=1 (immediate soft block), hard_block at session_soft_block.
+            // Strict: soft_block from the first occurrence, escalate to
+            // hard_block once `session_soft_block` is reached. There is no
+            // Warning level in Strict — every occurrence below the hard-block
+            // threshold is a SoftBlock so the user sees a deliberate gate.
             if session_count >= config.session_soft_block {
                 Some(GraduatedResponse::HardBlock {
                     total_occurrences: session_count,
@@ -1574,13 +1600,18 @@ pub fn evaluate_command_with_pack_order_deadline_at_path(
         return EvaluationResult::allowed();
     }
 
-    // Check exact command and prefix allowlists (reusing normalized from quick-reject)
-    // Use path-aware matching for context-aware allowlisting (Epic 5)
+    // Check exact command, prefix, and pattern allowlists (reusing normalized
+    // from quick-reject). Use path-aware matching for context-aware
+    // allowlisting (Epic 5). Pattern entries must additionally have
+    // `risk_acknowledged = true` (enforced inside the matcher's validity check).
     if allowlists
         .match_exact_command_at_path(&normalized, project_path)
         .is_some()
         || allowlists
             .match_command_prefix_at_path(&normalized, project_path)
+            .is_some()
+        || allowlists
+            .match_pattern_at_path(&normalized, project_path)
             .is_some()
     {
         return EvaluationResult::allowed();
