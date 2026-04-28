@@ -73,15 +73,33 @@ pub fn debug_capture<T: std::fmt::Debug>(name: &str, value: T) -> T {
 ///
 /// Returns any I/O error raised while creating the artifact directory or file.
 pub fn save_failure_artifact(test_name: &str, output: &str) -> std::io::Result<PathBuf> {
-    let path = PathBuf::from("target")
-        .join("test-artifacts")
-        .join(format!("{}.txt", sanitize_artifact_name(test_name)));
+    let file_name = format!(
+        "{}_{}.txt",
+        artifact_namespace(),
+        sanitize_artifact_name(test_name)
+    );
+    let artifact_root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("target"));
+    let path = artifact_root.join("test-artifacts").join(file_name);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&path, output)?;
     eprintln!("Saved failure artifact to: {}", path.display());
     Ok(path)
+}
+
+fn artifact_namespace() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.file_stem()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .map(|name| sanitize_artifact_name(&name))
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| format!("pid_{}", std::process::id()))
 }
 
 #[track_caller]
@@ -247,7 +265,10 @@ mod tests {
         )
         .expect("artifact should be written");
 
-        assert!(path.ends_with("common_logging_save_failure_artifact_writes_sanitized_path.txt"));
+        assert!(
+            path.to_string_lossy()
+                .ends_with("common_logging_save_failure_artifact_writes_sanitized_path.txt")
+        );
         let content = std::fs::read_to_string(path).expect("artifact should be readable");
         assert_eq!(content, "rendered output");
     }
