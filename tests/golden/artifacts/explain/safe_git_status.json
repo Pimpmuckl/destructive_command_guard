@@ -1,0 +1,31 @@
+{
+  "schema_version": 2,
+  "command": "git status --short",
+  "decision": "allow",
+  "total_duration_us": "<duration_us>",
+  "steps": [
+    {
+      "name": "full_evaluation",
+      "duration_us": "<duration_us>",
+      "details": {
+        "type": "keyword_gating",
+        "quick_rejected": true,
+        "keywords_checked": [
+          "/rm",
+          "DELETE",
+          "DROP",
+          "TRUNCATE",
+          "createdb",
+          "docker",
+          "dropdb",
+          "git",
+          "pg_dump",
+          "pg_restore",
+          "psql",
+          "rm"
+        ],
+        "first_match": null
+      }
+    }
+  ]
+}
