@@ -656,7 +656,8 @@ Runs on push to main only (benchmarks are noisy on PRs). Checks performance budg
 - Fast path: < 500us panic
 - Pattern match: < 1ms panic
 - Heredoc extract: < 2ms panic
-- Full pipeline: < 50ms panic
+- Full heredoc pipeline: < 20ms panic
+- Hook fail-open deadline: 200ms
 
 ### UBS Static Analysis
 

@@ -1679,19 +1679,21 @@ r"rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f"     // Complex but no lookahead
 
 ### Performance Budget System
 
-dcg operates under strict latency constraints—every Bash command passes through the hook, so even small delays compound into noticeable sluggishness. The performance budget system enforces these constraints with fail-open semantics.
+dcg operates under strict latency constraints - every Bash command passes through the hook, so even small delays compound into noticeable sluggishness. `src/perf.rs` is the source of truth for performance budgets, CI benchmark expectations, and hook-mode fail-open deadlines.
 
 **Latency Tiers**:
 
-| Tier | Stage | Target | Warning | Panic |
-|------|-------|--------|---------|-------|
-| 0 | Quick Reject | < 1μs | > 10μs | > 50μs |
-| 1 | Normalization | < 5μs | > 25μs | > 100μs |
-| 2 | Safe Pattern Check | < 50μs | > 200μs | > 500μs |
-| 3 | Destructive Pattern Check | < 50μs | > 200μs | > 500μs |
-| 4 | Heredoc Extraction | < 1ms | > 5ms | > 20ms |
-| 5 | Heredoc Evaluation | < 2ms | > 10ms | > 30ms |
-| 6 | Full Pipeline | < 5ms | > 15ms | > 50ms |
+| Tier | Path | Target | Warning Above | Panic Above |
+|------|------|--------|---------------|-------------|
+| 0 | Quick reject | < 1μs | > 5μs | > 50μs |
+| 1 | Fast path | < 75μs | > 150μs | > 500μs |
+| 2 | Pattern match | < 100μs | > 250μs | > 1ms |
+| 3 | Heredoc trigger | < 5μs | > 10μs | > 100μs |
+| 4 | Heredoc extract | < 200μs | > 500μs | > 2ms |
+| 5 | Language detect | < 20μs | > 50μs | > 200μs |
+| 6 | Full heredoc pipeline | < 5ms | > 15ms | > 20ms |
+
+Hook mode also has an absolute 200ms deadline. If that deadline is exhausted, expensive analysis fails open so dcg does not hang an interactive workflow.
 
 **Fail-Open Behavior**:
 
@@ -1710,16 +1712,10 @@ This design ensures that:
 **Budget Enforcement**:
 
 ```rust
-fn check_budget(tier: Tier, elapsed: Duration) -> BudgetResult {
-    let budget = TIER_BUDGETS[tier];
-    if elapsed > budget.panic {
-        log::warn!("Tier {} exceeded panic threshold", tier);
-        return BudgetResult::FailOpen;
-    }
-    if elapsed > budget.warning {
-        log::warn!("Tier {} exceeded warning threshold", tier);
-    }
-    BudgetResult::Continue
+let deadline = Deadline::fail_open_default();
+
+if deadline.is_exceeded() || !deadline.has_budget_for(&PATTERN_MATCH) {
+    return EvaluationResult::allowed_due_to_budget();
 }
 ```
 
@@ -1730,9 +1726,8 @@ Use `dcg explain --verbose` to see per-stage timing:
 ```
 Evaluation Trace:
   [  0.3μs] Tier 0: Quick reject (PASS - below 1μs target)
-  [  1.2μs] Tier 1: Normalize (PASS - below 5μs target)
-  [  8.7μs] Tier 2: Safe patterns (PASS - below 50μs target)
-  [ 15.2μs] Tier 3: Destructive patterns (PASS - below 50μs target)
+  [  8.7μs] Tier 1: Fast path (PASS - below 75μs target)
+  [ 15.2μs] Tier 2: Pattern match (PASS - below 100μs target)
   [ 15.4μs] Total: 15.4μs (PASS - below 5ms target)
 ```
 

@@ -140,4 +140,5 @@ jobs:
           echo "Key performance budgets:" >> $GITHUB_STEP_SUMMARY
           echo "- Quick reject: < 50μs (panic threshold)" >> $GITHUB_STEP_SUMMARY
           echo "- Fast path: < 500μs (panic threshold)" >> $GITHUB_STEP_SUMMARY
-          echo "- Full pipeline: < 50ms (panic threshold)" >> $GITHUB_STEP_SUMMARY
+          echo "- Full heredoc pipeline: < 20ms (panic threshold)" >> $GITHUB_STEP_SUMMARY
+          echo "- Hook fail-open deadline: 200ms" >> $GITHUB_STEP_SUMMARY

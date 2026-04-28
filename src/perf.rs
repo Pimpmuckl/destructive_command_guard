@@ -15,15 +15,15 @@
 //!
 //! # Performance Tiers
 //!
-//! | Tier | Path | Target | Warning | Panic |
-//! |------|------|--------|---------|-------|
-//! | 0 | Quick reject | < 1μs | < 5μs | > 50μs |
-//! | 1 | Fast path | < 75μs | < 150μs | > 500μs |
-//! | 2 | Pattern match | < 100μs | < 250μs | > 1ms |
-//! | 3 | Heredoc trigger | < 5μs | < 10μs | > 100μs |
-//! | 4 | Heredoc extract | < 200μs | < 500μs | > 2ms |
-//! | 5 | Language detect | < 20μs | < 50μs | > 200μs |
-//! | 6 | Full pipeline | < 5ms | < 15ms | > 20ms |
+//! | Tier | Path | Target | Warning Above | Panic Above |
+//! |------|------|--------|---------------|-------------|
+//! | 0 | Quick reject | < 1μs | > 5μs | > 50μs |
+//! | 1 | Fast path | < 75μs | > 150μs | > 500μs |
+//! | 2 | Pattern match | < 100μs | > 250μs | > 1ms |
+//! | 3 | Heredoc trigger | < 5μs | > 10μs | > 100μs |
+//! | 4 | Heredoc extract | < 200μs | > 500μs | > 2ms |
+//! | 5 | Language detect | < 20μs | > 50μs | > 200μs |
+//! | 6 | Full heredoc pipeline | < 5ms | > 15ms | > 20ms |
 //!
 //! # Absolute Maximum
 //!
@@ -300,8 +300,10 @@ pub fn should_fail_open(duration: Duration) -> bool {
 /// Commands exceeding this trigger CI failures.
 pub const FAST_PATH_BUDGET_US: u64 = 500;
 
-/// Slow path (heredoc) maximum budget in milliseconds (panic threshold).
-/// Operations exceeding this trigger fail-open behavior.
+/// Hook-mode slow path fail-open budget in milliseconds.
+///
+/// This mirrors the absolute hook deadline, not the Tier 6 benchmark panic
+/// threshold. Tier-specific heredoc budgets are defined above.
 pub const SLOW_PATH_BUDGET_MS: u64 = 200;
 
 /// Absolute maximum before fail-open (for documentation and config).
@@ -368,7 +370,7 @@ mod tests {
         // Heredoc trigger should be fast
         assert!(HEREDOC_TRIGGER.panic < HEREDOC_EXTRACT.target);
 
-        // Full pipeline should accommodate all components
+        // Full heredoc pipeline should accommodate all components
         assert!(FULL_HEREDOC_PIPELINE.panic >= HEREDOC_EXTRACT.panic);
     }
 
@@ -405,5 +407,76 @@ mod tests {
         assert!(deadline.has_budget_for(&small_budget));
         // Should not have budget for operations that take longer than the deadline
         assert!(!deadline.has_budget_for(&large_budget));
+    }
+
+    fn doc_duration(duration: Duration) -> String {
+        let micros = duration.as_micros();
+        if micros >= 1000 && micros.is_multiple_of(1000) {
+            format!("{}ms", micros / 1000)
+        } else {
+            format!("{micros}μs")
+        }
+    }
+
+    fn budget_row(tier: u8, path: &str, budget: Budget) -> String {
+        format!(
+            "| {tier} | {path} | < {} | > {} | > {} |",
+            doc_duration(budget.target),
+            doc_duration(budget.warning),
+            doc_duration(budget.panic)
+        )
+    }
+
+    #[test]
+    fn budget_documentation_matches_source_of_truth() {
+        let readme = include_str!("../README.md");
+        let agents = include_str!("../AGENTS.md");
+        let ci = include_str!("../.github/workflows/ci.yml");
+        let bench = include_str!("../.github/workflows/bench.yml");
+
+        for row in [
+            budget_row(0, "Quick reject", QUICK_REJECT),
+            budget_row(1, "Fast path", FAST_PATH),
+            budget_row(2, "Pattern match", PATTERN_MATCH),
+            budget_row(3, "Heredoc trigger", HEREDOC_TRIGGER),
+            budget_row(4, "Heredoc extract", HEREDOC_EXTRACT),
+            budget_row(5, "Language detect", LANGUAGE_DETECT),
+            budget_row(6, "Full heredoc pipeline", FULL_HEREDOC_PIPELINE),
+        ] {
+            assert!(
+                readme.contains(&row),
+                "README performance budget table drifted; missing row: {row}"
+            );
+        }
+
+        for expected in [
+            "- Quick reject: < 50us panic",
+            "- Fast path: < 500us panic",
+            "- Pattern match: < 1ms panic",
+            "- Heredoc extract: < 2ms panic",
+            "- Full heredoc pipeline: < 20ms panic",
+            "- Hook fail-open deadline: 200ms",
+        ] {
+            assert!(
+                agents.contains(expected),
+                "AGENTS.md benchmark budget prose drifted; missing: {expected}"
+            );
+        }
+
+        for expected in [
+            "# - Full heredoc pipeline: 20ms panic",
+            "# - Hook fail-open deadline: 200ms",
+            "Full heredoc pipeline benchmark exceeds 20ms budget",
+        ] {
+            assert!(
+                ci.contains(expected),
+                ".github/workflows/ci.yml budget prose drifted; missing: {expected}"
+            );
+        }
+
+        assert!(
+            bench.contains("- Full heredoc pipeline: < 20ms (panic threshold)"),
+            ".github/workflows/bench.yml budget prose drifted"
+        );
     }
 }

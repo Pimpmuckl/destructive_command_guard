@@ -489,21 +489,22 @@ jobs:
           # - Fast path: 500μs panic
           # - Pattern match: 1ms panic
           # - Heredoc extract: 2ms panic
-          # - Full pipeline: 50ms panic
+          # - Full heredoc pipeline: 20ms panic
+          # - Hook fail-open deadline: 200ms
           echo "## Performance Budget Check" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           PANIC_VIOLATIONS=0
 
-          # Check for any results exceeding 50ms (absolute max)
+          # Check for any results exceeding 1s (major benchmark sanity cap)
           if grep -E "time:.*\[.*[0-9]+\.[0-9]+ s" benchmark_output.txt; then
             echo "::error::Some benchmarks exceeded 1 second - major regression detected"
             PANIC_VIOLATIONS=$((PANIC_VIOLATIONS + 1))
           fi
 
-          # Check full_pipeline benchmarks (budget: 50ms panic)
-          if grep -A1 "full_pipeline" benchmark_output.txt | grep -E "time:.*\[.*[5-9][0-9]\.[0-9]+ ms|[0-9]{3,}\.[0-9]+ ms"; then
-            echo "::warning::Full pipeline benchmark exceeds 50ms budget"
+          # Check full_pipeline benchmarks (budget: 20ms panic)
+          if grep -A1 "full_pipeline" benchmark_output.txt | grep -E "time:.*\[.*([2-9][0-9]\.[0-9]+ ms|[0-9]{3,}\.[0-9]+ ms)"; then
+            echo "::warning::Full heredoc pipeline benchmark exceeds 20ms budget"
             PANIC_VIOLATIONS=$((PANIC_VIOLATIONS + 1))
           fi
 
