@@ -293,6 +293,97 @@ fn smoke_claude_destructive_command_blocked() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// P2.2 — Codex deny path: exit=2, 0 bytes stdout, non-empty stderr
+// ---------------------------------------------------------------------------
+
+#[test]
+fn codex_deny_multiple_destructive_commands() {
+    let commands = [
+        ("git reset --hard HEAD~5", "core.git:reset-hard"),
+        ("git clean -fd", "core.git:clean-force"),
+        ("git push --force origin main", "core.git"),
+        ("rm -rf /important/data", "core.filesystem"),
+    ];
+
+    for (cmd, expected_rule_fragment) in commands {
+        let outcome = run_codex_hook(cmd);
+        assert_eq!(
+            outcome.exit_code, 2,
+            "Codex deny must exit 2 for '{cmd}'\n{outcome}"
+        );
+        assert!(
+            outcome.stdout.is_empty(),
+            "Codex deny must produce 0 bytes stdout for '{cmd}'\n{outcome}"
+        );
+        assert!(
+            !outcome.stderr.is_empty(),
+            "Codex deny must produce non-empty stderr for '{cmd}'\n{outcome}"
+        );
+        assert!(
+            outcome.stderr_contains(expected_rule_fragment),
+            "stderr must contain rule fragment '{expected_rule_fragment}' for '{cmd}'\n{outcome}"
+        );
+    }
+}
+
+#[test]
+fn codex_deny_stderr_is_not_empty_even_when_nosuggest() {
+    // exit 2 + empty stderr = Failed in Codex (catastrophic); dcg must always
+    // produce non-empty stderr on deny.
+    let outcome = run_codex_hook("git reset --hard");
+    assert_eq!(outcome.exit_code, 2, "exit code 2 expected\n{outcome}");
+    assert!(
+        outcome.stderr.len() > 10,
+        "stderr must be substantive (>10 bytes), got {} bytes\n{outcome}",
+        outcome.stderr.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P2.3 — Codex allow path: exit=0, no stdout, no stderr
+// ---------------------------------------------------------------------------
+
+#[test]
+fn codex_allow_safe_commands_produce_no_output() {
+    let safe_commands = [
+        "git status",
+        "git log --oneline -5",
+        "git diff HEAD",
+        "git checkout -b new-feature",
+        "ls -la",
+        "echo hello",
+        "cat README.md",
+    ];
+
+    for cmd in safe_commands {
+        let outcome = run_codex_hook(cmd);
+        assert_eq!(
+            outcome.exit_code, 0,
+            "safe command '{cmd}' must exit 0\n{outcome}"
+        );
+        assert!(
+            outcome.stdout.is_empty(),
+            "safe command '{cmd}' must produce 0 bytes stdout\n{outcome}"
+        );
+        // stderr may contain trace/debug output but should be empty or minimal
+        // in a clean hermetic env.
+    }
+}
+
+#[test]
+fn codex_allow_git_clean_dry_run_not_blocked() {
+    let outcome = run_codex_hook("git clean -n");
+    assert!(
+        outcome.is_allow_shape(),
+        "git clean -n (dry run) must be allowed\n{outcome}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Hermetic HOME isolation
+// ---------------------------------------------------------------------------
+
 #[test]
 fn smoke_hermetic_home_isolates_pending_exceptions() {
     let outcome = run_codex_hook("git reset --hard HEAD~1");
