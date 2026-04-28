@@ -165,6 +165,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
 mod tests {
     use super::*;
     use crate::packs::test_helpers::*;
+    use crate::packs::Severity;
 
     #[test]
     fn pulumi_patterns_match_with_global_flags() {
@@ -185,5 +186,76 @@ mod tests {
             "pulumi --verbose --cwd ./prod stack rm prod-old",
             "stack rm",
         );
+    }
+
+    #[test]
+    fn pulumi_blocks_each_destructive_pattern() {
+        let pack = create_pack();
+        assert_blocks(&pack, "pulumi destroy", "destroy");
+        assert_blocks(&pack, "pulumi up -y", "skips confirmation");
+        assert_blocks(&pack, "pulumi up --yes", "skips confirmation");
+        assert_blocks(
+            &pack,
+            "pulumi state delete urn:pulumi:prod::db::aws:rds/instance:Instance::main",
+            "state delete",
+        );
+        assert_blocks(&pack, "pulumi stack rm prod-old", "stack rm");
+        assert_blocks(&pack, "pulumi refresh -y", "refresh -y");
+        assert_blocks(&pack, "pulumi refresh --yes", "refresh");
+        assert_blocks(&pack, "pulumi cancel", "cancel");
+    }
+
+    #[test]
+    fn pulumi_blocks_with_correct_severity() {
+        let pack = create_pack();
+        assert_blocks_with_severity(&pack, "pulumi destroy", Severity::Critical);
+        assert_blocks_with_severity(&pack, "pulumi up -y", Severity::High);
+        assert_blocks_with_severity(&pack, "pulumi state delete urn:foo", Severity::High);
+        assert_blocks_with_severity(&pack, "pulumi stack rm prod", Severity::High);
+        assert_blocks_with_severity(&pack, "pulumi refresh -y", Severity::Medium);
+        assert_blocks_with_severity(&pack, "pulumi cancel", Severity::High);
+    }
+
+    #[test]
+    fn pulumi_all_safe_patterns_match() {
+        let pack = create_pack();
+        assert_safe_pattern_matches(&pack, "pulumi preview");
+        assert_safe_pattern_matches(&pack, "pulumi stack ls");
+        assert_safe_pattern_matches(&pack, "pulumi stack select prod");
+        assert_safe_pattern_matches(&pack, "pulumi stack init dev");
+        assert_safe_pattern_matches(&pack, "pulumi config");
+        assert_safe_pattern_matches(&pack, "pulumi whoami");
+        assert_safe_pattern_matches(&pack, "pulumi version");
+        assert_safe_pattern_matches(&pack, "pulumi about");
+        assert_safe_pattern_matches(&pack, "pulumi logs");
+    }
+
+    #[test]
+    fn pulumi_safe_with_global_flags() {
+        let pack = create_pack();
+        assert_allows(&pack, "pulumi --cwd ./prod preview");
+        assert_allows(&pack, "pulumi --non-interactive stack ls");
+        assert_allows(&pack, "pulumi --verbose config get key");
+    }
+
+    #[test]
+    fn pulumi_destroy_does_not_false_match_stack_name() {
+        let pack = create_pack();
+        assert_allows(&pack, "pulumi up destroy-plan.yaml");
+    }
+
+    #[test]
+    fn pulumi_subcommand_as_substring_does_not_bypass() {
+        let pack = create_pack();
+        assert_blocks(&pack, "pulumi destroy preview-stack", "destroy");
+        assert_blocks(&pack, "pulumi destroy config-backup", "destroy");
+    }
+
+    #[test]
+    fn pulumi_unrelated_commands_no_match() {
+        let pack = create_pack();
+        assert_no_match(&pack, "ls -la");
+        assert_no_match(&pack, "git status");
+        assert_no_match(&pack, "echo pulumi");
     }
 }

@@ -92,6 +92,19 @@ fn create_safe_patterns() -> Vec<SafePattern> {
 
 fn create_destructive_patterns() -> Vec<DestructivePattern> {
     vec![
+        // plan -destroy is a preview but can be scary. Keep this before the
+        // broader destroy rule so the preview keeps its Medium severity.
+        destructive_pattern!(
+            "plan-destroy",
+            r"terraform\b.*?\bplan\s+.*-destroy",
+            "terraform plan -destroy shows what would be destroyed. Review carefully before applying.",
+            Medium,
+            "terraform plan -destroy shows destruction preview:\n\n\
+             - This is a read-only operation (safe to run)\n\
+             - Shows what WOULD be destroyed if you apply\n\
+             - Review output carefully before proceeding\n\n\
+             This is actually the safe way to preview destroy."
+        ),
         // destroy. Trailing `(?=\s|$)` so `terraform apply destroy-plan.tf`
         // (a plan file literally named `destroy-plan.tf`) doesn't false-match.
         destructive_pattern!(
@@ -105,18 +118,6 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Cannot be undone without backups/recreation\n\
              - Use -target to destroy specific resources only\n\n\
              Preview first: terraform plan -destroy"
-        ),
-        // plan -destroy is a preview but can be scary
-        destructive_pattern!(
-            "plan-destroy",
-            r"terraform\b.*?\bplan\s+.*-destroy",
-            "terraform plan -destroy shows what would be destroyed. Review carefully before applying.",
-            Medium,
-            "terraform plan -destroy shows destruction preview:\n\n\
-             - This is a read-only operation (safe to run)\n\
-             - Shows what WOULD be destroyed if you apply\n\
-             - Review output carefully before proceeding\n\n\
-             This is actually the safe way to preview destroy."
         ),
         // apply with -auto-approve (skips confirmation)
         destructive_pattern!(
@@ -202,6 +203,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
 mod tests {
     use super::*;
     use crate::packs::test_helpers::*;
+    use crate::packs::Severity;
 
     #[test]
     fn terraform_patterns_match_with_chdir_flag() {
@@ -253,5 +255,78 @@ mod tests {
         assert_allows(&pack, "terraform state list");
         // Genuine destructive still blocks
         assert_blocks(&pack, "terraform destroy -auto-approve", "destroy");
+    }
+
+    #[test]
+    fn terraform_blocks_each_destructive_pattern() {
+        let pack = create_pack();
+        assert_blocks(&pack, "terraform destroy", "destroy");
+        assert_blocks(&pack, "terraform plan -destroy", "plan -destroy");
+        assert_blocks(&pack, "terraform apply -auto-approve", "auto-approve");
+        assert_blocks(&pack, "terraform taint aws_instance.web", "taint");
+        assert_blocks(&pack, "terraform state rm aws_s3_bucket.data", "state rm");
+        assert_blocks(
+            &pack,
+            "terraform state mv aws_instance.a aws_instance.b",
+            "state mv",
+        );
+        assert_blocks(&pack, "terraform force-unlock 12345", "force-unlock");
+        assert_blocks(
+            &pack,
+            "terraform workspace delete staging",
+            "workspace delete",
+        );
+    }
+
+    #[test]
+    fn terraform_blocks_with_correct_severity() {
+        let pack = create_pack();
+        assert_blocks_with_severity(&pack, "terraform destroy", Severity::Critical);
+        assert_blocks_with_severity(&pack, "terraform plan -destroy", Severity::Medium);
+        assert_blocks_with_severity(&pack, "terraform apply -auto-approve", Severity::High);
+        assert_blocks_with_severity(&pack, "terraform taint aws_instance.x", Severity::High);
+        assert_blocks_with_severity(&pack, "terraform state rm aws_instance.x", Severity::High);
+        assert_blocks_with_severity(&pack, "terraform state mv a b", Severity::High);
+        assert_blocks_with_severity(&pack, "terraform force-unlock 123", Severity::High);
+        assert_blocks_with_severity(&pack, "terraform workspace delete dev", Severity::Medium);
+    }
+
+    #[test]
+    fn terraform_all_safe_patterns_match() {
+        let pack = create_pack();
+        assert_safe_pattern_matches(&pack, "terraform plan");
+        assert_safe_pattern_matches(&pack, "terraform init");
+        assert_safe_pattern_matches(&pack, "terraform validate");
+        assert_safe_pattern_matches(&pack, "terraform fmt");
+        assert_safe_pattern_matches(&pack, "terraform show");
+        assert_safe_pattern_matches(&pack, "terraform output");
+        assert_safe_pattern_matches(&pack, "terraform state list");
+        assert_safe_pattern_matches(&pack, "terraform state show aws_instance.web");
+        assert_safe_pattern_matches(&pack, "terraform graph");
+        assert_safe_pattern_matches(&pack, "terraform version");
+        assert_safe_pattern_matches(&pack, "terraform providers");
+    }
+
+    #[test]
+    fn terraform_destroy_does_not_false_match_plan_file_name() {
+        let pack = create_pack();
+        assert_allows(&pack, "terraform apply destroy-plan.tf");
+    }
+
+    #[test]
+    fn terraform_subcommand_as_substring_does_not_bypass() {
+        // A workspace named "plan-stack" must not trigger the safe
+        // "terraform-plan" pattern and allow "terraform destroy plan-stack".
+        let pack = create_pack();
+        assert_blocks(&pack, "terraform destroy plan-stack", "destroy");
+        assert_blocks(&pack, "terraform destroy init-resources", "destroy");
+    }
+
+    #[test]
+    fn terraform_unrelated_commands_no_match() {
+        let pack = create_pack();
+        assert_no_match(&pack, "ls -la");
+        assert_no_match(&pack, "git status");
+        assert_no_match(&pack, "echo terraform");
     }
 }

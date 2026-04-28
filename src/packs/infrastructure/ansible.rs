@@ -130,3 +130,110 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
     ]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packs::test_helpers::*;
+
+    #[test]
+    fn ansible_safe_dry_run_modes() {
+        let pack = create_pack();
+        assert_allows(&pack, "ansible --check -i inventory.ini all -m ping");
+        assert_allows(&pack, "ansible-playbook --check deploy.yml");
+        assert_allows(&pack, "ansible-playbook --diff site.yml");
+        assert_allows(&pack, "ansible-playbook --list-hosts site.yml");
+        assert_allows(&pack, "ansible-playbook --list-tasks site.yml");
+        assert_allows(&pack, "ansible-playbook --syntax-check site.yml");
+    }
+
+    #[test]
+    fn ansible_safe_info_commands() {
+        let pack = create_pack();
+        assert_allows(&pack, "ansible-inventory --list");
+        assert_allows(&pack, "ansible-doc file");
+        assert_allows(&pack, "ansible-config dump");
+    }
+
+    #[test]
+    fn ansible_blocks_shell_rm_rf() {
+        let pack = create_pack();
+        assert_blocks(
+            &pack,
+            "ansible all -m shell -a 'rm -rf /var/data'",
+            "rm -rf",
+        );
+        assert_blocks(
+            &pack,
+            "ansible webservers -m command -a 'rm -rf /tmp/cache'",
+            "rm -rf",
+        );
+    }
+
+    #[test]
+    fn ansible_blocks_shell_reboot_shutdown() {
+        let pack = create_pack();
+        assert_blocks(&pack, "ansible all -m shell -a 'reboot'", "reboot");
+        assert_blocks(
+            &pack,
+            "ansible dbservers -m command -a 'shutdown -h now'",
+            "shutdown",
+        );
+        assert_blocks(
+            &pack,
+            "ansible all -m shell -a 'poweroff'",
+            "reboot/shutdown",
+        );
+    }
+
+    #[test]
+    fn ansible_blocks_playbook_without_check_or_limit() {
+        let pack = create_pack();
+        assert_blocks(
+            &pack,
+            "ansible-playbook -i production deploy.yml",
+            "without --check or --limit",
+        );
+    }
+
+    #[test]
+    fn ansible_allows_playbook_with_check_or_limit() {
+        let pack = create_pack();
+        assert_allows(&pack, "ansible-playbook --check -i production deploy.yml");
+        assert_allows(
+            &pack,
+            "ansible-playbook --limit web1 -i production deploy.yml",
+        );
+        assert_allows(&pack, "ansible-playbook --diff -i production deploy.yml");
+    }
+
+    #[test]
+    fn ansible_blocks_extra_vars_destructive_keywords() {
+        let pack = create_pack();
+        assert_blocks(
+            &pack,
+            r"ansible all -e 'action=delete' -m shell -a 'echo hi'",
+            "destructive keywords",
+        );
+        assert_blocks(
+            &pack,
+            r#"ansible all -e "state=destroy" -m debug"#,
+            "destructive keywords",
+        );
+    }
+
+    #[test]
+    fn ansible_allows_benign_extra_vars() {
+        let pack = create_pack();
+        assert_allows(
+            &pack,
+            "ansible all -e 'version=1.2.3' -m debug -a 'var=version'",
+        );
+    }
+
+    #[test]
+    fn ansible_safe_check_overrides_destructive() {
+        let pack = create_pack();
+        assert_allows(&pack, "ansible all --check -m shell -a 'rm -rf /data'");
+    }
+}
