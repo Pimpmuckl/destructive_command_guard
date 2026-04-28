@@ -43,10 +43,7 @@ fn generate_enhanced_suggestions_empty_input() {
 
 #[test]
 fn generate_enhanced_suggestions_single_command_high_frequency() {
-    let entries = create_test_entries(
-        &[("git reset --hard HEAD", "/data/projects/myapp", false)],
-        15,
-    );
+    let entries = create_test_entries(&[("npm run build", "/data/projects/myapp", false)], 15);
 
     let suggestions = generate_enhanced_suggestions(&entries, 3);
 
@@ -57,8 +54,23 @@ fn generate_enhanced_suggestions_single_command_high_frequency() {
     let suggestion = &suggestions[0];
     // High frequency (15) with single variant = High confidence
     assert_eq!(suggestion.confidence, ConfidenceTier::High);
-    // git reset --hard is high risk
-    assert_eq!(suggestion.risk, RiskLevel::High);
+    assert_eq!(suggestion.risk, RiskLevel::Low);
+    assert!(suggestion.cluster.commands[0].contains("npm run build"));
+}
+
+#[test]
+fn generate_enhanced_suggestions_filters_high_risk_git_reset() {
+    let entries = create_test_entries(
+        &[("git reset --hard HEAD", "/data/projects/myapp", true)],
+        15,
+    );
+
+    let suggestions = generate_enhanced_suggestions(&entries, 3);
+
+    assert!(
+        suggestions.is_empty(),
+        "high-frequency bypassed git reset --hard must never be auto-suggested"
+    );
 }
 
 #[test]
@@ -451,17 +463,17 @@ fn generate_enhanced_suggestions_with_similar_commands() {
 fn generate_enhanced_suggestions_preserves_command_order_in_cluster() {
     let entries: Vec<CommandEntryInfo> = vec![
         CommandEntryInfo {
-            command: "git reset --hard HEAD".to_string(),
+            command: "npm run build".to_string(),
             working_dir: "/data/projects/app".to_string(),
             was_bypassed: false,
         },
         CommandEntryInfo {
-            command: "git reset --hard HEAD".to_string(),
+            command: "npm run build".to_string(),
             working_dir: "/data/projects/app".to_string(),
             was_bypassed: false,
         },
         CommandEntryInfo {
-            command: "git reset --hard HEAD".to_string(),
+            command: "npm run build".to_string(),
             working_dir: "/data/projects/app".to_string(),
             was_bypassed: false,
         },
@@ -475,7 +487,7 @@ fn generate_enhanced_suggestions_preserves_command_order_in_cluster() {
         suggestions[0]
             .cluster
             .commands
-            .contains(&"git reset --hard HEAD".to_string())
+            .contains(&"npm run build".to_string())
     );
 }
 
@@ -523,27 +535,22 @@ fn scenario_developer_workflow() {
     // Simulates developer repeatedly using git commands
     let mut entries = Vec::new();
 
-    // Developer tries git reset --hard multiple times, eventually bypasses
-    for i in 0..8 {
+    // Developer tries git reset --hard multiple times, eventually bypasses.
+    // This must still be filtered out of automatic allowlist suggestions.
+    for _ in 0..100 {
         entries.push(CommandEntryInfo {
             command: "git reset --hard HEAD~1".to_string(),
             working_dir: "/home/dev/myproject".to_string(),
-            was_bypassed: i >= 5, // Later attempts were bypassed
+            was_bypassed: true,
         });
     }
 
     let suggestions = generate_enhanced_suggestions(&entries, 3);
 
-    assert!(!suggestions.is_empty());
-    let suggestion = &suggestions[0];
-    // Should have high confidence due to bypasses
-    assert_eq!(suggestion.confidence, ConfidenceTier::High);
-    // But still high risk
-    assert_eq!(suggestion.risk, RiskLevel::High);
-    // Reason should be ManuallyBypassed
-    assert_eq!(suggestion.reason, SuggestionReason::ManuallyBypassed);
-    // Should suggest path-specific since all in same dir
-    assert!(suggestion.suggest_path_specific);
+    assert!(
+        suggestions.is_empty(),
+        "critical git reset --hard patterns must not be suggested even after repeated bypasses"
+    );
 }
 
 #[test]

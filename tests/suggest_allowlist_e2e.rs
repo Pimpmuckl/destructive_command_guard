@@ -185,7 +185,42 @@ database_path = "{}"
 #[allow(clippy::too_many_lines)]
 fn suggest_test_fixtures() -> Vec<TestCommand> {
     vec![
+        // Repeat safe build commands so the positive JSON path has suggestions.
+        TestCommand {
+            command: "npm run custom:build",
+            outcome: Outcome::Deny,
+            agent_type: "claude_code",
+            working_dir: "/data/projects/test",
+            timestamp_offset_secs: -3900,
+            pack_id: Some("package.npm"),
+            pattern_name: Some("custom-build"),
+            rule_id: Some("package.npm:custom-build"),
+            eval_duration_us: 100,
+        },
+        TestCommand {
+            command: "npm run custom:build",
+            outcome: Outcome::Deny,
+            agent_type: "claude_code",
+            working_dir: "/data/projects/test",
+            timestamp_offset_secs: -3800,
+            pack_id: Some("package.npm"),
+            pattern_name: Some("custom-build"),
+            rule_id: Some("package.npm:custom-build"),
+            eval_duration_us: 100,
+        },
+        TestCommand {
+            command: "npm run custom:build",
+            outcome: Outcome::Deny,
+            agent_type: "claude_code",
+            working_dir: "/data/projects/test",
+            timestamp_offset_secs: -3700,
+            pack_id: Some("package.npm"),
+            pattern_name: Some("custom-build"),
+            rule_id: Some("package.npm:custom-build"),
+            eval_duration_us: 100,
+        },
         // Repeat "git reset --hard HEAD" 4 times (meets min-frequency=3)
+        // but must still be filtered out by the suggestion safety guard.
         TestCommand {
             command: "git reset --hard HEAD",
             outcome: Outcome::Deny,
@@ -717,7 +752,7 @@ fn test_suggest_allowlist_json_output_non_empty() {
 
     let env = TestEnv::new().with_history(&suggest_test_fixtures());
 
-    // Use min-frequency=3 since we have 4 git reset --hard commands
+    // Use min-frequency=3 since the safe custom build command appears 3 times.
     let output = env.run_suggest_allowlist(&[
         "--non-interactive",
         "--format",
@@ -735,17 +770,31 @@ fn test_suggest_allowlist_json_output_non_empty() {
 
     assert!(output.status.success(), "Command should succeed");
 
-    // With 4 git reset --hard and 3 git push --force, we should have suggestions
+    // Safe repeated commands should produce suggestions, while high-risk git
+    // commands in the same history stay filtered out.
     if !stdout.contains("No denied commands") && !stdout.contains("No commands found") {
         let parsed: serde_json::Value =
             serde_json::from_str(&stdout).expect("Should produce valid JSON");
 
         if let Some(arr) = parsed.as_array() {
             eprintln!("Got {} suggestions", arr.len());
-            // We should have at least one suggestion for the git reset --hard pattern
             assert!(
                 !arr.is_empty(),
                 "Should have at least one suggestion with test fixtures"
+            );
+            let patterns: Vec<&str> = arr
+                .iter()
+                .filter_map(|suggestion| suggestion.get("pattern").and_then(|p| p.as_str()))
+                .collect();
+            assert!(
+                patterns.iter().any(|pattern| pattern.contains("npm")),
+                "safe npm command should be suggested, got {patterns:?}"
+            );
+            assert!(
+                patterns.iter().all(|pattern| !pattern.contains("reset")
+                    && !pattern.contains("push")
+                    && !pattern.contains("force")),
+                "high-risk git commands must not be suggested, got {patterns:?}"
             );
         }
     }
