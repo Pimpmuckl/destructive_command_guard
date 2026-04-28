@@ -419,18 +419,31 @@ pub struct AllowlistHit<'a> {
 ///
 #[must_use]
 pub fn is_expired(entry: &AllowEntry) -> bool {
-    // Check absolute expiration first
-    if let Some(ref expires_at) = entry.expires_at {
+    is_expiration_expired(
+        entry.expires_at.as_deref(),
+        entry.ttl.as_deref(),
+        entry.added_at.as_deref(),
+    )
+}
+
+/// Check whether expiration fields describe an expired allowlist entry.
+///
+/// Session-scoped validity is enforced separately by `session_scope_matches`;
+/// this helper only covers timestamp and TTL expiration.
+#[must_use]
+pub fn is_expiration_expired(
+    expires_at: Option<&str>,
+    ttl: Option<&str>,
+    added_at: Option<&str>,
+) -> bool {
+    if let Some(expires_at) = expires_at {
         return is_timestamp_expired(expires_at);
     }
 
-    // Check TTL-based expiration
-    if let Some(ref ttl) = entry.ttl {
-        return is_ttl_expired(ttl, entry.added_at.as_deref());
+    if let Some(ttl) = ttl {
+        return is_ttl_expired(ttl, added_at);
     }
 
-    // No timestamp expiration set.
-    // Session-scoped validity is enforced separately by `session_scope_matches`.
     false
 }
 

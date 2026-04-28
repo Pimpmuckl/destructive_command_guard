@@ -2107,6 +2107,16 @@ dcg allowlist validate
 dcg allowlist validate --strict
 ```
 
+**Pruning expired entries:**
+
+```bash
+# Preview expired entries without changing files
+dcg allowlist prune --dry-run
+
+# Remove expired entries from project/user allowlists
+dcg allowlist prune
+```
+
 **Example allowlist.toml:**
 
 ```toml

@@ -59,6 +59,9 @@ pub struct Config {
     /// Custom overrides.
     pub overrides: OverridesConfig,
 
+    /// Allowlist file management settings.
+    pub allowlist: AllowlistConfig,
+
     /// Heredoc/inline-script scanning configuration.
     pub heredoc: HeredocConfig,
 
@@ -110,6 +113,7 @@ struct ConfigLayer {
     packs: Option<PacksConfig>,
     policy: Option<PolicyConfig>,
     overrides: Option<OverridesConfig>,
+    allowlist: Option<AllowlistConfigLayer>,
     heredoc: Option<HeredocConfig>,
     confidence: Option<ConfidenceConfigLayer>,
     logging: Option<LoggingConfigLayer>,
@@ -1175,6 +1179,31 @@ pub struct OverridesConfig {
     /// ```
     #[serde(default)]
     pub allowlist_rules: Option<Vec<AllowlistRule>>,
+}
+
+/// Settings for layered allowlist files (`.dcg/allowlist.toml`,
+/// `~/.config/dcg/allowlist.toml`, and `/etc/dcg/allowlist.toml`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AllowlistConfig {
+    /// Automatically prune expired entries during allowlist CLI operations.
+    ///
+    /// Disabled by default so expired entries remain as audit history unless a
+    /// user explicitly opts in or runs `dcg allowlist prune`.
+    pub auto_prune_expired: bool,
+}
+
+impl Default for AllowlistConfig {
+    fn default() -> Self {
+        Self {
+            auto_prune_expired: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct AllowlistConfigLayer {
+    auto_prune_expired: Option<bool>,
 }
 
 /// An extended allowlist rule with optional path conditions.
@@ -2600,6 +2629,10 @@ impl Config {
             self.merge_overrides_layer(overrides);
         }
 
+        if let Some(allowlist) = other.allowlist {
+            self.merge_allowlist_layer(allowlist);
+        }
+
         if let Some(heredoc) = other.heredoc {
             self.merge_heredoc_layer(heredoc);
         }
@@ -2708,6 +2741,12 @@ impl Config {
     fn merge_overrides_layer(&mut self, overrides: OverridesConfig) {
         self.overrides.allow.extend(overrides.allow);
         self.overrides.block.extend(overrides.block);
+    }
+
+    const fn merge_allowlist_layer(&mut self, allowlist: AllowlistConfigLayer) {
+        if let Some(auto_prune_expired) = allowlist.auto_prune_expired {
+            self.allowlist.auto_prune_expired = auto_prune_expired;
+        }
     }
 
     fn merge_heredoc_layer(&mut self, heredoc: HeredocConfig) {
@@ -3241,6 +3280,7 @@ impl Config {
             },
             policy: PolicyConfig::default(),
             overrides: OverridesConfig::default(),
+            allowlist: AllowlistConfig::default(),
             heredoc: HeredocConfig::default(),
             confidence: ConfidenceConfig::default(),
             logging: crate::logging::LoggingConfig::default(),
@@ -3427,6 +3467,15 @@ block = [
 ]
 
 #─────────────────────────────────────────────────────────────
+# ALLOWLIST FILES
+#─────────────────────────────────────────────────────────────
+
+[allowlist]
+# Keep expired entries by default so allowlist files preserve audit history.
+# Set to true to prune expired entries before allowlist CLI operations.
+auto_prune_expired = false
+
+#─────────────────────────────────────────────────────────────
 # HEREDOC / INLINE SCRIPT SCANNING
 #─────────────────────────────────────────────────────────────
 
@@ -3596,6 +3645,19 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.general.color, "auto");
         assert!(config.packs.enabled.is_empty());
+        assert!(!config.allowlist.auto_prune_expired);
+    }
+
+    #[test]
+    fn test_allowlist_config_parses_auto_prune_expired() {
+        let config: Config = toml::from_str(
+            r#"
+[allowlist]
+auto_prune_expired = true
+"#,
+        )
+        .unwrap();
+        assert!(config.allowlist.auto_prune_expired);
     }
 
     #[test]

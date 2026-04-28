@@ -1599,6 +1599,26 @@ pub enum AllowlistAction {
         #[arg(long)]
         strict: bool,
     },
+
+    /// Remove expired allowlist entries
+    #[command(name = "prune")]
+    Prune {
+        /// Prune project allowlist only
+        #[arg(long, conflicts_with = "user")]
+        project: bool,
+
+        /// Prune user allowlist only
+        #[arg(long, conflicts_with = "project")]
+        user: bool,
+
+        /// Show what would be removed without writing changes
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Output format
+        #[arg(long, value_enum, default_value = "pretty", env = "DCG_FORMAT")]
+        format: AllowlistOutputFormat,
+    },
 }
 
 /// Subcommands for managing allow-once entries.
@@ -2014,7 +2034,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Some(Command::Allowlist { action }) => {
-            handle_allowlist_command(action)?;
+            handle_allowlist_command(action, config.allowlist.auto_prune_expired)?;
         }
         Some(Command::Allow {
             rule_id,
@@ -10965,7 +10985,14 @@ fn allowlist_path_for_layer(layer: AllowlistLayer) -> std::path::PathBuf {
 }
 
 /// Handle allowlist subcommand dispatch.
-fn handle_allowlist_command(action: AllowlistAction) -> Result<(), Box<dyn std::error::Error>> {
+fn handle_allowlist_command(
+    action: AllowlistAction,
+    auto_prune_expired: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if auto_prune_expired && !matches!(action, AllowlistAction::Prune { .. }) {
+        prune_allowlist_layers(false, false, false)?;
+    }
+
     match action {
         AllowlistAction::Add {
             rule_id,
@@ -11028,6 +11055,14 @@ fn handle_allowlist_command(action: AllowlistAction) -> Result<(), Box<dyn std::
             strict,
         } => {
             allowlist_validate(project, user, strict)?;
+        }
+        AllowlistAction::Prune {
+            project,
+            user,
+            dry_run,
+            format,
+        } => {
+            allowlist_prune(project, user, dry_run, format)?;
         }
     }
     Ok(())
@@ -12060,6 +12095,218 @@ fn allowlist_validate(
         println!("{msg}");
         Err(format!("Validation failed: {errors} error(s), {warnings} warning(s)").into())
     }
+}
+
+/// Remove expired entries from selected allowlist files.
+fn allowlist_prune(
+    project_only: bool,
+    user_only: bool,
+    dry_run: bool,
+    format: AllowlistOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    let pruned = prune_allowlist_layers(project_only, user_only, dry_run)?;
+
+    match format {
+        AllowlistOutputFormat::Pretty => {
+            if pruned.is_empty() {
+                println!("{}", "No expired allowlist entries found.".green());
+                return Ok(());
+            }
+
+            let action = if dry_run { "Would prune" } else { "Pruned" };
+            println!(
+                "{} {} expired allowlist entr{}",
+                "✓".green(),
+                action,
+                if pruned.len() == 1 { "y" } else { "ies" }
+            );
+            println!();
+
+            for entry in &pruned {
+                println!(
+                    "  {} {} [{}]",
+                    entry.selector_kind,
+                    entry.selector_value,
+                    entry.layer.label()
+                );
+                if let Some(reason) = &entry.reason {
+                    println!("    Reason: {reason}");
+                }
+                if let Some(expires_at) = &entry.expires_at {
+                    println!("    Expires: {expires_at}");
+                }
+                if let Some(ttl) = &entry.ttl {
+                    println!("    TTL: {ttl}");
+                }
+                println!("    File: {}", entry.path.display());
+            }
+        }
+        AllowlistOutputFormat::Json => {
+            let entries: Vec<serde_json::Value> = pruned
+                .iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "layer": entry.layer.label(),
+                        "path": entry.path.display().to_string(),
+                        "index": entry.index,
+                        "selector": {
+                            "type": &entry.selector_kind,
+                            "value": &entry.selector_value,
+                        },
+                        "reason": &entry.reason,
+                        "expires_at": &entry.expires_at,
+                        "ttl": &entry.ttl,
+                        "added_at": &entry.added_at,
+                    })
+                })
+                .collect();
+
+            let output = serde_json::json!({
+                "dry_run": dry_run,
+                "pruned": entries.len(),
+                "entries": entries,
+            });
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrunedAllowlistEntry {
+    index: usize,
+    layer: AllowlistLayer,
+    path: std::path::PathBuf,
+    selector_kind: String,
+    selector_value: String,
+    reason: Option<String>,
+    expires_at: Option<String>,
+    ttl: Option<String>,
+    added_at: Option<String>,
+}
+
+fn prune_allowlist_layers(
+    project_only: bool,
+    user_only: bool,
+    dry_run: bool,
+) -> Result<Vec<PrunedAllowlistEntry>, Box<dyn std::error::Error>> {
+    let layers: Vec<AllowlistLayer> = if project_only {
+        vec![AllowlistLayer::Project]
+    } else if user_only {
+        vec![AllowlistLayer::User]
+    } else {
+        vec![AllowlistLayer::Project, AllowlistLayer::User]
+    };
+
+    let mut pruned = Vec::new();
+
+    for layer in layers {
+        let path = allowlist_path_for_layer(layer);
+        if !path.exists() {
+            continue;
+        }
+
+        let mut doc = load_or_create_allowlist_doc(&path)?;
+        let layer_pruned = prune_expired_allowlist_doc(&mut doc, layer, &path, dry_run);
+        if !dry_run && !layer_pruned.is_empty() {
+            write_allowlist(&path, &doc)?;
+        }
+        pruned.extend(layer_pruned);
+    }
+
+    Ok(pruned)
+}
+
+fn prune_expired_allowlist_doc(
+    doc: &mut toml_edit::DocumentMut,
+    layer: AllowlistLayer,
+    path: &std::path::Path,
+    dry_run: bool,
+) -> Vec<PrunedAllowlistEntry> {
+    let pruned = collect_expired_allowlist_entries(doc, layer, path);
+    if dry_run || pruned.is_empty() {
+        return pruned;
+    }
+
+    if let Some(arr) = doc
+        .get_mut("allow")
+        .and_then(toml_edit::Item::as_array_of_tables_mut)
+    {
+        for idx in pruned.iter().map(|entry| entry.index).rev() {
+            arr.remove(idx);
+        }
+    }
+
+    pruned
+}
+
+fn collect_expired_allowlist_entries(
+    doc: &toml_edit::DocumentMut,
+    layer: AllowlistLayer,
+    path: &std::path::Path,
+) -> Vec<PrunedAllowlistEntry> {
+    let Some(arr) = doc
+        .get("allow")
+        .and_then(toml_edit::Item::as_array_of_tables)
+    else {
+        return Vec::new();
+    };
+
+    arr.iter()
+        .enumerate()
+        .filter_map(|(index, tbl)| {
+            let expires_at = toml_item_string(tbl.get("expires_at"));
+            let ttl = toml_item_string(tbl.get("ttl"));
+            let added_at = toml_item_string(tbl.get("added_at"));
+
+            if !crate::allowlist::is_expiration_expired(
+                expires_at.as_deref(),
+                ttl.as_deref(),
+                added_at.as_deref(),
+            ) {
+                return None;
+            }
+
+            let (selector_kind, selector_value) = allowlist_table_selector(tbl);
+            Some(PrunedAllowlistEntry {
+                index,
+                layer,
+                path: path.to_path_buf(),
+                selector_kind,
+                selector_value,
+                reason: toml_item_string(tbl.get("reason")),
+                expires_at,
+                ttl,
+                added_at,
+            })
+        })
+        .collect()
+}
+
+fn toml_item_string(item: Option<&toml_edit::Item>) -> Option<String> {
+    let item = item?;
+    if let Some(s) = item.as_str() {
+        return Some(s.to_string());
+    }
+    item.as_datetime().map(ToString::to_string)
+}
+
+fn allowlist_table_selector(tbl: &toml_edit::Table) -> (String, String) {
+    for (key, label) in [
+        ("rule", "rule"),
+        ("exact_command", "exact_command"),
+        ("command_prefix", "command_prefix"),
+        ("pattern", "pattern"),
+    ] {
+        if let Some(value) = toml_item_string(tbl.get(key)) {
+            return (label.to_string(), value);
+        }
+    }
+
+    ("unknown".to_string(), "<unknown>".to_string())
 }
 
 // ============================================================================
@@ -13920,6 +14167,35 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_parse_allowlist_prune() {
+        let cli = Cli::parse_from([
+            "dcg",
+            "allowlist",
+            "prune",
+            "--dry-run",
+            "--user",
+            "--format",
+            "json",
+        ]);
+        if let Some(Command::Allowlist {
+            action:
+                AllowlistAction::Prune {
+                    dry_run,
+                    user,
+                    format,
+                    ..
+                },
+        }) = cli.command
+        {
+            assert!(dry_run);
+            assert!(user);
+            assert_eq!(format, AllowlistOutputFormat::Json);
+        } else {
+            unreachable!("Expected Allowlist Prune command");
+        }
+    }
+
+    #[test]
     fn test_cli_parse_allowlist_add_command() {
         let cli = Cli::parse_from([
             "dcg",
@@ -14187,6 +14463,49 @@ mod tests {
         // Try to remove non-existent entry
         let removed = remove_rule_entry(&mut doc, &rule);
         assert!(!removed, "should return false for non-existent entry");
+    }
+
+    #[test]
+    fn allowlist_prune_removes_only_expired_entries() {
+        use tempfile::TempDir;
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("allowlist.toml");
+
+        let expired_rule = RuleId::parse("core.git:reset-hard").unwrap();
+        let active_rule = RuleId::parse("core.git:clean-force").unwrap();
+        let mut doc = load_or_create_allowlist_doc(&path).unwrap();
+        append_entry(
+            &mut doc,
+            build_rule_entry(&expired_rule, "expired", Some("2020-01-01T00:00:00Z"), &[]),
+        );
+        append_entry(
+            &mut doc,
+            build_rule_entry(&active_rule, "active", Some("2099-01-01T00:00:00Z"), &[]),
+        );
+
+        let pruned = prune_expired_allowlist_doc(&mut doc, AllowlistLayer::Project, &path, false);
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(pruned[0].selector_value, "core.git:reset-hard");
+        assert!(!has_rule_entry(&doc, &expired_rule));
+        assert!(has_rule_entry(&doc, &active_rule));
+    }
+
+    #[test]
+    fn allowlist_prune_dry_run_preserves_document() {
+        use tempfile::TempDir;
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("allowlist.toml");
+
+        let expired_rule = RuleId::parse("core.git:reset-hard").unwrap();
+        let mut doc = load_or_create_allowlist_doc(&path).unwrap();
+        append_entry(
+            &mut doc,
+            build_rule_entry(&expired_rule, "expired", Some("2020-01-01T00:00:00Z"), &[]),
+        );
+
+        let pruned = prune_expired_allowlist_doc(&mut doc, AllowlistLayer::Project, &path, true);
+        assert_eq!(pruned.len(), 1);
+        assert!(has_rule_entry(&doc, &expired_rule));
     }
 
     #[test]
