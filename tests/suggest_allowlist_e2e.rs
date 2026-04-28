@@ -1194,3 +1194,81 @@ fn apply_flag_out_of_range_index() {
         "Should report no patterns applied or warn about range"
     );
 }
+
+/// Fixtures with a command that touches a sensitive system path. The generated
+/// allowlist pattern should fall into `RequireConfirmation` (not `NeverSuggest`)
+/// per `check_suggestion_safety` in src/suggest.rs.
+fn sensitive_path_fixtures() -> Vec<TestCommand> {
+    let mut cmds = Vec::new();
+    for i in 0..4 {
+        cmds.push(TestCommand {
+            command: "cat /etc/dcg.conf",
+            outcome: Outcome::Deny,
+            agent_type: "claude_code",
+            working_dir: "/data/projects/test",
+            timestamp_offset_secs: -3600 + i * 100,
+            pack_id: Some("core.filesystem"),
+            pattern_name: Some("sensitive-read"),
+            rule_id: Some("core.filesystem:sensitive-read"),
+            eval_duration_us: 100,
+        });
+    }
+    cmds
+}
+
+/// `--apply` must refuse to write a `RequireConfirmation` suggestion (e.g. a
+/// pattern that touches `/etc`) without `--accept-risk`. This guards against
+/// the previously-shipped behavior where `apply_suggestions_by_index` ignored
+/// `suggestion.safety` entirely and silently allowlisted sensitive patterns.
+#[test]
+fn apply_flag_refuses_require_confirmation_without_accept_risk() {
+    let env = TestEnv::new().with_history(&sensitive_path_fixtures());
+
+    let output = env.run_suggest_allowlist(&["--apply", "1", "--min-frequency", "3"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    eprintln!("apply require-confirmation (no --accept-risk):\nstdout={stdout}\nstderr={stderr}");
+
+    assert!(output.status.success(), "Command should not crash");
+    assert!(
+        stderr.contains("Skipped (safety)") || stderr.contains("--accept-risk"),
+        "Should print a safety-skip message guiding the user toward --accept-risk"
+    );
+    assert!(
+        stdout.contains("0 applied") || stdout.contains("applied 0"),
+        "Sensitive pattern must NOT be written without --accept-risk"
+    );
+
+    // The sensitive pattern must not appear in any allowlist file.
+    let project_allowlist = env.temp_dir.path().join(".dcg").join("allowlist.toml");
+    let user_contents = if env.allowlist_exists() {
+        env.read_allowlist()
+    } else {
+        String::new()
+    };
+    let project_contents = fs::read_to_string(&project_allowlist).unwrap_or_default();
+    assert!(
+        !user_contents.contains("/etc/dcg.conf") && !project_contents.contains("/etc/dcg.conf"),
+        "Sensitive `/etc/...` pattern leaked into allowlist (user={user_contents}, project={project_contents})"
+    );
+}
+
+/// With `--accept-risk`, the same `RequireConfirmation` suggestion is written.
+#[test]
+fn apply_flag_writes_require_confirmation_with_accept_risk() {
+    let env = TestEnv::new().with_history(&sensitive_path_fixtures());
+
+    let output =
+        env.run_suggest_allowlist(&["--apply", "1", "--accept-risk", "--min-frequency", "3"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    eprintln!("apply require-confirmation (--accept-risk):\nstdout={stdout}\nstderr={stderr}");
+
+    assert!(output.status.success(), "Command should not crash");
+    assert!(
+        stdout.contains("Applied") || stdout.contains("applied"),
+        "Should report at least one applied pattern with --accept-risk"
+    );
+}

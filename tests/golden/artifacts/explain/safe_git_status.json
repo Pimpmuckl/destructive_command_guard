@@ -12,16 +12,7 @@
         "quick_rejected": true,
         "keywords_checked": [
           "/rm",
-          "DELETE",
-          "DROP",
-          "TRUNCATE",
-          "createdb",
-          "docker",
-          "dropdb",
           "git",
-          "pg_dump",
-          "pg_restore",
-          "psql",
           "rm"
         ],
         "first_match": null

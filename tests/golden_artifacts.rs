@@ -44,13 +44,34 @@ fn dcg_binary() -> PathBuf {
 }
 
 fn run_dcg(args: &[&str]) -> DcgOutput {
-    let output = Command::new(dcg_binary())
-        .args(args)
+    // Hermetic environment: golden artifacts must be reproducible across
+    // contributor machines. Without isolation, dcg reads the developer's
+    // real `~/.config/dcg/config.toml` (and any custom packs they have
+    // enabled), which makes the captured artifacts machine-specific. On
+    // `UPDATE_GOLDEN_ARTIFACTS=1` runs that noise gets committed.
+    //
+    // The pattern mirrors `tests/e2e_real_service.rs` and the
+    // `apply_hermetic_env` helper in `tests/agent_profile_comprehensive.rs`:
+    // clear inherited vars, then re-export only `PATH` plus an isolated
+    // `HOME` / `XDG_CONFIG_HOME` / `TMPDIR`.
+    let home = tempfile::tempdir().expect("create isolated HOME for run_dcg");
+    std::fs::create_dir_all(home.path().join(".config/dcg"))
+        .expect("create XDG_CONFIG_HOME/dcg under isolated HOME");
+    std::fs::create_dir_all(home.path().join("tmp")).expect("create isolated TMPDIR");
+
+    let mut cmd = Command::new(dcg_binary());
+    cmd.args(args).env_clear();
+    if let Ok(path) = std::env::var("PATH") {
+        cmd.env("PATH", path);
+    }
+    cmd.env("HOME", home.path())
+        .env("TMPDIR", home.path().join("tmp"))
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
         .env("NO_COLOR", "1")
         .env("CLICOLOR", "0")
-        .env("TERM", "dumb")
-        .output()
-        .expect("failed to run dcg");
+        .env("TERM", "dumb");
+
+    let output = cmd.output().expect("failed to run dcg");
 
     DcgOutput {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),

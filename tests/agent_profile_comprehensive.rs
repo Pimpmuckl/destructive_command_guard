@@ -24,8 +24,13 @@ use std::process::{Command, Stdio};
 // Test Utilities
 // =============================================================================
 
-/// Path to the DCG binary (uses same target directory as the test binary).
+/// Path to the DCG binary. Prefers `CARGO_BIN_EXE_dcg` (set by Cargo when
+/// building integration tests against a binary target) and falls back to the
+/// `target/<profile>/dcg` layout used by `cargo test`.
 fn dcg_binary() -> std::path::PathBuf {
+    if let Some(p) = option_env!("CARGO_BIN_EXE_dcg") {
+        return std::path::PathBuf::from(p);
+    }
     let mut path = std::env::current_exe().unwrap();
     path.pop(); // Remove test binary name
     path.pop(); // Remove deps/
@@ -33,19 +38,50 @@ fn dcg_binary() -> std::path::PathBuf {
     path
 }
 
+/// Per-spawn isolated HOME / XDG_CONFIG_HOME / TMPDIR so dcg cannot read or
+/// write the developer's real config, history, or pending-exception files
+/// during the test. Returns the tempdir; drop it when the test finishes.
+fn make_isolated_home() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("failed to create isolated HOME tempdir");
+    std::fs::create_dir_all(dir.path().join(".config/dcg"))
+        .expect("failed to create isolated XDG_CONFIG_HOME/dcg");
+    dir
+}
+
+/// Apply hermetic environment to a `Command`: clear inherited vars, then
+/// re-export only `PATH` plus the isolated HOME/TMPDIR/XDG_CONFIG_HOME, plus
+/// `NO_COLOR=1` so denial output stays plain in test logs.
+fn apply_hermetic_env(cmd: &mut Command, home: &std::path::Path) {
+    cmd.env_clear();
+    if let Ok(path) = std::env::var("PATH") {
+        cmd.env("PATH", path);
+    }
+    cmd.env("HOME", home)
+        .env("TMPDIR", home.join("tmp"))
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("NO_COLOR", "1");
+    let _ = std::fs::create_dir_all(home.join("tmp"));
+}
+
 /// Run DCG in hook mode with environment variables.
+///
+/// Spawns dcg in a hermetic environment (isolated HOME/XDG_CONFIG_HOME/TMPDIR)
+/// so the test cannot accidentally read the developer's real config or write
+/// to their real history database.
 fn run_hook_mode_with_env(command: &str, env_vars: &[(&str, &str)]) -> (String, String, i32) {
     let input = format!(
         r#"{{"tool_name":"Bash","tool_input":{{"command":"{}"}}}}"#,
         command.replace('\\', "\\\\").replace('"', "\\\"")
     );
 
+    let home = make_isolated_home();
     let mut cmd = Command::new(dcg_binary());
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    apply_hermetic_env(&mut cmd, home.path());
 
-    // Apply environment variables
+    // Apply environment variables (overrides any defaults from apply_hermetic_env)
     for (key, value) in env_vars {
         cmd.env(key, value);
     }
@@ -69,14 +105,20 @@ fn run_hook_mode_with_env(command: &str, env_vars: &[(&str, &str)]) -> (String, 
 }
 
 /// Run DCG in robot mode for cleaner JSON output.
+///
+/// Spawns dcg in a hermetic environment (isolated HOME/XDG_CONFIG_HOME/TMPDIR)
+/// so the test cannot accidentally read the developer's real config or write
+/// to their real history database.
 fn run_robot_mode_with_env(args: &[&str], env_vars: &[(&str, &str)]) -> (String, String, i32) {
+    let home = make_isolated_home();
     let mut cmd = Command::new(dcg_binary());
     cmd.args(["--robot"])
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    apply_hermetic_env(&mut cmd, home.path());
 
-    // Apply environment variables
+    // Apply environment variables (overrides any defaults from apply_hermetic_env)
     for (key, value) in env_vars {
         cmd.env(key, value);
     }
@@ -302,7 +344,7 @@ mod trust_level_tests {
 
         for cmd in destructive_commands {
             for (agent_var, agent_val) in &agents {
-                let (stdout, _stderr, exit_code) =
+                let (stdout, stderr, exit_code) =
                     run_hook_mode_with_env(cmd, &[(agent_var, agent_val)]);
 
                 // Hook mode always exits 0
@@ -311,23 +353,30 @@ mod trust_level_tests {
                     "hook mode should exit 0 for cmd: {cmd} with agent: {agent_var}"
                 );
 
-                // But should produce denial JSON
-                if !stdout.is_empty() {
-                    let json: serde_json::Value = serde_json::from_str(&stdout)
-                        .unwrap_or_else(|_| panic!("Invalid JSON for cmd '{cmd}': {stdout}"));
-
-                    if let Some(hook_output) = json.get("hookSpecificOutput") {
-                        let decision = hook_output
-                            .get("permissionDecision")
-                            .and_then(|v| v.as_str());
-
-                        assert_eq!(
-                            decision,
-                            Some("deny"),
-                            "Critical command '{cmd}' should be denied for agent {agent_var}"
-                        );
-                    }
-                }
+                // Critical commands MUST produce denial JSON for every agent.
+                // An empty stdout would mean the command was allowed — which
+                // is exactly the regression these tests guard against, so we
+                // assert non-empty stdout instead of treating "empty" as
+                // "skip silently".
+                assert!(
+                    !stdout.is_empty(),
+                    "Critical command '{cmd}' produced no denial JSON for agent {agent_var} (would have been allowed!). stderr: {stderr}"
+                );
+                let json: serde_json::Value = serde_json::from_str(&stdout)
+                    .unwrap_or_else(|_| panic!("Invalid JSON for cmd '{cmd}': {stdout}"));
+                let hook_output = json.get("hookSpecificOutput").unwrap_or_else(|| {
+                    panic!(
+                        "Missing hookSpecificOutput for cmd '{cmd}' / agent {agent_var}: {stdout}"
+                    )
+                });
+                let decision = hook_output
+                    .get("permissionDecision")
+                    .and_then(|v| v.as_str());
+                assert_eq!(
+                    decision,
+                    Some("deny"),
+                    "Critical command '{cmd}' should be denied for agent {agent_var}"
+                );
             }
         }
     }
@@ -444,27 +493,29 @@ mod unknown_agent_tests {
         let destructive_cmd = "git reset --hard";
 
         // Run without any agent env var
-        let (stdout, _stderr, exit_code) = run_hook_mode_with_env(destructive_cmd, &[]);
+        let (stdout, stderr, exit_code) = run_hook_mode_with_env(destructive_cmd, &[]);
 
         assert_eq!(exit_code, 0, "hook mode should exit 0");
 
-        // Destructive commands should still be blocked
-        if !stdout.is_empty() {
-            let json: serde_json::Value =
-                serde_json::from_str(&stdout).expect("should be valid JSON");
-
-            if let Some(hook_output) = json.get("hookSpecificOutput") {
-                let decision = hook_output
-                    .get("permissionDecision")
-                    .and_then(|v| v.as_str());
-
-                assert_eq!(
-                    decision,
-                    Some("deny"),
-                    "Unknown agent should still have destructive commands blocked"
-                );
-            }
-        }
+        // Destructive commands MUST still be blocked. An empty stdout would
+        // mean the unknown agent path silently allowed the command — the very
+        // regression this test exists to catch — so assert non-empty.
+        assert!(
+            !stdout.is_empty(),
+            "Unknown agent path produced no denial JSON for '{destructive_cmd}' (would have been allowed!). stderr: {stderr}"
+        );
+        let json: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+        let hook_output = json
+            .get("hookSpecificOutput")
+            .expect("missing hookSpecificOutput in deny response");
+        let decision = hook_output
+            .get("permissionDecision")
+            .and_then(|v| v.as_str());
+        assert_eq!(
+            decision,
+            Some("deny"),
+            "Unknown agent should still have destructive commands blocked"
+        );
     }
 
     #[test]
