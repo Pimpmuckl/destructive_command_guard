@@ -306,7 +306,7 @@ fn render_regex_pattern_rich(pattern: &str) -> Option<String> {
 
 fn format_regex_pattern_manual(pattern: &str) -> String {
     let mut result = String::with_capacity(pattern.len() + 32);
-    let mut chars = pattern.chars().peekable();
+    let mut chars = pattern.chars();
 
     while let Some(ch) = chars.next() {
         if ch == '\\' {
