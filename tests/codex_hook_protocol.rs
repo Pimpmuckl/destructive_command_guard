@@ -1039,6 +1039,254 @@ fn cross_protocol_allow_structural_parity() {
     assert!(claude.stdout.is_empty());
 }
 
+// ===========================================================================
+// P2.10 — Fail-open / error-mode integration tests
+//
+// dcg never crashes the host AI agent. Malformed, oversize, or missing input
+// always results in fail-open (exit 0). These tests verify the documented
+// "Fail-Open Philosophy" from README.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// P2.10.1 — Malformed JSON stdin (various broken payloads)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn failopen_not_json_at_all() {
+    let outcome = run_hook_raw(b"not-json-at-all", &[]);
+    assert_eq!(outcome.exit_code, 0, "malformed input must fail-open\n{outcome}");
+    assert!(outcome.stdout.is_empty(), "no stdout on fail-open\n{outcome}");
+}
+
+#[test]
+fn failopen_incomplete_json_brace() {
+    let outcome = run_hook_raw(b"{", &[]);
+    assert_eq!(outcome.exit_code, 0, "incomplete JSON must fail-open\n{outcome}");
+    assert!(outcome.stdout.is_empty(), "no stdout on fail-open\n{outcome}");
+}
+
+#[test]
+fn failopen_json_null() {
+    let outcome = run_hook_raw(b"null", &[]);
+    assert_eq!(outcome.exit_code, 0, "JSON null must fail-open\n{outcome}");
+    assert!(outcome.stdout.is_empty(), "no stdout on fail-open\n{outcome}");
+}
+
+#[test]
+fn failopen_json_array() {
+    let outcome = run_hook_raw(b"[]", &[]);
+    assert_eq!(outcome.exit_code, 0, "JSON array must fail-open\n{outcome}");
+    assert!(outcome.stdout.is_empty(), "no stdout on fail-open\n{outcome}");
+}
+
+#[test]
+fn failopen_json_missing_tool_input() {
+    let payload = br#"{ "tool_name": "Bash" }"#;
+    let outcome = run_hook_raw(payload, &[]);
+    assert_eq!(outcome.exit_code, 0, "missing tool_input must fail-open\n{outcome}");
+    assert!(outcome.stdout.is_empty(), "no stdout on fail-open\n{outcome}");
+}
+
+#[test]
+fn failopen_json_tool_input_null() {
+    let payload = br#"{ "tool_name": "Bash", "tool_input": null }"#;
+    let outcome = run_hook_raw(payload, &[]);
+    assert_eq!(outcome.exit_code, 0, "null tool_input must fail-open\n{outcome}");
+    assert!(outcome.stdout.is_empty(), "no stdout on fail-open\n{outcome}");
+}
+
+#[test]
+fn failopen_json_command_is_number() {
+    let payload = br#"{ "tool_name": "Bash", "tool_input": { "command": 42 } }"#;
+    let outcome = run_hook_raw(payload, &[]);
+    assert_eq!(outcome.exit_code, 0, "numeric command must fail-open\n{outcome}");
+    assert!(outcome.stdout.is_empty(), "no stdout on fail-open\n{outcome}");
+}
+
+#[test]
+fn failopen_json_command_is_array() {
+    let payload = br#"{ "tool_name": "Bash", "tool_input": { "command": ["git", "reset"] } }"#;
+    let outcome = run_hook_raw(payload, &[]);
+    assert_eq!(outcome.exit_code, 0, "array command must fail-open\n{outcome}");
+    assert!(outcome.stdout.is_empty(), "no stdout on fail-open\n{outcome}");
+}
+
+#[test]
+fn failopen_json_command_is_object() {
+    let payload = br#"{ "tool_name": "Bash", "tool_input": { "command": {"cmd": "git reset"} } }"#;
+    let outcome = run_hook_raw(payload, &[]);
+    assert_eq!(outcome.exit_code, 0, "object command must fail-open\n{outcome}");
+    assert!(outcome.stdout.is_empty(), "no stdout on fail-open\n{outcome}");
+}
+
+// ---------------------------------------------------------------------------
+// P2.10.2 — Empty stdin
+// ---------------------------------------------------------------------------
+
+#[test]
+fn failopen_empty_stdin() {
+    let outcome = run_hook_raw(b"", &[]);
+    assert_eq!(outcome.exit_code, 0, "empty stdin must fail-open\n{outcome}");
+    assert!(outcome.stdout.is_empty(), "no stdout on fail-open\n{outcome}");
+}
+
+// ---------------------------------------------------------------------------
+// P2.10.3 — Truncated JSON (valid start, abrupt end)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn failopen_truncated_json() {
+    let payload = br#"{ "tool_name": "Bash", "tool_input": { "command": "git reset --ha"#;
+    let outcome = run_hook_raw(payload, &[]);
+    assert_eq!(outcome.exit_code, 0, "truncated JSON must fail-open\n{outcome}");
+    assert!(outcome.stdout.is_empty(), "no stdout on fail-open\n{outcome}");
+}
+
+// ---------------------------------------------------------------------------
+// P2.10.4 — Oversize stdin (> max_hook_input_bytes, default 256 KiB)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn failopen_oversize_stdin() {
+    // Default limit is 256 KiB. Send 300 KiB of valid-looking JSON.
+    let padding = "x".repeat(300 * 1024);
+    let payload = format!(
+        r#"{{ "tool_name": "Bash", "tool_input": {{ "command": "{padding}" }} }}"#
+    );
+    let outcome = run_hook_raw(payload.as_bytes(), &[]);
+    assert_eq!(
+        outcome.exit_code, 0,
+        "oversize stdin must fail-open\n{outcome}"
+    );
+    assert!(outcome.stdout.is_empty(), "no stdout on fail-open\n{outcome}");
+    assert!(
+        outcome.stderr_contains("exceeds limit"),
+        "stderr must mention 'exceeds limit' for oversize stdin\n{outcome}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P2.10.5 — Oversize command (input under limit, command > max_command_bytes)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn failopen_oversize_command() {
+    // Default command limit is 64 KiB. Send a 70 KiB command inside a small payload.
+    let big_cmd = "echo ".to_string() + &"A".repeat(70 * 1024);
+    let payload = build_claude_payload(&big_cmd);
+    let outcome = run_hook_raw(payload.as_bytes(), &[]);
+    assert_eq!(
+        outcome.exit_code, 0,
+        "oversize command must fail-open\n{outcome}"
+    );
+    assert!(outcome.stdout.is_empty(), "no stdout on fail-open\n{outcome}");
+    assert!(
+        outcome.stderr_contains("exceeds limit"),
+        "stderr must mention 'exceeds limit' for oversize command\n{outcome}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P2.10.6 — turn_id with wrong type (number instead of string)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn failopen_turn_id_wrong_type() {
+    let payload = br#"{
+  "session_id": "test",
+  "turn_id": 42,
+  "cwd": "/tmp",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": { "command": "git reset --hard" },
+  "tool_use_id": "call_test"
+}"#;
+    let outcome = run_hook_raw(payload, &[]);
+    // dcg should either fail-open (if serde rejects the type) or process normally.
+    // Either way, no crash — exit 0 or 2 (if treated as valid Codex payload).
+    assert!(
+        outcome.exit_code == 0 || outcome.exit_code == 2,
+        "wrong-type turn_id must not crash (exit 0 or 2), got {}\n{outcome}",
+        outcome.exit_code
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P2.10.7 — No crash on any fail-open path (universal invariant)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn failopen_no_crash_signal_on_garbage() {
+    let garbage_payloads: &[&[u8]] = &[
+        b"\xff\xfe\x00\x01",       // binary garbage
+        b"\0\0\0\0",               // null bytes
+        b"}{}{",                    // broken JSON
+        b"true",                    // JSON true
+        b"42",                      // JSON number
+        b"\"just a string\"",       // JSON string
+        b"{ \"tool_name\": 123 }", // wrong tool_name type
+    ];
+
+    for payload in garbage_payloads {
+        let outcome = run_hook_raw(payload, &[]);
+        assert_eq!(
+            outcome.exit_code, 0,
+            "garbage input must fail-open (exit 0), got {} for {:?}\n{outcome}",
+            outcome.exit_code,
+            String::from_utf8_lossy(payload)
+        );
+        assert!(
+            outcome.stdout.is_empty(),
+            "no stdout for garbage input {:?}\n{outcome}",
+            String::from_utf8_lossy(payload)
+        );
+        // Must not contain panic backtrace
+        assert!(
+            !outcome.stderr_contains("panicked at"),
+            "must not panic on garbage input {:?}\n{outcome}",
+            String::from_utf8_lossy(payload)
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P2.10.8 — Both protocols see same fail-open for malformed input
+// ---------------------------------------------------------------------------
+
+#[test]
+fn failopen_same_behavior_both_protocols() {
+    // Payload with valid structure but command is missing → fail-open for both
+    let codex_style = br#"{
+  "session_id": "test",
+  "turn_id": "turn-1",
+  "cwd": "/tmp",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {}
+}"#;
+    let claude_style = br#"{
+  "session_id": "test",
+  "cwd": "/tmp",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {}
+}"#;
+
+    let codex_outcome = run_hook_raw(codex_style, &[]);
+    let claude_outcome = run_hook_raw(claude_style, &[]);
+
+    assert_eq!(
+        codex_outcome.exit_code, 0,
+        "Codex-style missing command must fail-open\n{codex_outcome}"
+    );
+    assert_eq!(
+        claude_outcome.exit_code, 0,
+        "Claude-style missing command must fail-open\n{claude_outcome}"
+    );
+    assert!(codex_outcome.stdout.is_empty());
+    assert!(claude_outcome.stdout.is_empty());
+}
+
 // ---------------------------------------------------------------------------
 // Hermetic HOME isolation
 // ---------------------------------------------------------------------------
