@@ -177,12 +177,25 @@ pub fn auto_theme_with_config(config: &Config) -> Theme {
 }
 
 fn env_flag_enabled(var: &str) -> bool {
-    std::env::var(var).is_ok_and(|value| {
-        !matches!(
-            value.trim().to_lowercase().as_str(),
-            "" | "0" | "false" | "no" | "off"
-        )
-    })
+    std::env::var(var).is_ok_and(|value| env_flag_value_enabled(&value))
+}
+
+fn env_flag_value_enabled(value: &str) -> bool {
+    !matches!(
+        value.trim().to_lowercase().as_str(),
+        "" | "0" | "false" | "no" | "off"
+    )
+}
+
+/// Returns whether machine-friendly robot output mode is enabled.
+///
+/// Explicit `--robot` always wins. The `DCG_ROBOT` environment variable follows
+/// the same boolean parsing as other output flags, so `DCG_ROBOT=0`,
+/// `DCG_ROBOT=false`, `DCG_ROBOT=no`, and `DCG_ROBOT=off` are treated as
+/// disabled rather than merely-present.
+#[must_use]
+pub fn robot_mode_enabled(explicit_robot_flag: bool) -> bool {
+    explicit_robot_flag || env_flag_enabled("DCG_ROBOT")
 }
 
 /// Checks if the terminal supports 256 colors.
@@ -293,6 +306,25 @@ mod tests {
     fn test_env_flag_enabled_false_for_unset() {
         // An unset variable should return false
         assert!(!env_flag_enabled("DCG_DEFINITELY_NOT_SET_EVER"));
+    }
+
+    #[test]
+    fn test_env_flag_value_enabled_boolean_semantics() {
+        for value in ["1", "true", "yes", "on", "anything"] {
+            assert!(env_flag_value_enabled(value), "{value:?} should be enabled");
+        }
+
+        for value in ["", "0", "false", "no", "off", " FALSE "] {
+            assert!(
+                !env_flag_value_enabled(value),
+                "{value:?} should be disabled"
+            );
+        }
+    }
+
+    #[test]
+    fn test_robot_mode_enabled_explicit_flag_wins() {
+        assert!(robot_mode_enabled(true));
     }
 
     #[test]

@@ -25,6 +25,7 @@ use crate::interactive::{
     print_not_available_message, run_interactive_prompt,
 };
 use crate::load_default_allowlists;
+use crate::output::robot_mode_enabled;
 use crate::packs::{
     DecisionMode, ExternalPackStore, REGISTRY, Severity as PackSeverity, get_external_packs,
     load_external_packs,
@@ -1927,7 +1928,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Command::ListPacks { enabled, format }) => {
             // Robot mode forces JSON output
-            let robot_mode = cli.robot || std::env::var("DCG_ROBOT").is_ok();
+            let robot_mode = robot_mode_enabled(cli.robot);
             let effective_format = if robot_mode {
                 PacksFormat::Json
             } else {
@@ -1962,7 +1963,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             heredoc_languages,
         }) => {
             // Robot mode forces JSON output
-            let robot_mode = cli.robot || std::env::var("DCG_ROBOT").is_ok();
+            let robot_mode = robot_mode_enabled(cli.robot);
             let effective_format = if robot_mode { TestFormat::Json } else { format };
 
             // Load specific config file if provided, otherwise use default
@@ -2092,7 +2093,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             handle_allow_once_command(&config, &cmd)?;
         }
         Some(Command::RebaseRecover { ttl }) => {
-            handle_rebase_recover(ttl, cli.robot || std::env::var("DCG_ROBOT").is_ok())?;
+            handle_rebase_recover(ttl, robot_mode_enabled(cli.robot))?;
         }
         Some(Command::Scan(scan)) => {
             handle_scan_command(&config, scan, verbosity)?;
@@ -2106,7 +2107,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             with_packs,
         }) => {
             // Robot mode forces JSON output
-            let robot_mode = cli.robot || std::env::var("DCG_ROBOT").is_ok();
+            let robot_mode = robot_mode_enabled(cli.robot);
             let effective_format = if robot_mode {
                 ExplainFormat::Json
             } else {
@@ -2127,7 +2128,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             handle_history_command(&config, action)?;
         }
         Some(Command::SuggestAllowlist(cmd)) => {
-            let robot_mode = cli.robot || std::env::var("DCG_ROBOT").is_ok();
+            let robot_mode = robot_mode_enabled(cli.robot);
             handle_suggest_allowlist_command(&config, &cmd, robot_mode)?;
         }
         Some(Command::Dev { action }) => {
@@ -2138,7 +2139,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             format,
             no_color,
         }) => {
-            let robot_mode = cli.robot || std::env::var("DCG_ROBOT").is_ok();
+            let robot_mode = robot_mode_enabled(cli.robot);
             let exit_code = classify_command(&config, &command, format, no_color || robot_mode);
             if exit_code != 0 {
                 std::process::exit(exit_code);

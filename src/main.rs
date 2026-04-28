@@ -229,7 +229,7 @@ fn main() {
     // Initialize output system based on CLI flags.
     // --legacy-output, --no-color, or --robot forces plain output mode.
     // Robot mode also suppresses all stderr output.
-    let robot_mode = cli.robot || std::env::var("DCG_ROBOT").is_ok();
+    let robot_mode = destructive_command_guard::output::robot_mode_enabled(cli.robot);
     let force_plain_output = cli.legacy_output || cli.no_color || robot_mode;
     destructive_command_guard::output::init(force_plain_output);
     destructive_command_guard::output::init_console(force_plain_output);

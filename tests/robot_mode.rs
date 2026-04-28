@@ -160,6 +160,23 @@ fn test_dcg_robot_env_no_ansi_codes() {
     );
 }
 
+#[test]
+fn test_dcg_robot_env_false_values_do_not_force_json() {
+    for value in ["0", "false", "no", "off"] {
+        let (stdout, _stderr, exit_code) =
+            run_dcg_with_env(&["test", "git status"], "DCG_ROBOT", value);
+
+        assert_eq!(
+            exit_code, 0,
+            "DCG_ROBOT={value} should not change allowed command exit code"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&stdout).is_err(),
+            "DCG_ROBOT={value} should leave default human output, got JSON: {stdout}"
+        );
+    }
+}
+
 // =============================================================================
 // Robot Mode JSON Structure Tests
 // =============================================================================
