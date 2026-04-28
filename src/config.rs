@@ -3651,10 +3651,10 @@ mod tests {
     #[test]
     fn test_allowlist_config_parses_auto_prune_expired() {
         let config: Config = toml::from_str(
-            r#"
+            r"
 [allowlist]
 auto_prune_expired = true
-"#,
+",
         )
         .unwrap();
         assert!(config.allowlist.auto_prune_expired);
