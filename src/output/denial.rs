@@ -1182,4 +1182,112 @@ mod tests {
         // Visible length is 3 ("Red"), so padding should be 7 spaces
         assert_eq!(padding.len(), 7);
     }
+
+    #[test]
+    fn test_denial_box_without_branch_context() {
+        let span = HighlightSpan::new(0, 10);
+        let denial = DenialBox::new("git reset --hard", span, "core.git:reset_hard", Severity::Critical);
+
+        assert!(denial.branch_name.is_none());
+        assert!(!denial.is_protected_branch);
+
+        let output = denial.render_plain();
+        assert!(output.contains("BLOCKED: Destructive Command Detected"));
+        assert!(!output.contains("Branch:"));
+        assert!(!output.contains("Protected"));
+        assert!(!output.contains("Extra caution"));
+    }
+
+    #[test]
+    fn test_denial_box_with_branch_name() {
+        let span = HighlightSpan::new(0, 10);
+        let denial = DenialBox::new("git reset --hard", span, "core.git:reset_hard", Severity::Critical)
+            .with_branch_context("feature/my-branch", false);
+
+        assert_eq!(denial.branch_name.as_deref(), Some("feature/my-branch"));
+        assert!(!denial.is_protected_branch);
+
+        let output = denial.render_plain();
+        assert!(output.contains("BLOCKED (Branch: feature/my-branch)"));
+        assert!(!output.contains("Protected"));
+        assert!(!output.contains("Extra caution"));
+    }
+
+    #[test]
+    fn test_denial_box_with_protected_branch() {
+        let span = HighlightSpan::new(0, 10);
+        let denial = DenialBox::new("git reset --hard", span, "core.git:reset_hard", Severity::Critical)
+            .with_branch_context("main", true);
+
+        assert_eq!(denial.branch_name.as_deref(), Some("main"));
+        assert!(denial.is_protected_branch);
+
+        let output = denial.render_plain();
+        assert!(output.contains("BLOCKED (Protected Branch: main)"));
+        assert!(output.contains("Extra caution on protected branches"));
+    }
+
+    #[test]
+    #[cfg(not(feature = "rich-output"))]
+    fn test_denial_box_branch_context_ascii_render() {
+        let theme = Theme {
+            border_style: BorderStyle::Ascii,
+            colors_enabled: false,
+            ..Theme::default()
+        };
+        let span = HighlightSpan::new(0, 10);
+        let denial = DenialBox::new("rm -rf /", span, "core.fs:rm_rf", Severity::Critical)
+            .with_branch_context("main", true);
+
+        let output = denial.render(&theme);
+        assert!(output.contains("BLOCKED (Protected Branch: main)"));
+        assert!(output.contains("Extra caution on protected branches"));
+    }
+
+    #[test]
+    #[cfg(not(feature = "rich-output"))]
+    fn test_denial_box_branch_context_unicode_render() {
+        let theme = Theme {
+            border_style: BorderStyle::Unicode,
+            colors_enabled: false,
+            ..Theme::default()
+        };
+        let span = HighlightSpan::new(0, 10);
+        let denial = DenialBox::new("rm -rf /", span, "core.fs:rm_rf", Severity::High)
+            .with_branch_context("develop", false);
+
+        let output = denial.render(&theme);
+        assert!(output.contains("BLOCKED (Branch: develop)"));
+        assert!(!output.contains("Protected"));
+    }
+
+    #[test]
+    fn test_denial_box_all_fields_with_branch() {
+        let span = HighlightSpan::with_label(0, 10, "Matched");
+        let denial = DenialBox::new("git push --force", span, "core.git:push_force", Severity::High)
+            .with_explanation("Force push overwrites remote history")
+            .with_alternatives(vec!["Use git push --force-with-lease".to_string()])
+            .with_allow_once_code("abc12")
+            .with_branch_context("main", true);
+
+        let output = denial.render_plain();
+        assert!(output.contains("BLOCKED (Protected Branch: main)"));
+        assert!(output.contains("Extra caution"));
+        assert!(output.contains("Force push overwrites remote history"));
+        assert!(output.contains("git push --force-with-lease"));
+    }
+
+    #[test]
+    fn test_denial_box_branch_builder_chaining() {
+        let span = HighlightSpan::new(0, 5);
+        let denial = DenialBox::new("cmd", span, "pack:rule", Severity::Medium)
+            .with_branch_context("release/1.0", true)
+            .with_explanation("test")
+            .with_allow_once_code("xyz");
+
+        assert_eq!(denial.branch_name.as_deref(), Some("release/1.0"));
+        assert!(denial.is_protected_branch);
+        assert!(denial.explanation.is_some());
+        assert!(denial.allow_once_code.is_some());
+    }
 }
