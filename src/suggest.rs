@@ -40,6 +40,9 @@ const MEDIUM_CONFIDENCE_MIN_FREQUENCY: usize = 5;
 /// Minimum path consistency ratio for path-specific suggestions.
 const PATH_CLUSTER_THRESHOLD: f32 = 0.7;
 
+/// Minimum literal prefix length before a single token can be generalized.
+const MIN_SHARED_TOKEN_PREFIX_LEN: usize = 4;
+
 // ============================================================================
 // Confidence and Risk Assessment Types
 // ============================================================================
@@ -698,6 +701,41 @@ pub struct GeneratedPattern {
     pub example_matches: Vec<String>,
 }
 
+/// Public allowlist-generalization result for similar command families.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GeneralizedPattern {
+    /// Conservative regex pattern that covers the matched commands.
+    pub pattern: String,
+    /// Deduplicated command examples matched by the pattern.
+    pub matched_commands: Vec<String>,
+    /// Confidence score from 0.0 to 1.0 based on pattern specificity.
+    pub confidence: f64,
+}
+
+/// Generalize a group of related commands into one conservative regex pattern.
+///
+/// Returns `None` when there is fewer than two unique commands, when the
+/// commands cannot be represented by a valid regex, or when the generated
+/// pattern does not cover every command in the input.
+#[must_use]
+pub fn generalize_commands(commands: &[String]) -> Option<GeneralizedPattern> {
+    let unique_commands = deduplicate_commands(commands);
+    if unique_commands.len() < 2 {
+        return None;
+    }
+
+    let generated = generate_pattern_from_cluster(&unique_commands);
+    if generated.regex.is_empty() || !generated.matches_all {
+        return None;
+    }
+
+    Some(GeneralizedPattern {
+        pattern: generated.regex,
+        matched_commands: unique_commands,
+        confidence: f64::from(generated.specificity_score),
+    })
+}
+
 /// Generate a conservative regex pattern from a cluster of similar commands.
 ///
 /// This function implements the pattern generation strategy:
@@ -893,24 +931,10 @@ fn build_segmented_pattern(
                     .map(regex_escape)
                     .collect();
                 parts.extend(escaped);
+            } else if let Some(pattern) = build_shared_single_token_pattern(&middle_variants) {
+                parts.push(pattern);
             } else if middle_variants.len() <= MAX_ALTERNATION_COUNT {
-                // Multiple variants - use alternation
-                let alternatives: Vec<String> = middle_variants
-                    .iter()
-                    .map(|v| {
-                        v.split_whitespace()
-                            .map(regex_escape)
-                            .collect::<Vec<_>>()
-                            .join(r"\s+")
-                    })
-                    .collect();
-
-                // Sort for deterministic output
-                let mut sorted_alternatives = alternatives;
-                sorted_alternatives.sort();
-
-                let alternation = format!("(?:{})", sorted_alternatives.join("|"));
-                parts.push(alternation);
+                parts.push(build_alternation_pattern(&middle_variants));
             } else {
                 // Too many variants - use conservative wildcard
                 let pattern = build_conservative_variable_pattern(&middle_variants);
@@ -932,6 +956,22 @@ fn build_segmented_pattern(
     format!("^{}$", parts.join(r"\s+"))
 }
 
+fn build_alternation_pattern(variants: &[String]) -> String {
+    let alternatives: Vec<String> = variants
+        .iter()
+        .map(|v| {
+            v.split_whitespace()
+                .map(regex_escape)
+                .collect::<Vec<_>>()
+                .join(r"\s+")
+        })
+        .collect();
+
+    let mut sorted_alternatives = alternatives;
+    sorted_alternatives.sort();
+    format!("(?:{})", sorted_alternatives.join("|"))
+}
+
 /// Build a conservative variable pattern for too many variants.
 ///
 /// Instead of using `.*`, we try to be more specific by analyzing the structure
@@ -941,6 +981,10 @@ fn build_conservative_variable_pattern(variants: &[String]) -> String {
     let all_single_token = variants.iter().all(|v| !v.contains(' '));
 
     if all_single_token {
+        if let Some(pattern) = build_shared_single_token_pattern(variants) {
+            return pattern;
+        }
+
         // All variants are single tokens - check if they share characteristics
         let all_numeric = variants
             .iter()
@@ -963,12 +1007,105 @@ fn build_conservative_variable_pattern(variants: &[String]) -> String {
             return r"[0-9a-fA-F_-]+".to_string();
         }
 
-        // Default: word characters only (no spaces)
-        return r"[\w.-]+".to_string();
+        return build_alternation_pattern(variants);
     }
 
-    // Multiple tokens - use word characters with spaces
-    r"[\w\s.-]+".to_string()
+    build_alternation_pattern(variants)
+}
+
+fn build_shared_single_token_pattern(variants: &[String]) -> Option<String> {
+    if variants.len() < 2 || !variants.iter().all(|v| !v.is_empty() && !v.contains(' ')) {
+        return None;
+    }
+
+    let prefix = common_char_prefix(variants);
+    if prefix.chars().count() < MIN_SHARED_TOKEN_PREFIX_LEN {
+        return None;
+    }
+
+    let suffixes: Vec<&str> = variants
+        .iter()
+        .map(|variant| variant.strip_prefix(&prefix).unwrap_or_default())
+        .collect();
+    if suffixes.iter().any(|suffix| suffix.is_empty()) {
+        return None;
+    }
+
+    if prefix.starts_with('/') && !path_prefix_allows_generalization(&prefix) {
+        return None;
+    }
+
+    if !prefix_allows_generalization(&prefix, &suffixes) {
+        return None;
+    }
+
+    variable_suffix_pattern(&suffixes).map(|suffix_pattern| {
+        let escaped_prefix = regex_escape(&prefix);
+        format!("{escaped_prefix}{suffix_pattern}")
+    })
+}
+
+fn common_char_prefix(values: &[String]) -> String {
+    let Some(first) = values.first() else {
+        return String::new();
+    };
+
+    let mut prefix = String::new();
+    for (idx, ch) in first.chars().enumerate() {
+        if values
+            .iter()
+            .skip(1)
+            .all(|value| value.chars().nth(idx) == Some(ch))
+        {
+            prefix.push(ch);
+        } else {
+            break;
+        }
+    }
+    prefix
+}
+
+fn prefix_allows_generalization(prefix: &str, suffixes: &[&str]) -> bool {
+    if matches!(prefix.chars().last(), Some(':' | '-' | '_' | '.' | '/')) {
+        return true;
+    }
+
+    suffixes
+        .iter()
+        .all(|suffix| suffix.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+fn path_prefix_allows_generalization(prefix: &str) -> bool {
+    [
+        "/tmp/",
+        "/var/tmp/",
+        "/data/projects/",
+        "/workspace/",
+        "/repo/",
+        "/repos/",
+    ]
+    .iter()
+    .any(|safe_prefix| prefix.starts_with(safe_prefix))
+}
+
+fn variable_suffix_pattern(suffixes: &[&str]) -> Option<&'static str> {
+    if suffixes
+        .iter()
+        .all(|suffix| suffix.chars().all(|ch| ch.is_ascii_digit()))
+    {
+        return Some(r"\d+");
+    }
+
+    if suffixes.iter().all(|suffix| {
+        !suffix.contains('/')
+            && suffix
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
+    }) {
+        return Some(r"[\w.:-]+");
+    }
+
+    None
 }
 
 /// Validate that a pattern matches all given commands.
@@ -1014,7 +1151,10 @@ fn calculate_pattern_specificity(pattern: &str, command_count: usize) -> f32 {
         score -= 0.15;
     }
     if pattern.contains(r"\d+") {
-        score -= 0.1;
+        score -= 0.15;
+    }
+    if pattern.contains(r"[\w.:-]+") {
+        score -= 0.15;
     }
 
     // Reward anchoring
@@ -1029,7 +1169,7 @@ fn calculate_pattern_specificity(pattern: &str, command_count: usize) -> f32 {
         score += 0.1;
     } else if alternation_count > MAX_ALTERNATION_COUNT {
         // Too many alternations reduce specificity
-        score -= 0.1;
+        score -= 0.2;
     }
 
     // Penalize very short patterns (likely too broad)
@@ -1258,12 +1398,11 @@ fn build_proposed_pattern(commands: &[String]) -> String {
         return format!("^{}$", regex_escape(&unique[0]));
     }
 
-    let mut parts = Vec::with_capacity(unique.len());
-    for cmd in unique {
-        parts.push(regex_escape(&cmd));
+    if let Some(generalized) = generalize_commands(&unique) {
+        return generalized.pattern;
     }
 
-    format!("^(?:{})$", parts.join("|"))
+    format!("^{}$", build_alternation_pattern(&unique))
 }
 
 #[cfg(test)]
@@ -1643,6 +1782,91 @@ mod tests {
 
         // Specificity should be lower due to broader pattern
         assert!(pattern.specificity_score < 1.0);
+    }
+
+    #[test]
+    fn generalizes_namespaced_build_variants() {
+        let commands = vec![
+            "npm run build:dev".to_string(),
+            "npm run build:prod".to_string(),
+            "npm run build:staging".to_string(),
+        ];
+
+        let generalized = generalize_commands(&commands).expect("commands should generalize");
+
+        assert_eq!(generalized.matched_commands, commands);
+        assert!(generalized.pattern.contains("build:"));
+        assert!(
+            generalized.pattern.contains(r"[\w.:-]+"),
+            "pattern should use a constrained token suffix, got {}",
+            generalized.pattern
+        );
+        assert!(generalized.confidence > 0.0);
+
+        let re = Regex::new(&generalized.pattern).unwrap();
+        assert!(re.is_match("npm run build:qa"));
+        assert!(!re.is_match("npm run delete-everything"));
+    }
+
+    #[test]
+    fn proposed_cluster_pattern_uses_generalized_regex() {
+        let input = vec![
+            ("npm run build:dev".to_string(), 4),
+            ("npm run build:prod".to_string(), 3),
+        ];
+
+        let clusters = cluster_denied_commands(&input, 2);
+
+        assert_eq!(clusters.len(), 1);
+        assert!(clusters[0].proposed_pattern.contains("build:"));
+        assert!(clusters[0].proposed_pattern.contains(r"[\w.:-]+"));
+    }
+
+    #[test]
+    fn generalizes_temp_path_numeric_suffixes() {
+        let commands = vec![
+            "rm -rf /tmp/cache1".to_string(),
+            "rm -rf /tmp/cache2".to_string(),
+            "rm -rf /tmp/cache42".to_string(),
+        ];
+
+        let pattern = generate_pattern_from_cluster(&commands);
+
+        assert!(pattern.matches_all);
+        assert!(
+            pattern.regex.contains(r"/tmp/cache\d+"),
+            "temp path suffix should be constrained, got {}",
+            pattern.regex
+        );
+
+        let re = Regex::new(&pattern.regex).unwrap();
+        assert!(re.is_match("rm -rf /tmp/cache99"));
+        assert!(!re.is_match("rm -rf /etc/cache99"));
+    }
+
+    #[test]
+    fn sensitive_paths_are_not_wildcarded() {
+        let commands = vec![
+            "rm -rf /etc/cache1".to_string(),
+            "rm -rf /etc/cache2".to_string(),
+        ];
+
+        let pattern = generate_pattern_from_cluster(&commands);
+
+        assert!(pattern.matches_all);
+        assert!(
+            !pattern.regex.contains(r"/etc/cache\d+"),
+            "sensitive paths should remain enumerated, got {}",
+            pattern.regex
+        );
+        assert!(pattern.regex.contains('|'));
+    }
+
+    #[test]
+    fn single_command_has_no_generalized_pattern() {
+        let commands = vec!["git reset --hard".to_string()];
+
+        assert!(generalize_commands(&commands).is_none());
     }
 
     #[test]
