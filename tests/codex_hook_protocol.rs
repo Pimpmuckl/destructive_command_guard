@@ -409,18 +409,17 @@ fn regression_claude_tool_use_id_bash_stays_claude_path() {
 #[test]
 fn regression_claude_tool_use_id_launch_process_stays_claude_path() {
     // Variant with launch-process tool name.
-    let payload = format!(
-        r#"{{
+    let payload = r#"{
   "session_id": "sess-claude-test",
   "transcript_path": "/tmp/claude/transcript.jsonl",
   "cwd": "/tmp/test-workdir",
   "permission_mode": "default",
   "hook_event_name": "PreToolUse",
   "tool_name": "launch-process",
-  "tool_input": {{ "command": "git reset --hard HEAD~1" }},
+  "tool_input": { "command": "git reset --hard HEAD~1" },
   "tool_use_id": "toolu_01LAUNCH"
-}}"#
-    );
+}"#
+    .to_string();
     let outcome = run_hook_raw(payload.as_bytes(), &[]);
     assert_eq!(
         outcome.exit_code, 0,

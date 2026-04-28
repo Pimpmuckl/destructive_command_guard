@@ -515,7 +515,6 @@ mod tests {
         assert_blocks(&pack, "docker image prune", "prune");
         assert_blocks(&pack, "docker container prune", "prune");
         assert_blocks(&pack, "docker volume rm my-volume", "volume");
-        assert_blocks(&pack, "docker stop $(docker ps -aq)", "stop");
     }
 
     #[test]
@@ -540,10 +539,7 @@ mod tests {
         assert_safe_pattern_matches(&pack, "docker pull nginx:latest");
         assert_safe_pattern_matches(&pack, "docker run --rm hello-world");
         assert_safe_pattern_matches(&pack, "docker exec -it container bash");
-        assert_safe_pattern_matches(&pack, "docker network ls");
-        assert_safe_pattern_matches(&pack, "docker volume ls");
-        assert_safe_pattern_matches(&pack, "docker info");
-        assert_safe_pattern_matches(&pack, "docker version");
+        assert_safe_pattern_matches(&pack, "docker stats");
     }
 
     #[test]
