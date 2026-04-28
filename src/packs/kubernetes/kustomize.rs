@@ -104,3 +104,91 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
     ]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packs::test_helpers::*;
+    use crate::packs::Severity;
+
+    #[test]
+    fn kustomize_blocks_piped_delete() {
+        let pack = create_pack();
+        assert_blocks(
+            &pack,
+            "kustomize build ./overlays/prod | kubectl delete -f -",
+            "kustomize",
+        );
+        assert_blocks(
+            &pack,
+            "kubectl kustomize ./overlays/prod | kubectl delete -f -",
+            "kustomize",
+        );
+    }
+
+    #[test]
+    fn kustomize_blocks_kubectl_delete_k() {
+        let pack = create_pack();
+        assert_blocks(
+            &pack,
+            "kubectl delete -k ./overlays/prod",
+            "delete -k",
+        );
+    }
+
+    #[test]
+    fn kustomize_blocks_with_correct_severity() {
+        let pack = create_pack();
+        assert_blocks_with_severity(
+            &pack,
+            "kustomize build ./prod | kubectl delete -f -",
+            Severity::Critical,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "kubectl kustomize ./prod | kubectl delete -f -",
+            Severity::Critical,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "kubectl delete -k ./prod",
+            Severity::Critical,
+        );
+    }
+
+    #[test]
+    fn kustomize_safe_build_alone() {
+        let pack = create_pack();
+        assert_allows(&pack, "kustomize build ./overlays/prod");
+        assert_allows(&pack, "kubectl kustomize ./overlays/prod");
+    }
+
+    #[test]
+    fn kustomize_safe_with_diff() {
+        let pack = create_pack();
+        assert_allows(
+            &pack,
+            "kustomize build ./overlays/prod | kubectl diff -f -",
+        );
+    }
+
+    #[test]
+    fn kustomize_safe_with_dry_run() {
+        let pack = create_pack();
+        assert_allows(
+            &pack,
+            "kustomize build ./overlays/prod | kubectl apply --dry-run=client -f -",
+        );
+        assert_allows(
+            &pack,
+            "kubectl delete -k ./prod --dry-run=client",
+        );
+    }
+
+    #[test]
+    fn kustomize_unrelated_commands_no_match() {
+        let pack = create_pack();
+        assert_no_match(&pack, "ls -la");
+        assert_no_match(&pack, "git status");
+    }
+}
