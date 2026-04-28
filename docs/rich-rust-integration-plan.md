@@ -844,6 +844,27 @@ fn run_explain(command: &str, format: ExplainFormat) -> Result<()> {
 3. Update documentation
 4. Final testing across terminal types
 
+### 6.6 Phase 7 Cleanup Gate Status
+
+The Phase 7 cleanup work is now split into separate beads so each risky cleanup
+can be verified independently. The umbrella gate (`bd-3jl0`) should be treated as
+the handoff point from the validated rich-output implementation to those child
+cleanup tasks, not as permission to batch dependency removal, docs rewrites, and
+feature-default changes into one commit.
+
+| Bead | Cleanup Surface | Status |
+|------|-----------------|--------|
+| `bd-391u` | Remove `comfy-table` only after markdown/table fallbacks are accounted for | Follow-up |
+| `bd-v7lj` | Remove unused legacy output paths while preserving non-rich builds | Follow-up |
+| `bd-3fs5` | Refresh README rich-output examples and screenshots | Follow-up |
+| `bd-c0di` | Document `DCG_NO_RICH`, `NO_COLOR`, `DCG_NO_COLOR`, `TERM=dumb`, and `CI` behavior | Follow-up |
+| `bd-2uor` | Add agent-compatibility notes for stdout JSON and stderr human output | Follow-up |
+| `bd-15p0` | Consider making `rich-output` default after the cleanup and docs beads land | Follow-up |
+
+This keeps Phase 7 aligned with the safety rule for dcg output: agent-facing JSON
+contracts stay stable while human-facing rich output can improve behind explicit
+feature and environment controls.
+
 ---
 
 ## 7. Agent Safety Measures
@@ -1097,15 +1118,21 @@ fn output_works_with_screen_reader() {
 
 ### 10.2 Beta (Opt-In Users)
 
-- Environment variable: `DCG_RICH_OUTPUT=1`
-- Duration: 2 weeks
-- Collect feedback via GitHub issues
+- Feature flag: build with `--features rich-output`
+- Runtime controls: rich rendering is used only when the output is TTY-safe and
+  the disabling environment variables are absent
+- Disable rich formatting with `DCG_NO_RICH=1`, `NO_COLOR=1`, `DCG_NO_COLOR=1`,
+  `TERM=dumb`, `CI=1`, or the global `--legacy-output` / `DCG_LEGACY_OUTPUT=1`
+  fallback
+- Collect feedback via GitHub issues before changing default features
 
 ### 10.3 General Availability
 
-- Default enabled
-- Legacy fallback: `DCG_LEGACY_OUTPUT=1` or `--legacy-output`
-- Remove legacy code after 1 release cycle
+- Default-enabled rich output remains gated by `bd-15p0`
+- Keep the legacy fallback until non-rich builds and stdout/stderr separation
+  have dedicated verification on the final default-feature configuration
+- Remove legacy code only through `bd-v7lj`, after confirming no markdown,
+  scan, or agent-output contract still depends on it
 
 ---
 
