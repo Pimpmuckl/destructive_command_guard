@@ -309,6 +309,17 @@ json_escape() {
     echo -n "$s"
 }
 
+has_permission_decision() {
+    local output="$1"
+    local decision="$2"
+    echo "$output" | grep -qE "\"permissionDecision\"[[:space:]]*:[[:space:]]*\"$decision\""
+}
+
+has_dcg_warning() {
+    local stderr_output="$1"
+    [[ -n "$stderr_output" ]] && echo "$stderr_output" | grep -q "dcg WARNING"
+}
+
 # Test helper: run command and check result
 test_command() {
     local cmd="$1"
@@ -437,7 +448,7 @@ test_malformed_input() {
 # This verifies that the pack-aware quick reject allows non-core packs to be evaluated
 test_command_with_packs() {
     local cmd="$1"
-    local expected="$2"  # "block" or "allow"
+    local expected="$2"  # "block", "warn", "silent", or "allow"
     local packs="$3"     # comma-separated pack list
     local desc="$4"
 
@@ -454,38 +465,63 @@ test_command_with_packs() {
     local encoded
     encoded=$(echo -n "$json" | base64 -w 0)
 
-    # Run the binary with DCG_PACKS environment variable
-    local result
-    result=$(echo "$encoded" | base64 -d | \
+    # Run the binary with DCG_PACKS environment variable.
+    local out_file err_file
+    out_file=$(mktemp)
+    err_file=$(mktemp)
+
+    echo "$encoded" | base64 -d | \
         HOME="$TEST_ENV_HOME" \
         XDG_CONFIG_HOME="$TEST_ENV_XDG" \
         DCG_ALLOWLIST_SYSTEM_PATH="" \
         DCG_PACKS="$packs" \
-        "$BINARY" 2>/dev/null || true)
+        "$BINARY" >"$out_file" 2>"$err_file" || true
+
+    local result err
+    result=$(cat "$out_file")
+    err=$(cat "$err_file")
 
     # Check result
-    if [[ "$expected" == "block" ]]; then
-        if echo "$result" | grep -q '"permissionDecision"'; then
-            if echo "$result" | grep -q '"deny"'; then
+    case "$expected" in
+        block)
+            if has_permission_decision "$result" "deny"; then
                 log_pass "BLOCKED (pack=$packs): $desc"
                 if $VERBOSE && ! $JSON_OUTPUT; then
                     echo -e "  ${CYAN}Reason:${NC} $(echo "$result" | grep -o '"permissionDecisionReason":"[^"]*"' | head -1 | cut -d'"' -f4 | head -c 80)..."
                 fi
                 return 0
             fi
-        fi
-        log_fail "Should BLOCK with pack=$packs: $desc" "JSON with permissionDecision: deny" "${result:-<empty>}"
-        return 0
-    else
-        # Expected: allow (empty output)
-        if [[ -z "$result" ]]; then
-            log_pass "ALLOWED (pack=$packs): $desc"
+            log_fail "Should BLOCK with pack=$packs: $desc" "JSON with permissionDecision: deny" "${result:-<empty>}"
             return 0
-        else
+            ;;
+        warn)
+            if has_permission_decision "$result" "ask" && has_dcg_warning "$err"; then
+                log_pass "WARNED (pack=$packs): $desc"
+                return 0
+            fi
+            log_fail "Should WARN with pack=$packs: $desc" "JSON with permissionDecision: ask; stderr contains dcg WARNING" "stdout=${result:-<empty>} | stderr=${err:-<empty>}"
+            return 0
+            ;;
+        allow)
+            if [[ -z "$result" ]]; then
+                log_pass "ALLOWED (pack=$packs): $desc"
+                return 0
+            fi
             log_fail "Should ALLOW with pack=$packs: $desc" "<empty output>" "$result"
             return 0
-        fi
-    fi
+            ;;
+        silent)
+            if [[ -z "$result" ]] && [[ -z "$err" ]]; then
+                log_pass "SILENT (pack=$packs): $desc"
+                return 0
+            fi
+            log_fail "Should be silent with pack=$packs: $desc" "stdout+stderr empty" "stdout=${result:-<empty>} | stderr=${err:-<empty>}"
+            return 0
+            ;;
+        *)
+            log_fail "Invalid expected mode with pack=$packs: $desc" "block|warn|silent|allow" "$expected"
+            ;;
+    esac
 }
 
 # Test helper: run command WITHOUT policy override to test default severity behavior
@@ -524,10 +560,10 @@ test_default_severity_behavior() {
 
     case "$expected" in
         warn)
-            if [[ -z "$out" ]] && [[ -n "$err" ]] && echo "$err" | grep -q "dcg WARNING"; then
+            if has_permission_decision "$out" "ask" && has_dcg_warning "$err"; then
                 log_pass "WARNED (default severity): $desc"
             else
-                log_fail "Should WARN (default severity): $desc" "stdout empty; stderr contains dcg WARNING" "stdout=${out:-<empty>} | stderr=${err:-<empty>}"
+                log_fail "Should WARN (default severity): $desc" "JSON with permissionDecision: ask; stderr contains dcg WARNING" "stdout=${out:-<empty>} | stderr=${err:-<empty>}"
             fi
             ;;
         *)
@@ -574,17 +610,17 @@ test_command_with_policy() {
 
     case "$expected" in
         block)
-            if echo "$out" | grep -q '"permissionDecision"' && echo "$out" | grep -q '"deny"'; then
+            if has_permission_decision "$out" "deny"; then
                 log_pass "BLOCKED (policy=$policy_mode): $desc"
             else
                 log_fail "Should BLOCK (policy=$policy_mode): $desc" "JSON with permissionDecision: deny" "${out:-<empty>}"
             fi
             ;;
         warn)
-            if [[ -z "$out" ]] && [[ -n "$err" ]] && echo "$err" | grep -q "dcg WARNING"; then
+            if has_permission_decision "$out" "ask" && has_dcg_warning "$err"; then
                 log_pass "WARNED (policy=$policy_mode): $desc"
             else
-                log_fail "Should WARN (policy=$policy_mode): $desc" "stdout empty; stderr contains dcg WARNING" "stdout=${out:-<empty>} | stderr=${err:-<empty>}"
+                log_fail "Should WARN (policy=$policy_mode): $desc" "JSON with permissionDecision: ask; stderr contains dcg WARNING" "stdout=${out:-<empty>} | stderr=${err:-<empty>}"
             fi
             ;;
         silent)
@@ -1102,7 +1138,7 @@ test_command_with_packs "scp file.txt user@host:/tmp/backup/" "allow" "remote.sc
 test_command_with_packs "aws cloudfront list-distributions" "allow" "cdn.cloudfront" "aws cloudfront list-distributions (cloudfront pack enabled, safe command)"
 test_command_with_packs "aws cloudfront get-distribution --id ABC" "allow" "cdn.cloudfront" "aws cloudfront get-distribution (cloudfront pack enabled, safe command)"
 test_command_with_packs "aws cloudfront delete-distribution --id ABC --if-match ETAG" "block" "cdn.cloudfront" "aws cloudfront delete-distribution (cloudfront pack enabled)"
-test_command_with_packs "aws cloudfront create-invalidation --distribution-id ABC --paths '/*'" "block" "cdn.cloudfront" "aws cloudfront create-invalidation (cloudfront pack enabled)"
+test_command_with_packs "aws cloudfront create-invalidation --distribution-id ABC --paths '/*'" "warn" "cdn.cloudfront" "aws cloudfront create-invalidation (cloudfront pack enabled)"
 
 # AWS SES pack tests
 test_command_with_packs "aws ses list-identities" "allow" "email.ses" "aws ses list-identities (ses pack enabled, safe command)"
@@ -1150,9 +1186,9 @@ test_command_with_packs "terraform plan" "allow" "infrastructure.terraform" "ter
 # GitHub Actions pack tests
 test_command_with_packs "gh secret delete FOO" "block" "cicd.github_actions" "gh secret delete (github actions pack enabled)"
 test_command_with_packs "gh -R owner/repo secret remove FOO" "block" "cicd.github_actions" "gh -R ... secret remove (github actions pack enabled)"
-test_command_with_packs "gh variable delete FOO" "block" "cicd.github_actions" "gh variable delete (github actions pack enabled)"
-test_command_with_packs "gh workflow disable 123" "block" "cicd.github_actions" "gh workflow disable (github actions pack enabled)"
-test_command_with_packs "gh run cancel 123" "block" "cicd.github_actions" "gh run cancel (github actions pack enabled)"
+test_command_with_packs "gh variable delete FOO" "warn" "cicd.github_actions" "gh variable delete (github actions pack enabled)"
+test_command_with_packs "gh workflow disable 123" "silent" "cicd.github_actions" "gh workflow disable (github actions pack enabled)"
+test_command_with_packs "gh run cancel 123" "silent" "cicd.github_actions" "gh run cancel (github actions pack enabled)"
 test_command_with_packs "gh api -X DELETE repos/o/r/actions/secrets/FOO" "block" "cicd.github_actions" "gh api -X DELETE .../actions/secrets (github actions pack enabled)"
 test_command_with_packs "gh secret list" "allow" "cicd.github_actions" "gh secret list (github actions pack enabled, safe command)"
 
@@ -1185,7 +1221,7 @@ test_command_with_packs "curl -X GET https://api.cloudflare.com/client/v4/zones"
 test_command_with_packs "aws route53 delete-hosted-zone --id Z123" "block" "dns.route53" "aws route53 delete-hosted-zone (route53 dns pack enabled)"
 test_command_with_packs "aws route53 change-resource-record-sets --hosted-zone-id Z123 --change-batch '{\"Changes\":[{\"Action\":\"DELETE\"}]}'" "block" "dns.route53" "aws route53 change-resource-record-sets DELETE (route53 dns pack enabled)"
 test_command_with_packs "aws route53 delete-health-check --health-check-id abc" "block" "dns.route53" "aws route53 delete-health-check (route53 dns pack enabled)"
-test_command_with_packs "aws route53 delete-query-logging-config --id abc" "block" "dns.route53" "aws route53 delete-query-logging-config (route53 dns pack enabled)"
+test_command_with_packs "aws route53 delete-query-logging-config --id abc" "warn" "dns.route53" "aws route53 delete-query-logging-config (route53 dns pack enabled)"
 test_command_with_packs "aws route53 delete-traffic-policy --id abc --version 1" "block" "dns.route53" "aws route53 delete-traffic-policy (route53 dns pack enabled)"
 test_command_with_packs "aws route53 delete-reusable-delegation-set --id N123" "block" "dns.route53" "aws route53 delete-reusable-delegation-set (route53 dns pack enabled)"
 test_command_with_packs "aws route53 list-hosted-zones" "allow" "dns.route53" "aws route53 list-hosted-zones (route53 dns pack enabled, safe command)"
@@ -1195,8 +1231,8 @@ test_command_with_packs "aws route53 test-dns-answer --hosted-zone-id Z123 --rec
 
 # Generic DNS tools pack tests
 test_command_with_packs "echo 'delete example.com' | nsupdate" "block" "dns.generic" "nsupdate delete via pipe (generic dns pack enabled)"
-test_command_with_packs "nsupdate -l" "block" "dns.generic" "nsupdate -l local update (generic dns pack enabled)"
-test_command_with_packs "dig axfr example.com" "block" "dns.generic" "dig axfr zone transfer (generic dns pack enabled)"
+test_command_with_packs "nsupdate -l" "warn" "dns.generic" "nsupdate -l local update (generic dns pack enabled)"
+test_command_with_packs "dig axfr example.com" "warn" "dns.generic" "dig axfr zone transfer (generic dns pack enabled)"
 test_command_with_packs "dig example.com" "allow" "dns.generic" "dig query (generic dns pack enabled, safe command)"
 test_command_with_packs "dig +short example.com" "allow" "dns.generic" "dig +short (generic dns pack enabled, safe command)"
 test_command_with_packs "host example.com" "allow" "dns.generic" "host lookup (generic dns pack enabled, safe command)"
