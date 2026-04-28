@@ -413,14 +413,10 @@ fn memory_codex_protocol_detection() {
     .map(|cmd| sample_codex_input(cmd))
     .collect();
 
-    let claude_inputs: Vec<String> = [
-        "git reset --hard HEAD~3",
-        "rm -rf /",
-        "ls -la",
-    ]
-    .iter()
-    .map(|cmd| sample_claude_input(cmd))
-    .collect();
+    let claude_inputs: Vec<String> = ["git reset --hard HEAD~3", "rm -rf /", "ls -la"]
+        .iter()
+        .map(|cmd| sample_claude_input(cmd))
+        .collect();
 
     assert_no_leak("codex_protocol_detection", 1000, 2 * 1024 * 1024, || {
         for json in &codex_inputs {
@@ -447,11 +443,7 @@ fn memory_codex_deny_pipeline() {
     let enabled_keywords = dcg::packs::REGISTRY.collect_enabled_keywords(&enabled_packs);
     let allowlists = dcg::load_default_allowlists();
 
-    let destructive_cmds = [
-        "git reset --hard HEAD~3",
-        "rm -rf build/",
-        "sudo rm -rf /",
-    ];
+    let destructive_cmds = ["git reset --hard HEAD~3", "rm -rf build/", "sudo rm -rf /"];
 
     let codex_inputs: Vec<String> = destructive_cmds
         .iter()
@@ -488,6 +480,7 @@ fn memory_codex_deny_pipeline() {
                             pi.and_then(|p| p.severity),
                             None,
                             pi.map_or(&[], |p| p.suggestions),
+                            None,
                         );
                         black_box(&stdout_buf);
                         black_box(&stderr_buf);
@@ -533,12 +526,16 @@ fn memory_codex_deny_output_formatting() {
                 Some(dcg::packs::Severity::Critical),
                 Some(0.95),
                 &[],
+                None,
             );
             black_box(&stdout_buf);
             black_box(&stderr_buf);
 
             // Codex path: stdout should be empty (no JSON), stderr has colored message
-            debug_assert!(stdout_buf.is_empty(), "Codex deny should not write to stdout");
+            debug_assert!(
+                stdout_buf.is_empty(),
+                "Codex deny should not write to stdout"
+            );
 
             stdout_buf.clear();
             stderr_buf.clear();
@@ -595,6 +592,7 @@ fn memory_codex_vs_claude_deny_parity() {
                             pi.and_then(|p| p.severity),
                             None,
                             pi.map_or(&[], |p| p.suggestions),
+                            None,
                         );
                         black_box(&stdout_buf);
                         black_box(&stderr_buf);

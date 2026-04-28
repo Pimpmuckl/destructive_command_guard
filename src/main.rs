@@ -619,6 +619,11 @@ fn main() {
                 }
             }
 
+            let branch_ctx = if config.git_awareness.should_show_branch_in_output() {
+                result.branch_context.as_ref()
+            } else {
+                None
+            };
             hook::output_denial_for_protocol(
                 hook_protocol,
                 &command,
@@ -631,6 +636,7 @@ fn main() {
                 info.severity,
                 None, // confidence not yet available in PatternMatch
                 info.suggestions,
+                branch_ctx,
             );
 
             // Log if configured

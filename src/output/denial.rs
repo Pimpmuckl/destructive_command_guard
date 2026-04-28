@@ -40,6 +40,10 @@ pub struct DenialBox {
     pub alternatives: Vec<String>,
     /// Optional allow-once code.
     pub allow_once_code: Option<String>,
+    /// Git branch name (shown when `git_awareness.show_branch_in_output` is enabled).
+    pub branch_name: Option<String>,
+    /// Whether the branch is protected (adds extra caution note).
+    pub is_protected_branch: bool,
 }
 
 impl DenialBox {
@@ -60,6 +64,8 @@ impl DenialBox {
             explanation: None,
             alternatives: Vec::new(),
             allow_once_code: None,
+            branch_name: None,
+            is_protected_branch: false,
         }
     }
 
@@ -104,6 +110,18 @@ impl DenialBox {
     #[must_use]
     pub fn with_allow_once_code(mut self, code: impl Into<String>) -> Self {
         self.allow_once_code = Some(code.into());
+        self
+    }
+
+    /// Add git branch context.
+    #[must_use]
+    pub fn with_branch_context(
+        mut self,
+        branch_name: impl Into<String>,
+        is_protected: bool,
+    ) -> Self {
+        self.branch_name = Some(branch_name.into());
+        self.is_protected_branch = is_protected;
         self
     }
 
@@ -157,10 +175,28 @@ impl DenialBox {
         // Build content as a Vec of lines
         let mut lines = Vec::new();
 
-        // 1. Header is handled by Panel title, but we add inner padding text
         let severity_markup = theme.severity_markup(self.severity);
-        lines.push(format!("[{severity_markup}]🛑 COMMAND BLOCKED[/]"));
+        if let Some(branch) = &self.branch_name {
+            if self.is_protected_branch {
+                lines.push(format!(
+                    "[{severity_markup}]🛑 BLOCKED (Protected Branch: {branch})[/]"
+                ));
+            } else {
+                lines.push(format!(
+                    "[{severity_markup}]🛑 BLOCKED (Branch: {branch})[/]"
+                ));
+            }
+        } else {
+            lines.push(format!("[{severity_markup}]🛑 COMMAND BLOCKED[/]"));
+        }
         lines.push(String::new());
+
+        if self.is_protected_branch {
+            lines.push(format!(
+                "[{severity_markup}]Extra caution on protected branches.[/]"
+            ));
+            lines.push(String::new());
+        }
 
         // 2. Command with highlighting
         // Note: We use manual highlighting for now, but rich_rust Syntax could be used later
@@ -236,9 +272,21 @@ impl DenialBox {
             false,
         );
 
-        // Header
-        let _ = writeln!(output, "BLOCKED: Destructive Command Detected");
+        if let Some(branch) = &self.branch_name {
+            if self.is_protected_branch {
+                let _ = writeln!(output, "BLOCKED (Protected Branch: {branch})");
+            } else {
+                let _ = writeln!(output, "BLOCKED (Branch: {branch})");
+            }
+        } else {
+            let _ = writeln!(output, "BLOCKED: Destructive Command Detected");
+        }
         let _ = writeln!(output);
+
+        if self.is_protected_branch {
+            let _ = writeln!(output, "  !! Extra caution on protected branches.");
+            let _ = writeln!(output);
+        }
 
         // Command with highlighting
         let highlighted =
@@ -293,8 +341,15 @@ impl DenialBox {
         );
         let explanation_label = format!("\x1b[1;{}mExplanation:\x1b[0m", &severity_code);
 
-        // Top border with header
-        let header = " \u{26d4}  BLOCKED: Destructive Command Detected ";
+        let header = if let Some(branch) = &self.branch_name {
+            if self.is_protected_branch {
+                format!(" \u{26d4}  BLOCKED (Protected Branch: {branch}) ")
+            } else {
+                format!(" \u{26d4}  BLOCKED (Branch: {branch}) ")
+            }
+        } else {
+            " \u{26d4}  BLOCKED: Destructive Command Detected ".to_string()
+        };
         let header_len = header.chars().count();
         let top_pad = width.saturating_sub(header_len);
 
@@ -319,6 +374,26 @@ impl DenialBox {
             &severity_code,
             "\u{2500}".repeat(width)
         );
+
+        if self.is_protected_branch {
+            let caution = "\u{26a0}  Extra caution on protected branches.";
+            let _ = writeln!(
+                output,
+                "\x1b[{}m\u{2502}\x1b[0m  \x1b[1;{}m{}\x1b[0m{}  \x1b[{}m\u{2502}\x1b[0m",
+                &severity_code,
+                &severity_code,
+                caution,
+                padding_for(caution, width.saturating_sub(4)),
+                &severity_code
+            );
+            let _ = writeln!(
+                output,
+                "\x1b[{}m\u{2502}\x1b[0m{}  \x1b[{}m\u{2502}\x1b[0m",
+                &severity_code,
+                " ".repeat(width.saturating_sub(2)),
+                &severity_code
+            );
+        }
 
         // Command section
         let highlighted = format_highlighted_command(
@@ -473,14 +548,32 @@ impl DenialBox {
             false,
         );
 
-        // Top border with header
-        let header = " !  BLOCKED: Destructive Command Detected ";
+        let header = if let Some(branch) = &self.branch_name {
+            if self.is_protected_branch {
+                format!(" !  BLOCKED (Protected Branch: {branch}) ")
+            } else {
+                format!(" !  BLOCKED (Branch: {branch}) ")
+            }
+        } else {
+            " !  BLOCKED: Destructive Command Detected ".to_string()
+        };
         let header_len = header.chars().count();
         let top_pad = width.saturating_sub(header_len);
 
         let _ = writeln!(output, "+{}+", "-".repeat(width));
         let _ = writeln!(output, "|{}{}|", header, " ".repeat(top_pad));
         let _ = writeln!(output, "+{}+", "-".repeat(width));
+
+        if self.is_protected_branch {
+            let caution = "!!  Extra caution on protected branches.";
+            let _ = writeln!(
+                output,
+                "|  {}{}  |",
+                caution,
+                padding_for(caution, width.saturating_sub(4))
+            );
+            let _ = writeln!(output, "|{}  |", " ".repeat(width.saturating_sub(2)));
+        }
 
         // Command section
         let highlighted = format_highlighted_command(

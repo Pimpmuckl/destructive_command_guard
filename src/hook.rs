@@ -632,6 +632,7 @@ pub(crate) fn print_colorful_warning_to(
     matched_span: Option<&MatchSpan>,
     pattern_suggestions: &[PatternSuggestion],
     severity: Option<crate::packs::Severity>,
+    branch_context: Option<&crate::evaluator::BranchContext>,
 ) {
     #[cfg(feature = "rich-output")]
     let console_instance = console();
@@ -681,6 +682,12 @@ pub(crate) fn print_colorful_warning_to(
 
     if let Some(code) = allow_once_code {
         denial = denial.with_allow_once_code(code);
+    }
+
+    if let Some(ctx) = branch_context {
+        if let Some(name) = &ctx.branch_name {
+            denial = denial.with_branch_context(name, ctx.is_protected);
+        }
     }
 
     let _ = writeln!(writer, "{}", denial.render(&theme));
@@ -746,6 +753,7 @@ pub fn print_colorful_warning(
         matched_span,
         pattern_suggestions,
         severity,
+        None,
     );
 }
 
@@ -841,6 +849,7 @@ pub fn write_denial_to(
     severity: Option<crate::packs::Severity>,
     confidence: Option<f64>,
     pattern_suggestions: &[PatternSuggestion],
+    branch_context: Option<&crate::evaluator::BranchContext>,
 ) {
     let allow_once_code = allow_once.map(|info| info.code.as_str());
     print_colorful_warning_to(
@@ -854,6 +863,7 @@ pub fn write_denial_to(
         matched_span,
         pattern_suggestions,
         severity,
+        branch_context,
     );
 
     let message = format_denial_message(command, reason, explanation, pack, pattern);
@@ -946,6 +956,7 @@ pub fn output_denial_for_protocol(
     severity: Option<crate::packs::Severity>,
     confidence: Option<f64>,
     pattern_suggestions: &[PatternSuggestion],
+    branch_context: Option<&crate::evaluator::BranchContext>,
 ) {
     let out = io::stdout();
     let mut out_handle = out.lock();
@@ -965,6 +976,7 @@ pub fn output_denial_for_protocol(
         severity,
         confidence,
         pattern_suggestions,
+        branch_context,
     );
 }
 
@@ -996,6 +1008,7 @@ pub fn output_denial(
         severity,
         confidence,
         pattern_suggestions,
+        None,
     );
 }
 
@@ -1725,6 +1738,7 @@ mod tests {
             Some(crate::packs::Severity::Critical),
             Some(0.95),
             &[],
+            None,
         );
 
         let stdout_str = String::from_utf8_lossy(&stdout);
@@ -1760,6 +1774,7 @@ mod tests {
             Some(crate::packs::Severity::Critical),
             Some(0.95),
             &[],
+            None,
         );
 
         assert!(
@@ -1802,6 +1817,7 @@ mod tests {
             Some(crate::packs::Severity::Critical),
             None,
             &[],
+            None,
         );
 
         let stdout_str = String::from_utf8_lossy(&stdout);
@@ -1837,6 +1853,7 @@ mod tests {
             Some(crate::packs::Severity::High),
             None,
             &[],
+            None,
         );
 
         let stdout_str = String::from_utf8_lossy(&stdout);

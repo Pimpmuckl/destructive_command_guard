@@ -123,6 +123,7 @@ fn run_deny_path(payload: &str, state: &BenchState, buffers: &mut OutputBuffers)
         info.severity,
         None,
         info.suggestions,
+        None,
     );
 
     (buffers.stdout.len(), buffers.stderr.len())
