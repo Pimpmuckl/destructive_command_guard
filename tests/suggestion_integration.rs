@@ -106,7 +106,8 @@ fn generate_enhanced_suggestions_with_bypasses() {
     assert_eq!(suggestion.confidence, ConfidenceTier::High);
     // Reason should be ManuallyBypassed
     assert_eq!(suggestion.reason, SuggestionReason::ManuallyBypassed);
-    assert_eq!(suggestion.bypass_count, 2);
+    // Bypass is a per-command signal, not a per-denied-row count.
+    assert_eq!(suggestion.bypass_count, 1);
 }
 
 #[test]
@@ -120,6 +121,7 @@ fn generate_enhanced_suggestions_clustered_paths() {
     let suggestion = &suggestions[0];
     // Should suggest path-specific allowlisting
     assert!(suggestion.suggest_path_specific);
+    assert_eq!(suggestion.reason, SuggestionReason::PathClustered);
     assert!(!suggestion.path_patterns.is_empty());
 }
 

@@ -250,6 +250,11 @@ impl AllowlistSuggestion {
             }
         }
 
+        self.reason = determine_primary_reason(
+            self.cluster.frequency,
+            self.bypass_count > 0,
+            &self.path_patterns,
+        );
         self.score = calculate_suggestion_score(self.confidence, self.risk);
         self
     }
