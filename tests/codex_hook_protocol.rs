@@ -1648,6 +1648,258 @@ fn codex_allow_once_round_trip() {
 }
 
 // ===========================================================================
+// P2.6 — History entry persists across Codex's process::exit(2)
+//
+// The fix at src/main.rs:653-655 calls writer.flush_sync() before
+// process::exit(2). Without that flush, the async HistoryWriter's worker
+// thread gets killed by libc::exit and the deny entry is lost.
+// ===========================================================================
+
+#[test]
+fn codex_deny_writes_history_entry_despite_exit_2() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let db_path = home.path().join("codex-history.db");
+
+    let config_dir = home.path().join(".config/dcg");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        b"[history]\nenabled = true\n",
+    )
+    .unwrap();
+
+    let payload = build_codex_payload("git reset --hard HEAD~1");
+    let system_path = std::env::var("PATH").unwrap_or_default();
+
+    let mut cmd = Command::new(dcg_binary());
+    cmd.env_clear()
+        .env("PATH", &system_path)
+        .env("HOME", home.path())
+        .env("TMPDIR", home.path().join("tmp"))
+        .env("NO_COLOR", "1")
+        .env("DCG_HISTORY_DB", &db_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("spawn");
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        stdin.write_all(payload.as_bytes()).unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    let outcome = HookOutcome {
+        stdout: output.stdout,
+        stderr: output.stderr,
+        exit_code: output.status.code().unwrap_or(-1),
+        stdin_sent: payload.into_bytes(),
+        home_dir: home.path().to_path_buf(),
+    };
+
+    assert_eq!(
+        outcome.exit_code, 2,
+        "Codex deny must exit 2\n{outcome}"
+    );
+
+    // Despite process::exit(2), flush_sync() runs first → DB exists with data.
+    // fsqlite/sqlite page size is 4096; a newly-created DB with schema + one row
+    // may be exactly 4096 bytes (one page).
+    assert!(
+        db_path.exists(),
+        "history DB must exist after Codex deny (flush_sync before exit 2)\n{outcome}"
+    );
+    let db_size = std::fs::metadata(&db_path)
+        .expect("stat history DB")
+        .len();
+    assert!(
+        db_size >= 4096,
+        "history DB must contain at least one page (>= 4096 bytes), got {db_size}\n{outcome}"
+    );
+}
+
+#[test]
+fn codex_deny_with_history_disabled_still_exits_2() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let config_dir = home.path().join(".config/dcg");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    // Explicitly disable history
+    std::fs::write(
+        config_dir.join("config.toml"),
+        b"[history]\nenabled = false\n",
+    )
+    .unwrap();
+
+    let payload = build_codex_payload("git reset --hard HEAD~1");
+    let system_path = std::env::var("PATH").unwrap_or_default();
+
+    let mut cmd = Command::new(dcg_binary());
+    cmd.env_clear()
+        .env("PATH", &system_path)
+        .env("HOME", home.path())
+        .env("TMPDIR", home.path().join("tmp"))
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("spawn");
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        stdin.write_all(payload.as_bytes()).unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap_or(-1),
+        2,
+        "Codex deny must still exit 2 with history disabled"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "Codex deny must produce no stdout with history disabled"
+    );
+    assert!(
+        !output.stderr.is_empty(),
+        "Codex deny must still produce stderr with history disabled"
+    );
+
+    // No history DB should be created
+    let default_db = home.path().join(".config/dcg/history.db");
+    assert!(
+        !default_db.exists(),
+        "no history DB should be created when history is disabled"
+    );
+}
+
+#[test]
+fn codex_rapid_fire_denies_all_persist_to_history() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let db_path = home.path().join("rapid-history.db");
+
+    let config_dir = home.path().join(".config/dcg");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        b"[history]\nenabled = true\n",
+    )
+    .unwrap();
+
+    let system_path = std::env::var("PATH").unwrap_or_default();
+    let commands = [
+        "git reset --hard HEAD~1",
+        "git reset --hard HEAD~2",
+        "git clean -fd",
+        "git push --force origin main",
+        "git reset --hard HEAD~3",
+    ];
+
+    // Sequential rapid-fire: 5 Codex denies, each process::exit(2)
+    for cmd in &commands {
+        let payload = build_codex_payload(cmd);
+        let mut child = Command::new(dcg_binary())
+            .env_clear()
+            .env("PATH", &system_path)
+            .env("HOME", home.path())
+            .env("TMPDIR", home.path().join("tmp"))
+            .env("NO_COLOR", "1")
+            .env("DCG_HISTORY_DB", &db_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn");
+
+        {
+            let stdin = child.stdin.as_mut().unwrap();
+            stdin.write_all(payload.as_bytes()).unwrap();
+        }
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(
+            output.status.code().unwrap_or(-1),
+            2,
+            "Codex deny must exit 2 for '{cmd}'"
+        );
+    }
+
+    // All 5 entries should have been flushed before their respective exit(2)
+    assert!(
+        db_path.exists(),
+        "history DB must exist after 5 rapid-fire Codex denies"
+    );
+    let db_size = std::fs::metadata(&db_path)
+        .expect("stat history DB")
+        .len();
+    // With 5 entries, the DB should be at least one page (4096 bytes)
+    assert!(
+        db_size >= 4096,
+        "history DB with 5 entries must be >= 4096 bytes, got {db_size}"
+    );
+}
+
+#[test]
+fn codex_deny_history_write_protected_dir_no_panic() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let config_dir = home.path().join(".config/dcg");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        b"[history]\nenabled = true\n",
+    )
+    .unwrap();
+
+    // Point DCG_HISTORY_DB at a path inside a read-only directory
+    let readonly_dir = home.path().join("readonly");
+    std::fs::create_dir_all(&readonly_dir).unwrap();
+    let db_path = readonly_dir.join("history.db");
+    // Make the directory read-only so DB creation fails
+    let mut perms = std::fs::metadata(&readonly_dir).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&readonly_dir, perms.clone()).unwrap();
+
+    let payload = build_codex_payload("git reset --hard HEAD~1");
+    let system_path = std::env::var("PATH").unwrap_or_default();
+
+    let mut cmd = Command::new(dcg_binary());
+    cmd.env_clear()
+        .env("PATH", &system_path)
+        .env("HOME", home.path())
+        .env("TMPDIR", home.path().join("tmp"))
+        .env("NO_COLOR", "1")
+        .env("DCG_HISTORY_DB", &db_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("spawn");
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        stdin.write_all(payload.as_bytes()).unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+
+    // Must still exit 2 (deny works even if history fails)
+    assert_eq!(
+        output.status.code().unwrap_or(-1),
+        2,
+        "Codex deny must exit 2 even when history DB creation fails"
+    );
+    assert!(
+        !output.stderr.is_empty(),
+        "Codex deny must produce stderr even when history fails"
+    );
+    // Must not contain panic
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("panicked at"),
+        "must not panic when history write fails\nstderr: {stderr}"
+    );
+
+    // Restore permissions for cleanup
+    perms.set_readonly(false);
+    std::fs::set_permissions(&readonly_dir, perms).unwrap();
+}
+
+// ===========================================================================
 // Hermetic HOME isolation + P2.14 Parallel test runner isolation
 //
 // Meta-tests that validate the test infrastructure itself. Without these,
