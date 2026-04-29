@@ -182,6 +182,30 @@ const SHRED_SUGGESTIONS: &[PatternSuggestion] = &[
         "Single-pass shred is faster (and on SSDs, multi-pass adds little)",
     ),
 ];
+
+/// Suggestions for `tar --remove-files` patterns. `tar --remove-files
+/// -cf <archive> <source>` archives the source paths into <archive>,
+/// then deletes the originals — bytewise-equivalent to `rm -rf <source>`
+/// on the destination tree. The destruction trigger is the
+/// `--remove-files` flag; without it tar only reads the source.
+const TAR_REMOVE_FILES_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "tar -cf {path}.tar {path}",
+        "Archive without --remove-files (sources are preserved)",
+    ),
+    PatternSuggestion::new(
+        "tar -cf {path}.tar {path} && rm -ri {path}",
+        "Archive first, then remove with confirmation prompts",
+    ),
+    PatternSuggestion::new(
+        "tar --remove-files -cf out.tar /tmp/{subdir}",
+        "Safe temp-directory archive + remove (allowed without confirmation)",
+    ),
+    PatternSuggestion::new(
+        "ls -la {path}",
+        "Verify the source path before archive+delete",
+    ),
+];
 use crate::{normalize::NormalizeTokenKind, normalize::tokenize_for_normalization};
 use std::ops::Range;
 
@@ -553,9 +577,12 @@ pub fn create_pack() -> Pack {
         // destroys file content without removing the inode.
         // `shred` covers overwrite-and-unlink (or just overwrite) — DoD-
         // style data destruction with no recovery.
+        // `tar` covers `tar --remove-files <sensitive-source>`, which
+        // archives-then-deletes — i.e. recursive-force-delete masquerading
+        // as an archive operation.
         // Mirror entries MUST also exist in src/packs/mod.rs::PACK_ENTRIES
         // (the duplicate-source-of-truth that gates execution).
-        keywords: &["rm", "find", "unlink", "truncate", "shred"],
+        keywords: &["rm", "find", "unlink", "truncate", "shred", "tar"],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
         keyword_matcher: None,
@@ -847,6 +874,44 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         safe_pattern!(
             "shred-tmpdir-brace",
             r"^shred(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+\$\{TMPDIR\}/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s*$"
+        ),
+        // -----------------------------------------------------------------
+        // `tar --remove-files` safe whitelist.
+        //
+        // `tar --remove-files -cf <archive> <source>` archives sources
+        // and then deletes them. The destructive pair is `--remove-files`
+        // PLUS a sensitive source path; safe rescue requires the source
+        // to be entirely under a temp directory.
+        //
+        // Pattern shape: anchored `^...$`, optional flags (each flag may
+        // take a non-path-like value — that swallows the `-cf out.tar`
+        // archive arg without falsely matching it as a sensitive path),
+        // then the temp-dir source, then optional trailing flags. The
+        // `(?=\s+[^|;&]*--remove-files\b)` lookahead requires the flag
+        // to actually be present (otherwise the destructive rule wouldn't
+        // fire and no rescue is needed).
+        //
+        // Trade-off accepted: a multi-source mixed command like
+        // `tar --remove-files -cf out.tar /tmp/foo /etc/bar` will NOT
+        // be rescued (there's a non-tmp positional after /tmp/foo, so
+        // the trailing repetition fails to consume it) and the
+        // destructive rule will fire correctly on the /etc/bar source.
+        // -----------------------------------------------------------------
+        safe_pattern!(
+            "tar-remove-files-tmp",
+            r"^tar(?=\s+[^|;&]*--remove-files\b)(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s*$"
+        ),
+        safe_pattern!(
+            "tar-remove-files-var-tmp",
+            r"^tar(?=\s+[^|;&]*--remove-files\b)(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s*$"
+        ),
+        safe_pattern!(
+            "tar-remove-files-tmpdir",
+            r"^tar(?=\s+[^|;&]*--remove-files\b)(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+\$TMPDIR/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s*$"
+        ),
+        safe_pattern!(
+            "tar-remove-files-tmpdir-brace",
+            r"^tar(?=\s+[^|;&]*--remove-files\b)(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+\$\{TMPDIR\}/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s*$"
         ),
     ]
 }
@@ -1197,6 +1262,69 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - On modern SSDs `shred` may not actually overwrite the underlying flash \
                cells; use `cryptsetup erase` or vendor secure-erase utilities instead.",
             SHRED_SUGGESTIONS
+        ),
+        // ----- `tar --remove-files <sensitive>` (Critical: root/home) -----
+        //
+        // `tar --remove-files -cf <archive> <source>` archives the source
+        // tree into <archive>, then deletes the originals — bytewise-
+        // equivalent to `rm -rf <source>` once the archive is written.
+        // With `-cf /dev/null` the archive is discarded entirely, making
+        // it a pure delete. This is the sibling-bypass of the rm-rf-root-
+        // home and find-delete-root-home rules: agents that learn `rm -rf`
+        // and `find -delete` are blocked simply switch to
+        // `tar --remove-files`.
+        //
+        // Order-agnostic match: `--remove-files` and the sensitive source
+        // path can appear in either order (alternation arms below). Both
+        // tokens must live inside the SAME shell command segment
+        // (`[^|;&]*?`) so a benign tar elsewhere in a compound chain
+        // does not taint a separate sensitive-path mention later.
+        //
+        // Known limitation: `tar --remove-files -cf /etc/foo.tar /tmp/x`
+        // (writing the ARCHIVE into /etc, not deleting from it) trips
+        // this rule because the regex doesn't position-parse `-cf`'s
+        // argument. Accepted: writing tar archives to /etc is itself
+        // suspicious and `dcg allow-once` covers the rare legitimate case.
+        destructive_pattern!(
+            "tar-remove-files-root-home",
+            r#"\btar\b[^|;&]*?\s--remove-files\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)|\btar\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)[^|;&]*?\s--remove-files\b"#,
+            "tar --remove-files on a sensitive system or home path is recursive deletion masquerading as an archive operation. EXTREMELY DANGEROUS.",
+            Critical,
+            "`tar --remove-files -cf <archive> <source>` first archives the source paths \
+             into <archive>, then deletes the originals. With a sensitive source \
+             (`/etc`, `/usr`, `/var`, `/home/<user>`, `~`, `$HOME`, ...) the result is \
+             bytewise-equivalent to `rm -rf <source>`. With `-cf /dev/null` the archive \
+             is discarded entirely, making this a pure recursive delete with no audit \
+             trail.\n\n\
+             There is NO recovery without backups.\n\n\
+             Safer alternatives:\n\
+             - Drop `--remove-files`: `tar -cf out.tar <source>` (sources preserved).\n\
+             - Two-step with confirmation: `tar -cf out.tar <source> && rm -ri <source>`.\n\
+             - Verify the source first: `ls -la <source>`.\n\
+             - Allowed for temp dirs: `tar --remove-files -cf out.tar /tmp/<subdir>`.",
+            TAR_REMOVE_FILES_SUGGESTIONS
+        ),
+        // ----- `tar --remove-files ...` (High: any other target) -----
+        //
+        // Fires after the safe-pattern whitelist (which allows the temp-
+        // directory variants). Any other tar-with-remove-files invocation
+        // is unscoped destruction that should require human approval, by
+        // exact analogy with the parallel `rm-rf-general` /
+        // `find-delete-general` rules.
+        destructive_pattern!(
+            "tar-remove-files-general",
+            r"\btar\b[^|;&]*?\s--remove-files\b",
+            "tar --remove-files deletes source paths after archiving and requires human approval.",
+            High,
+            "`tar --remove-files <source>` deletes the source paths once they have been \
+             archived. While not as broad as `rm -rf`, a typo or wide glob in the source \
+             list destroys files the agent did not intend to remove. With `-cf /dev/null` \
+             the archive itself is discarded — the operation becomes a pure delete.\n\n\
+             Safer alternatives:\n\
+             - Drop `--remove-files` to preserve sources after archiving.\n\
+             - Verify the source list with `ls -la` before running.\n\
+             - For temp scratch: `tar --remove-files -cf out.tar /tmp/<subdir>` is allowed.",
+            TAR_REMOVE_FILES_SUGGESTIONS
         ),
     ]
 }
@@ -1785,6 +1913,139 @@ mod tests {
         for (input, expected) in [
             ("/usr/bin/shred -u /etc/passwd", "shred -u /etc/passwd"),
             ("/bin/shred -fzu /etc/shadow", "shred -fzu /etc/shadow"),
+        ] {
+            let normalized = normalize_command(input);
+            assert!(
+                normalized.contains(expected),
+                "PATH_NORMALIZER did not strip `{input}` to `{expected}` (got `{normalized}`)"
+            );
+        }
+    }
+
+    // ---------- tar --remove-files: archive-then-delete bypass family ----------
+
+    #[test]
+    fn tar_remove_files_blocks_root_critical() {
+        let pack = create_pack();
+        for cmd in [
+            // Flag before source.
+            "tar --remove-files -cf out.tar /etc",
+            "tar --remove-files -czf out.tar.gz /home/user",
+            "tar --remove-files -cf out.tar /usr/local",
+            // Source before flag.
+            "tar -cf out.tar --remove-files /etc",
+            "tar -cf out.tar /etc --remove-files",
+            // Delete-only (discarded archive).
+            "tar --remove-files -cf /dev/null /etc",
+            // Quoted sensitive paths.
+            "tar --remove-files -cf out.tar \"/etc\"",
+            "tar --remove-files -cf out.tar '/etc'",
+            // Home variants.
+            "tar --remove-files -cf out.tar ~/.ssh",
+            "tar --remove-files -cf out.tar $HOME/.aws",
+            "tar --remove-files -cf out.tar ${HOME}/.gnupg",
+            // Compound forms (\btar\b matches at any boundary).
+            "echo done; tar --remove-files -cf out.tar /etc",
+            "true && tar --remove-files -cf out.tar /etc",
+            "(tar --remove-files -cf out.tar /etc)",
+            // Wrappers.
+            "sudo tar --remove-files -cf out.tar /etc",
+            "env FOO=bar tar --remove-files -cf out.tar /etc",
+            // Path-prefixed (PATH_NORMALIZER).
+            "/usr/bin/tar --remove-files -cf out.tar /etc",
+            "/bin/tar --remove-files -cf out.tar /etc",
+        ] {
+            assert_blocks_with_severity(&pack, cmd, Severity::Critical);
+            assert_blocks_with_pattern(&pack, cmd, "tar-remove-files-root-home");
+        }
+    }
+
+    #[test]
+    fn tar_remove_files_blocks_general_high() {
+        let pack = create_pack();
+        for cmd in [
+            "tar --remove-files -cf out.tar ./build",
+            "tar --remove-files -cf out.tar important.db",
+            "tar --remove-files -cf out.tar ./workspace",
+            "tar -cf out.tar --remove-files data.json",
+        ] {
+            assert_blocks_with_severity(&pack, cmd, Severity::High);
+            assert_blocks_with_pattern(&pack, cmd, "tar-remove-files-general");
+        }
+    }
+
+    #[test]
+    fn tar_remove_files_under_tmp_is_allowed() {
+        let pack = create_pack();
+        for cmd in [
+            "tar --remove-files -cf out.tar /tmp/scratch",
+            "tar -cf out.tar --remove-files /tmp/foo",
+            "tar --remove-files -czf out.tar.gz /var/tmp/cache",
+            "tar --remove-files -cf out.tar $TMPDIR/scratch",
+            "tar --remove-files -cf out.tar ${TMPDIR}/scratch",
+        ] {
+            assert_safe_pattern_matches(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn tar_without_remove_files_is_allowed() {
+        let pack = create_pack();
+        // No --remove-files = pure archive/extract/list — destructive
+        // pattern requires the flag, so these fall through to default-allow.
+        for cmd in [
+            "tar -cf out.tar /etc",
+            "tar -czf out.tar.gz /home/user",
+            "tar -xf in.tar",
+            "tar -xzf in.tar.gz -C /tmp",
+            "tar -tf in.tar",
+            "tar --help",
+            "tar --version",
+        ] {
+            assert_no_match(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn tar_no_false_positive_substring_traps() {
+        let pack = create_pack();
+        for cmd in [
+            "cat tar-readme.md",
+            "ls /etc/tar-config",
+            "echo --remove-files",
+            // Bare --remove-files appears (e.g. as a documented flag),
+            // but no `tar` invocation: must not match.
+            "grep --remove-files docs/",
+        ] {
+            assert_no_match(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn tar_remove_files_mixed_sources_blocks_via_general() {
+        // `tar --remove-files -cf out.tar /tmp/foo /etc/bar` — the safe
+        // /tmp/foo source does NOT rescue because /etc/bar is a sensitive
+        // co-source. The root-home rule must fire.
+        let pack = create_pack();
+        assert_blocks_with_pattern(
+            &pack,
+            "tar --remove-files -cf out.tar /tmp/foo /etc/bar",
+            "tar-remove-files-root-home",
+        );
+    }
+
+    #[test]
+    fn tar_remove_files_path_prefixed_normalizes_to_bare() {
+        use crate::normalize::normalize_command;
+        for (input, expected) in [
+            (
+                "/usr/bin/tar --remove-files -cf out.tar /etc",
+                "tar --remove-files -cf out.tar /etc",
+            ),
+            (
+                "/bin/tar --remove-files -cf out.tar /home/user",
+                "tar --remove-files -cf out.tar /home/user",
+            ),
         ] {
             let normalized = normalize_command(input);
             assert!(

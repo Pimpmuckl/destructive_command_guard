@@ -906,6 +906,12 @@ static PACK_ENTRIES: [PackEntry; 83] = [
         // (rule shred-unlink-root-home / shred-unlink-general). Without
         // these, `shred -fzu /etc/passwd` silently destroys the file
         // beyond forensic recovery.
+        //
+        // `tar` and `/tar` enable detection of `tar --remove-files
+        // <sensitive-source>`, which is bytewise-equivalent to `rm -rf`
+        // on the source tree (after archiving). Without these, agents
+        // bypass dcg by switching from `rm -rf /etc` to
+        // `tar --remove-files -cf /dev/null /etc`.
         &[
             "rm",
             "/rm",
@@ -917,6 +923,8 @@ static PACK_ENTRIES: [PackEntry; 83] = [
             "/truncate",
             "shred",
             "/shred",
+            "tar",
+            "/tar",
         ],
         core::filesystem::create_pack,
     ),
