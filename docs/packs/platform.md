@@ -6,6 +6,7 @@ This document describes packs in the `platform` category.
 
 - [GitHub Platform](#platformgithub)
 - [GitLab Platform](#platformgitlab)
+- [Railway Platform](#platformrailway)
 
 ---
 
@@ -147,6 +148,95 @@ To allowlist all rules from this pack (use with caution):
 ```toml
 [[allow]]
 rule = "platform.gitlab:*"
+reason = "Your reason here"
+risk_acknowledged = true
+```
+
+---
+
+## Railway Platform
+
+**Pack ID:** `platform.railway`
+
+Protects against destructive Railway CLI and Public API operations that can delete projects, environments, services, volumes, variables, or deployments.
+
+### Keywords
+
+Commands containing these keywords are checked against this pack:
+
+- `railway`
+- `backboard.railway.app`
+- `backboard.railway.com`
+- `railway.app/graphql`
+- `railway.com/graphql`
+- `projectDelete`
+- `projectScheduleDelete`
+- `environmentDelete`
+- `serviceDelete`
+- `volumeDelete`
+- `volumeInstanceDelete`
+- `volumeInstanceUpdate`
+- `variableDelete`
+- `variableCollectionUpsert`
+- `deploymentRemove`
+- `deploymentStop`
+
+### Safe Patterns (Allowed)
+
+These patterns match safe commands that are always allowed:
+
+| Pattern Name | Pattern |
+|--------------|----------|
+| `railway-status` | `railway(?:\s+--?\S+(?:\s+\S+)?)*\s+status(?:\s\|$)` |
+| `railway-project-list` | `railway(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list\|ls)(?:\s\|$)` |
+| `railway-project-subcommand-list` | `railway(?:\s+--?\S+(?:\s+\S+)?)*\s+project\s+(?:list\|ls)(?:\s\|$)` |
+| `railway-whoami` | `railway(?:\s+--?\S+(?:\s+\S+)?)*\s+whoami(?:\s\|$)` |
+| `railway-logs` | `railway(?:\s+--?\S+(?:\s+\S+)?)*\s+logs(?:\s\|$)` |
+| `railway-service-list` | `railway(?:\s+--?\S+(?:\s+\S+)?)*\s+service\s+(?:list\|ls)(?:\s\|$)` |
+| `railway-environment-list` | `railway(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:environment\|env)\s+(?:list\|ls)(?:\s\|$)` |
+| `railway-volume-list` | `railway(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+(?:list\|ls)(?:\s\|$)` |
+| `railway-variable-list` | `railway(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:variable\|variables\|vars\|var)\s+(?:list\|ls)(?:\s\|$)` |
+
+### Destructive Patterns (Blocked)
+
+These patterns match potentially destructive commands:
+
+| Pattern Name | Reason | Severity |
+|--------------|--------|----------|
+| `railway-project-delete` | railway delete schedules deletion of the entire Railway project. | critical |
+| `railway-project-subcommand-delete` | railway project delete schedules deletion of the entire Railway project. | critical |
+| `railway-environment-delete` | railway environment delete removes a Railway environment and its resources. | critical |
+| `railway-service-delete` | railway service delete permanently deletes a Railway service. | critical |
+| `railway-volume-delete` | railway volume delete removes persistent Railway storage. | critical |
+| `railway-volume-detach` | railway volume detach disconnects persistent storage from a service. | high |
+| `railway-variable-delete` | railway variable delete removes Railway environment variables. | high |
+| `railway-database-variable-set` | railway variable set is changing a database connection variable. | high |
+| `railway-database-variable-legacy-set` | railway variable legacy flags are changing a database connection variable. | high |
+| `railway-deployment-remove` | railway down removes the latest successful deployment. | high |
+| `railway-api-project-delete` | Railway Public API project deletion mutation detected. | critical |
+| `railway-api-environment-delete` | Railway Public API environment deletion mutation detected. | critical |
+| `railway-api-service-delete` | Railway Public API service deletion mutation detected. | critical |
+| `railway-api-volume-delete` | Railway Public API volume deletion mutation detected. | critical |
+| `railway-api-volume-detach` | Railway Public API volume detach mutation detected. | high |
+| `railway-api-variable-delete` | Railway Public API variable deletion mutation detected. | high |
+| `railway-api-database-variable-upsert` | Railway Public API upsert is changing a database connection variable. | high |
+| `railway-api-deployment-remove` | Railway Public API deployment removal or stop mutation detected. | high |
+
+### Allowlist Guidance
+
+To allowlist a specific rule from this pack, add to your allowlist:
+
+```toml
+[[allow]]
+rule = "platform.railway:<pattern-name>"
+reason = "Your reason here"
+```
+
+To allowlist all rules from this pack (use with caution):
+
+```toml
+[[allow]]
+rule = "platform.railway:*"
 reason = "Your reason here"
 risk_acknowledged = true
 ```
