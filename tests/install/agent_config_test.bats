@@ -158,6 +158,55 @@ EOF
     [ "$dcg_count" -le 1 ]
 }
 
+@test "configure_claude_code: does not treat dcg substring commands as installed" {
+    log_test "Testing Claude Code exact dcg command detection..."
+
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+    mkdir -p "$HOME/.claude"
+
+    cat > "$CLAUDE_SETTINGS" << 'EOF'
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {"type": "command", "command": "/opt/dcgrep/bin/scan"}
+        ]
+      }
+    ]
+  }
+}
+EOF
+
+    configure_claude_code "$CLAUDE_SETTINGS" "0"
+
+    log_test "CLAUDE_STATUS: $CLAUDE_STATUS"
+    log_test "After: $(cat "$CLAUDE_SETTINGS")"
+
+    [ "$CLAUDE_STATUS" = "merged" ]
+    python3 - "$CLAUDE_SETTINGS" "$DEST/dcg" <<'PY'
+import json
+import sys
+
+settings_file, dcg_path = sys.argv[1:3]
+with open(settings_file, "r") as f:
+    settings = json.load(f)
+
+commands = []
+for entry in settings["hooks"]["PreToolUse"]:
+    if entry.get("matcher") == "Bash":
+        for hook in entry.get("hooks", []):
+            commands.append(hook.get("command"))
+
+assert dcg_path in commands, commands
+assert "/opt/dcgrep/bin/scan" in commands, commands
+assert commands.count(dcg_path) == 1, commands
+PY
+}
+
 # ============================================================================
 # Gemini CLI Configuration Tests
 # ============================================================================
