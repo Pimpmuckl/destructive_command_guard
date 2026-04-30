@@ -2539,59 +2539,60 @@ fn list_packs(
         return;
     }
 
-    // Rich output when feature enabled
+    // Rich output when feature enabled and the process is attached to a
+    // terminal that can render it. Non-TTY output keeps the plain stdout
+    // contract used by scripts and tests.
     #[cfg(feature = "rich-output")]
     {
-        list_packs_rich(&pack_list, verbose, expand, max_patterns);
+        if crate::output::should_use_rich_output() {
+            list_packs_rich(&pack_list, verbose, expand, max_patterns);
+            return;
+        }
     }
 
     // Pretty output (default, non-rich fallback)
-    #[cfg(not(feature = "rich-output"))]
-    {
-        println!("Available packs:");
-        println!();
+    println!("Available packs:");
+    println!();
 
-        // Group by category (use pack_list which includes both built-in and external packs)
-        let mut by_category: std::collections::BTreeMap<&str, Vec<&PackInfo>> =
-            std::collections::BTreeMap::new();
-        for info in &pack_list {
-            let category = info.category.as_str();
-            by_category.entry(category).or_default().push(info);
-        }
-
-        for (category, packs) in by_category {
-            println!("  {category}:");
-            for info in packs {
-                if enabled_only && !info.enabled {
-                    continue;
-                }
-
-                let status = if info.enabled { "✓" } else { "○" };
-                if verbose {
-                    let description = markdown_single_line_for_cli(&info.description);
-                    println!(
-                        "    {} {} - {} ({} safe, {} destructive)",
-                        status,
-                        info.id,
-                        description,
-                        info.safe_pattern_count,
-                        info.destructive_pattern_count
-                    );
-                    print_pack_patterns_plain(info, expand, max_patterns);
-                } else {
-                    println!("    {} {} - {}", status, info.id, info.name);
-                }
-            }
-            println!();
-        }
-
-        println!("Legend: ✓ = enabled, ○ = disabled");
-        println!();
-        println!("Enable packs in ~/.config/dcg/config.toml");
+    // Group by category (use pack_list which includes both built-in and external packs)
+    let mut by_category: std::collections::BTreeMap<&str, Vec<&PackInfo>> =
+        std::collections::BTreeMap::new();
+    for info in &pack_list {
+        let category = info.category.as_str();
+        by_category.entry(category).or_default().push(info);
     }
+
+    for (category, packs) in by_category {
+        println!("  {category}:");
+        for info in packs {
+            if enabled_only && !info.enabled {
+                continue;
+            }
+
+            let status = if info.enabled { "✓" } else { "○" };
+            if verbose {
+                let description = markdown_single_line_for_cli(&info.description);
+                println!(
+                    "    {} {} - {} ({} safe, {} destructive)",
+                    status,
+                    info.id,
+                    description,
+                    info.safe_pattern_count,
+                    info.destructive_pattern_count
+                );
+                print_pack_patterns_plain(info, expand, max_patterns);
+            } else {
+                println!("    {} {} - {}", status, info.id, info.name);
+            }
+        }
+        println!();
+    }
+
+    println!("Legend: ✓ = enabled, ○ = disabled");
+    println!();
+    println!("Enable packs in ~/.config/dcg/config.toml");
 }
 
-#[cfg(not(feature = "rich-output"))]
 fn print_pack_patterns_plain(info: &PackInfo, expand: bool, max_patterns: usize) {
     let Some(pack) = REGISTRY.get(&info.id) else {
         return;
@@ -2626,7 +2627,6 @@ fn print_pack_patterns_plain(info: &PackInfo, expand: bool, max_patterns: usize)
     );
 }
 
-#[cfg(not(feature = "rich-output"))]
 fn print_pack_pattern_lines(title: &str, lines: Vec<String>, expand: bool, max_patterns: usize) {
     if lines.is_empty() {
         return;
@@ -2714,7 +2714,6 @@ fn list_packs_rich(pack_list: &[PackInfo], verbose: bool, expand: bool, max_patt
         .render();
 }
 
-#[cfg(not(feature = "rich-output"))]
 fn markdown_single_line_for_cli(text: &str) -> String {
     crate::highlight::format_markdown_explanation(
         text,
@@ -5980,8 +5979,19 @@ fn parse_git_name_status_z(stdout: &[u8]) -> Vec<std::path::PathBuf> {
 }
 
 /// Print scan report in pretty format.
-#[cfg(not(feature = "rich-output"))]
 fn print_scan_pretty(report: &crate::scan::ScanReport, verbose: bool, top: usize) {
+    #[cfg(feature = "rich-output")]
+    {
+        if crate::output::should_use_rich_output() {
+            print_scan_pretty_rich(report, verbose, top);
+            return;
+        }
+    }
+
+    print_scan_pretty_plain(report, verbose, top);
+}
+
+fn print_scan_pretty_plain(report: &crate::scan::ScanReport, verbose: bool, top: usize) {
     use crate::output::{ScanResultRow, ScanResultsTable, TableStyle, auto_theme};
     use colored::Colorize;
 
@@ -6088,7 +6098,7 @@ fn print_scan_pretty(report: &crate::scan::ScanReport, verbose: bool, top: usize
 
 /// Print scan report in pretty format with rich output.
 #[cfg(feature = "rich-output")]
-fn print_scan_pretty(report: &crate::scan::ScanReport, verbose: bool, top: usize) {
+fn print_scan_pretty_rich(report: &crate::scan::ScanReport, verbose: bool, top: usize) {
     use crate::output::console::console;
     use crate::output::{ScanResultRow, ScanResultsTable, auto_theme};
 
@@ -6474,14 +6484,15 @@ fn handle_explain(
         ExplainFormat::Pretty => {
             #[cfg(feature = "rich-output")]
             {
-                explain_rich(&trace);
+                if crate::output::should_use_rich_output() {
+                    explain_rich(&trace);
+                } else {
+                    print_explain_pretty_plain(&trace);
+                }
             }
             #[cfg(not(feature = "rich-output"))]
             {
-                let output =
-                    trace.format_pretty(colored::control::SHOULD_COLORIZE.should_colorize());
-                println!("{output}");
-                print_explain_regex_line(&trace);
+                print_explain_pretty_plain(&trace);
             }
         }
         ExplainFormat::Compact => {
@@ -6496,7 +6507,12 @@ fn handle_explain(
     }
 }
 
-#[cfg(not(feature = "rich-output"))]
+fn print_explain_pretty_plain(trace: &crate::trace::ExplainTrace) {
+    let output = trace.format_pretty(colored::control::SHOULD_COLORIZE.should_colorize());
+    println!("{output}");
+    print_explain_regex_line(trace);
+}
+
 fn print_explain_regex_line(trace: &crate::trace::ExplainTrace) {
     let Some(match_info) = trace.match_info.as_ref() else {
         return;
@@ -7069,7 +7085,11 @@ fn handle_stats_command(
         StatsFormat::Pretty => {
             #[cfg(feature = "rich-output")]
             {
-                format_stats_pack_rich(&aggregated, cmd.days);
+                if crate::output::should_use_rich_output() {
+                    format_stats_pack_rich(&aggregated, cmd.days);
+                } else {
+                    print!("{}", stats::format_stats_pretty(&aggregated, cmd.days));
+                }
             }
             #[cfg(not(feature = "rich-output"))]
             {
@@ -7140,7 +7160,11 @@ fn handle_stats_rules(
         StatsFormat::Pretty => {
             #[cfg(feature = "rich-output")]
             {
-                format_rule_metrics_rich(&metrics, cmd.days);
+                if crate::output::should_use_rich_output() {
+                    format_rule_metrics_rich(&metrics, cmd.days);
+                } else {
+                    print!("{}", format_rule_metrics_pretty(&metrics, cmd.days));
+                }
             }
             #[cfg(not(feature = "rich-output"))]
             {
@@ -7156,7 +7180,6 @@ fn handle_stats_rules(
 }
 
 /// Format rule metrics as a pretty table.
-#[cfg(not(feature = "rich-output"))]
 #[allow(clippy::too_many_lines)]
 fn format_rule_metrics_pretty(metrics: &[crate::history::RuleMetrics], period_days: u64) -> String {
     use std::fmt::Write;
@@ -8951,7 +8974,11 @@ fn doctor(fix: bool, format: DoctorFormat) {
         DoctorFormat::Pretty => {
             #[cfg(feature = "rich-output")]
             {
-                doctor_rich(fix);
+                if crate::output::should_use_rich_output() {
+                    doctor_rich(fix);
+                } else {
+                    doctor_pretty(fix);
+                }
             }
             #[cfg(not(feature = "rich-output"))]
             {
@@ -8963,7 +8990,6 @@ fn doctor(fix: bool, format: DoctorFormat) {
 }
 
 /// Human-readable doctor output (colored crate, non-rich fallback).
-#[cfg(not(feature = "rich-output"))]
 #[allow(clippy::too_many_lines, clippy::unnecessary_unwrap)]
 fn doctor_pretty(fix: bool) {
     use colored::Colorize;
@@ -10245,16 +10271,15 @@ fn handle_version_check(
 }
 
 fn self_update_unix(update: UpdateCommand) -> Result<(), Box<dyn std::error::Error>> {
-    // Mitigation: pin the installer URL to a tag so the install.sh that
-    // runs is the one that shipped with the requested version (or with
-    // the currently-installed binary), rather than whatever is currently
-    // sitting on `main`. This bounds the trust window — `main` may be in
-    // mid-refactor or carry an in-flight installer change that does not
-    // belong in a stable update path. It does NOT eliminate the supply
-    // chain risk: a GitHub account compromise still lets an attacker push
-    // arbitrary code at the chosen tag. Proper mitigation requires
-    // verifying install.sh against a sha256 / sigstore bundle published
-    // with each release — see follow-up bd issue.
+    // Tag-pin the installer URL so the install.sh that runs is the one
+    // that shipped with the requested version (not whatever is on `main`).
+    //
+    // Per `git_safety_guard-ythp`, we additionally:
+    //   1. Download install.sh to a temp file (no piping to `bash`)
+    //   2. Best-effort fetch install.sh.sha256 from the matching release
+    //   3. If the sha256 file is present, verify before exec — abort on
+    //      mismatch. Older tags (pre-ythp release) won't have the sha256;
+    //      we warn and proceed (preserving update path for stale binaries).
     let target_tag = update
         .version
         .clone()
@@ -10267,15 +10292,14 @@ fn self_update_unix(update: UpdateCommand) -> Result<(), Box<dyn std::error::Err
     let script_url = format!(
         "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/{normalized_tag}/install.sh"
     );
+    // Releases-download URL where install.sh.sha256 is published from
+    // dist.yml. Pre-ythp tags will 404 here; the verification step
+    // detects that and warns rather than aborting.
+    let sha_url = format!(
+        "https://github.com/Dicklesworthstone/destructive_command_guard/releases/download/{normalized_tag}/install.sh.sha256"
+    );
 
-    eprintln!("WARNING: dcg update fetches install.sh from {normalized_tag} and pipes it to bash.");
-    eprintln!(
-        "         The script itself verifies the binary checksum and (optionally) the sigstore bundle,"
-    );
-    eprintln!("         but install.sh itself is not yet checksum-verified. If you need stronger");
-    eprintln!(
-        "         supply-chain guarantees for the script, install manually from a release tarball."
-    );
+    eprintln!("dcg update: downloading and verifying install.sh from {normalized_tag}.");
 
     let mut args: Vec<String> = Vec::new();
 
@@ -10320,18 +10344,56 @@ fn self_update_unix(update: UpdateCommand) -> Result<(), Box<dyn std::error::Err
         escaped_args.push_str(&shell_escape_posix(arg));
     }
 
-    let command = if escaped_args.is_empty() {
-        format!(
-            "curl -fsSL {} | bash -s --",
-            shell_escape_posix(&script_url)
-        )
+    // Download script + sha256 to a tempdir, verify, then exec from disk.
+    // Verification grammar matches what dist.yml produces (`shasum -a 256
+    // <script>` output: `<sha>  <basename>`). Older tags without the
+    // sha256 file warn and proceed (graceful degradation for stale binaries
+    // updating into the new world).
+    let exec_args = if escaped_args.is_empty() {
+        String::new()
     } else {
-        format!(
-            "curl -fsSL {} | bash -s -- {}",
-            shell_escape_posix(&script_url),
-            escaped_args
-        )
+        format!(" {escaped_args}")
     };
+    // Pick the available SHA-256 verifier. `shasum -a 256 -c` and
+    // `sha256sum -c` both consume the same `<hex>  <basename>` line format
+    // so either works on the file `dist.yml` produces with `shasum -a 256`.
+    // Alpine and distroless containers ship `sha256sum` (coreutils) but
+    // not `shasum` (Perl); macOS ships `shasum` but not always
+    // `sha256sum`. If neither exists we warn and proceed — same posture as
+    // a missing `.sha256` file (preserves the update path).
+    let command = format!(
+        r#"set -e
+tmp="$(mktemp -d -t dcg-install.XXXXXX)"
+trap 'rm -rf "$tmp"' EXIT
+script="$tmp/install.sh"
+sha="$tmp/install.sh.sha256"
+curl -fsSL {script} -o "$script"
+verify_sha() {{
+  if command -v shasum >/dev/null 2>&1; then
+    ( cd "$tmp" && shasum -a 256 -c "$sha" )
+  elif command -v sha256sum >/dev/null 2>&1; then
+    ( cd "$tmp" && sha256sum -c "$sha" )
+  else
+    echo "dcg update: neither shasum nor sha256sum available — skipping verification." >&2
+    return 0
+  fi
+}}
+if curl -fsSL --output "$sha" {sha_url} 2>/dev/null; then
+  if verify_sha; then
+    echo "dcg update: install.sh sha256 verified."
+  else
+    echo "dcg update: install.sh sha256 verification FAILED — aborting." >&2
+    exit 1
+  fi
+else
+  echo "dcg update: install.sh.sha256 not published for this tag — proceeding without verification." >&2
+fi
+bash "$script"{exec_args}
+"#,
+        script = shell_escape_posix(&script_url),
+        sha_url = shell_escape_posix(&sha_url),
+        exec_args = exec_args,
+    );
 
     let status = std::process::Command::new("sh")
         .arg("-c")
@@ -10358,9 +10420,8 @@ fn self_update_windows(update: UpdateCommand) -> Result<(), Box<dyn std::error::
         );
     }
 
-    // Same tag-pinning mitigation as `self_update_unix`. See the comment
-    // there for the full rationale and the follow-up issue tracking
-    // proper installer signing.
+    // Same tag-pinning + sha256 verification as `self_update_unix`. See
+    // that function's comment for the full rationale (`git_safety_guard-ythp`).
     let target_tag = update
         .version
         .clone()
@@ -10373,16 +10434,11 @@ fn self_update_windows(update: UpdateCommand) -> Result<(), Box<dyn std::error::
     let script_url = format!(
         "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/{normalized_tag}/install.ps1"
     );
+    let sha_url = format!(
+        "https://github.com/Dicklesworthstone/destructive_command_guard/releases/download/{normalized_tag}/install.ps1.sha256"
+    );
 
-    eprintln!(
-        "WARNING: dcg update fetches install.ps1 from {normalized_tag} and runs it in PowerShell."
-    );
-    eprintln!(
-        "         install.ps1 verifies the binary, but the script itself is not yet checksum-verified."
-    );
-    eprintln!(
-        "         For stronger supply-chain guarantees, install manually from a release archive."
-    );
+    eprintln!("dcg update: downloading and verifying install.ps1 from {normalized_tag}.");
 
     let mut args: Vec<String> = Vec::new();
 
@@ -10408,16 +10464,48 @@ fn self_update_windows(update: UpdateCommand) -> Result<(), Box<dyn std::error::
         format!(" {}", args.join(" "))
     };
 
+    // Download script + sha256 to %TEMP%, verify, then run. `dist.yml`
+    // publishes install.ps1.sha256 in the format `<sha>  install.ps1`
+    // (POSIX shasum convention). We compare the lower-cased PowerShell
+    // hash to the leading 64 hex chars of that line. If the .sha256 file
+    // is missing (older tag), warn and proceed.
+    // Download flow: separate the .sha256 fetch (which may legitimately
+    // 404 for older tags) from the verification (which must abort on any
+    // failure including a malformed .sha256). Lumping both in one try/catch
+    // would silently treat a corrupt .sha256 file as "not published" and
+    // proceed without verification — the wrong posture.
     let command = format!(
         "$ErrorActionPreference='Stop'; \
 $url={url}; \
+$shaUrl={sha_url}; \
 $tmp=Join-Path $env:TEMP 'dcg-install.ps1'; \
+$shaTmp=Join-Path $env:TEMP 'dcg-install.ps1.sha256'; \
 Invoke-WebRequest -Uri $url -OutFile $tmp; \
+$shaDownloaded=$false; \
+try {{ Invoke-WebRequest -Uri $shaUrl -OutFile $shaTmp -ErrorAction Stop; $shaDownloaded=$true; }} \
+catch {{ Write-Warning 'dcg update: install.ps1.sha256 not published for this tag — proceeding without verification.'; }} \
+if ($shaDownloaded) {{ \
+  $shaContent=(Get-Content $shaTmp -Raw).Trim(); \
+  if ($shaContent.Length -lt 64) {{ \
+    Write-Error 'dcg update: install.ps1.sha256 is malformed (need 64 hex chars) — aborting.'; \
+    Remove-Item $tmp,$shaTmp -ErrorAction SilentlyContinue; \
+    exit 1; \
+  }} \
+  $expected=$shaContent.Substring(0,64).ToLower(); \
+  $actual=(Get-FileHash -Algorithm SHA256 $tmp).Hash.ToLower(); \
+  if ($expected -ne $actual) {{ \
+    Write-Error 'dcg update: install.ps1 sha256 verification FAILED — aborting.'; \
+    Remove-Item $tmp,$shaTmp -ErrorAction SilentlyContinue; \
+    exit 1; \
+  }} \
+  Write-Host 'dcg update: install.ps1 sha256 verified.'; \
+}} \
 & $tmp{args}; \
 $code=$LASTEXITCODE; \
-Remove-Item $tmp -ErrorAction SilentlyContinue; \
+Remove-Item $tmp,$shaTmp -ErrorAction SilentlyContinue; \
 exit $code;",
         url = shell_escape_powershell(&script_url),
+        sha_url = shell_escape_powershell(&sha_url),
         args = args_str
     );
 
@@ -11712,8 +11800,9 @@ fn resolve_allow_once_revoke_target(
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut matches: Vec<String> = Vec::new();
 
-    // Short codes are 5-digit numeric strings; anything else is a hash prefix
-    let is_short_code = target.len() <= 5 && target.chars().all(|c| c.is_ascii_digit());
+    // Short codes are 6-digit numeric strings (formerly 5; legacy codes still
+    // accepted). Anything else is a hash prefix.
+    let is_short_code = target.len() <= 6 && target.chars().all(|c| c.is_ascii_digit());
 
     if is_short_code {
         matches.extend(

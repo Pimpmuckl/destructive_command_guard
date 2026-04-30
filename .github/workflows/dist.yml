@@ -130,6 +130,23 @@ jobs:
           cp install.sh dist/ 2>/dev/null || echo "No install.sh found"
           cp install.ps1 dist/ 2>/dev/null || echo "No install.ps1 found"
 
+      - name: Checksum + sign install scripts (git_safety_guard-ythp)
+        # Publishes install.sh.sha256 / install.ps1.sha256 (with the
+        # `<sha>  <basename>` format `shasum -a 256 -c` understands) plus
+        # cosign sigstore bundles. `dcg update` downloads the script to a
+        # tempfile, fetches the sha256, verifies, and only then exec's it.
+        # Without this the installer-fetch step is a supply-chain trust
+        # window even when pinned to a tag.
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          cd dist
+          for script in install.sh install.ps1; do
+            [ -f "$script" ] || continue
+            shasum -a 256 "$script" > "$script.sha256"
+            cosign sign-blob --yes --bundle "$script.sigstore.json" "$script"
+          done
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:

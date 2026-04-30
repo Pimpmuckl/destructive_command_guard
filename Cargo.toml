@@ -133,9 +133,9 @@ strip = true        # Remove debug symbols
 opt-level = 1       # Faster compile times during development
 
 [features]
+default = ["rich-output"]
 rayon = ["dep:rayon"]
 rich-output = ["dep:rich_rust"]  # Enable rich_rust for premium terminal output
-legacy-output = []               # Keep old rendering (placeholder for gradual migration)
 
 [lints.rust]
 # unsafe_code = "forbid" # Moved to src/lib.rs and src/main.rs to allow unsafe in tests

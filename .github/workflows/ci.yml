@@ -124,6 +124,9 @@ jobs:
       - name: Check compilation
         run: cargo check --all-targets
 
+      - name: Check lean build without rich output
+        run: cargo check --all-targets --no-default-features
+
       - name: Build release binary for tests
         run: cargo build --release
 
