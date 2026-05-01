@@ -10,7 +10,7 @@
 #
 # Options:
 #   --verbose     Show detailed output for each test (includes timing and test IDs)
-#   --binary      Path to dcg binary (default: searches PATH)
+#   --binary      Path to dcg binary (default: searches Cargo target dirs, then PATH)
 #   --json        Output results in JSON format (machine-readable)
 #   --artifacts   Directory to store failure artifacts (stdout/stderr captures)
 #   --full        Run slow/expensive tests (memory test execution)
@@ -39,6 +39,7 @@ BOLD='\033[1m'
 # Configuration
 VERBOSE=false
 BINARY=""
+BINARY_EXPLICIT=false
 JSON_OUTPUT=false
 ARTIFACTS_DIR=""
 RUN_FULL=false
@@ -73,6 +74,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --binary|-b)
             BINARY="$2"
+            BINARY_EXPLICIT=true
             shift 2
             ;;
         --json|-j)
@@ -92,7 +94,7 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Options:"
             echo "  --verbose, -v     Show detailed output for each test"
-            echo "  --binary, -b      Path to dcg binary"
+            echo "  --binary, -b      Path to dcg binary (default: Cargo target dirs, then PATH)"
             echo "  --json, -j        Output results in JSON format (machine-readable)"
             echo "  --artifacts, -a   Directory to store failure artifacts (stdout/stderr)"
             echo "  --full            Run slow/expensive tests (memory test execution)"
@@ -106,17 +108,36 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Repo root (used for binary discovery and CI feature tests)
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
 # Find binary
 if [[ -z "$BINARY" ]]; then
     # Prefer in-repo build artifacts over any globally installed `dcg` to keep
     # the test suite hermetic and reproducible.
-    if [[ -f "./target/release/dcg" ]]; then
-        BINARY="./target/release/dcg"
-    elif [[ -f "./target/debug/dcg" ]]; then
-        BINARY="./target/debug/dcg"
-    elif command -v dcg &> /dev/null; then
+    declare -a BINARY_CANDIDATES=()
+    if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+        if [[ "$CARGO_TARGET_DIR" = /* ]]; then
+            CARGO_TARGET_ROOT="${CARGO_TARGET_DIR%/}"
+        else
+            CARGO_TARGET_ROOT="$REPO_ROOT/${CARGO_TARGET_DIR%/}"
+        fi
+        BINARY_CANDIDATES+=("$CARGO_TARGET_ROOT/release/dcg" "$CARGO_TARGET_ROOT/debug/dcg")
+    fi
+    BINARY_CANDIDATES+=("$REPO_ROOT/target/release/dcg" "$REPO_ROOT/target/debug/dcg")
+
+    for candidate in "${BINARY_CANDIDATES[@]}"; do
+        if [[ -f "$candidate" ]]; then
+            BINARY="$candidate"
+            break
+        fi
+    done
+
+    if [[ -z "$BINARY" ]] && command -v dcg &> /dev/null; then
         BINARY="$(command -v dcg)"
-    else
+    fi
+
+    if [[ -z "$BINARY" ]]; then
         echo -e "${RED}Error: dcg binary not found${NC}"
         echo "Run 'cargo build --release' first or specify --binary PATH"
         exit 2
@@ -129,8 +150,18 @@ if [[ "$BINARY" != /* ]]; then
     BINARY="$(cd "$(dirname "$BINARY")" && pwd)/$(basename "$BINARY")"
 fi
 
-# Repo root (used by CI feature tests)
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if ! $BINARY_EXPLICIT && [[ "$BINARY" == "$REPO_ROOT/"* ]]; then
+    EXPECTED_VERSION=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' "$REPO_ROOT/Cargo.toml" | head -n 1)
+    ACTUAL_VERSION=$("$BINARY" --version 2>/dev/null | sed -n '1p')
+    if [[ -n "$EXPECTED_VERSION" && "$ACTUAL_VERSION" != "$EXPECTED_VERSION" ]]; then
+        echo -e "${RED}Error: stale dcg binary selected${NC}"
+        echo "Binary: $BINARY"
+        echo "Binary version: ${ACTUAL_VERSION:-unknown}"
+        echo "Cargo.toml version: $EXPECTED_VERSION"
+        echo "Run 'cargo build --release' or pass --binary PATH to the intended binary."
+        exit 2
+    fi
+fi
 
 # Setup artifacts directory if specified
 if [[ -n "$ARTIFACTS_DIR" ]]; then

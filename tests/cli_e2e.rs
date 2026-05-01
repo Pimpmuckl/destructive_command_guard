@@ -4028,8 +4028,10 @@ mod stats_rules_tests {
         let env = StatsRulesEnv::new();
         // Don't seed any data
 
-        // Create the database by opening it
-        let _db = HistoryDb::open(Some(env.db_path.clone())).expect("create db");
+        // Create the database, then close the setup handle before the dcg
+        // subprocess opens the same FrankenSQLite file.
+        let db = HistoryDb::open(Some(env.db_path.clone())).expect("create db");
+        drop(db);
 
         let output = env.run(&["stats", "--rules"]);
         let stdout = String::from_utf8_lossy(&output.stdout);
