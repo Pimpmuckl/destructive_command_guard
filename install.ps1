@@ -97,21 +97,29 @@ function Get-JsonArray {
   @($Value)
 }
 
+function Test-JsonObject {
+  param([object]$Value)
+
+  $null -ne $Value -and $Value.GetType() -eq [System.Management.Automation.PSCustomObject]
+}
+
 function Test-CodexHookAlreadyCurrent {
   param([object]$Config, [string]$DcgPath)
 
   $hooks = Get-ObjectPropertyValue $Config "hooks"
   if ($null -eq $hooks) { return $false }
 
+  $dcgCommands = @()
   foreach ($entry in (Get-JsonArray (Get-ObjectPropertyValue $hooks "PreToolUse"))) {
     if ((Get-ObjectPropertyValue $entry "matcher") -ne "Bash") { continue }
     foreach ($hook in (Get-JsonArray (Get-ObjectPropertyValue $entry "hooks"))) {
-      $command = Get-ObjectPropertyValue $hook "command"
-      if ($command -eq $DcgPath) { return $true }
+      if (Test-DcgHookCommand $hook) {
+        $dcgCommands += [string](Get-ObjectPropertyValue $hook "command")
+      }
     }
   }
 
-  $false
+  $dcgCommands.Count -eq 1 -and $dcgCommands[0] -eq $DcgPath
 }
 
 function Configure-CodexHook {
@@ -155,7 +163,7 @@ function Configure-CodexHook {
     $config = [pscustomobject][ordered]@{}
   }
 
-  if ($null -eq $config -or $config -isnot [psobject]) {
+  if (-not (Test-JsonObject $config)) {
     $config = [pscustomobject][ordered]@{}
   }
 
@@ -164,7 +172,7 @@ function Configure-CodexHook {
   }
 
   $hooks = Get-ObjectPropertyValue $config "hooks"
-  if ($null -eq $hooks -or $hooks -isnot [psobject]) {
+  if (-not (Test-JsonObject $hooks)) {
     $hooks = [pscustomobject][ordered]@{}
     Set-ObjectPropertyValue $config "hooks" $hooks
   }

@@ -1152,7 +1152,16 @@ except (IOError, ValueError, json.JSONDecodeError):
     print("merge")
     raise SystemExit(0)
 
-pre_tool_use = settings.get("hooks", {}).get("PreToolUse", [])
+if not isinstance(settings, dict):
+    print("merge")
+    raise SystemExit(0)
+
+hooks_obj = settings.get("hooks", {})
+if not isinstance(hooks_obj, dict):
+    print("merge")
+    raise SystemExit(0)
+
+pre_tool_use = hooks_obj.get("PreToolUse", [])
 if not isinstance(pre_tool_use, list):
     print("merge")
     raise SystemExit(0)
@@ -1681,7 +1690,16 @@ except (IOError, ValueError, json.JSONDecodeError):
     print("merge")
     raise SystemExit(0)
 
-pre_tool_use = config.get("hooks", {}).get("PreToolUse", [])
+if not isinstance(config, dict):
+    print("merge")
+    raise SystemExit(0)
+
+hooks_obj = config.get("hooks", {})
+if not isinstance(hooks_obj, dict):
+    print("merge")
+    raise SystemExit(0)
+
+pre_tool_use = hooks_obj.get("PreToolUse", [])
 if not isinstance(pre_tool_use, list):
     print("merge")
     raise SystemExit(0)
