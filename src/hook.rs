@@ -57,7 +57,7 @@ pub struct HookInput {
     /// divergence from Claude's public hook docs. Claude Code does NOT send
     /// this field (Claude does send `tool_use_id`, so that field can't be
     /// used to disambiguate the two otherwise-similar wire formats). When
-    /// `turn_id` is present we switch to Codex's strict exit-2 + stderr
+    /// `turn_id` is present and non-blank we switch to Codex's strict exit-2 + stderr
     /// deny path because Codex's JSON parser uses `deny_unknown_fields` and
     /// would silently drop dcg's standard hookSpecificOutput payload.
     #[serde(alias = "turnId")]
@@ -371,7 +371,10 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
     // (`deny_unknown_fields`) and would silently drop dcg's standard deny
     // payload, letting the destructive command through.
     let is_claude_tool = matches!(tool_name.as_str(), "bash" | "launch-process");
-    let has_codex_turn_id = input.turn_id.as_deref().is_some_and(|s| !s.is_empty());
+    let has_codex_turn_id = input
+        .turn_id
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty());
     if is_claude_tool && has_codex_turn_id {
         return HookProtocol::Codex;
     }
@@ -2086,13 +2089,11 @@ mod tests {
 
     #[test]
     fn test_detect_protocol_whitespace_only_turn_id_is_not_codex() {
-        // is_some_and(|s| !s.is_empty()) does not trim — whitespace turn_id
-        // is non-empty and would classify as Codex. This documents the current
-        // behavior: whitespace-only turn_id IS treated as Codex. A future
-        // hardening could add .trim() before the check.
+        // A whitespace-only turn_id is malformed and should behave like a
+        // missing turn_id instead of forcing Codex's stderr-only protocol.
         let json = r#"{"tool_name":"Bash","tool_input":{"command":"ls"},"turn_id":"   "}"#;
         let input: HookInput = serde_json::from_str(json).unwrap();
-        assert_eq!(detect_protocol(&input), HookProtocol::Codex);
+        assert_eq!(detect_protocol(&input), HookProtocol::ClaudeCompatible);
     }
 
     #[test]
