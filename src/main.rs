@@ -182,6 +182,44 @@ fn install_history_shutdown_handler(
     install_signal_shutdown_handler();
 }
 
+fn is_top_level_global_flag(arg: &str) -> bool {
+    matches!(
+        arg,
+        "--verbose"
+            | "--quiet"
+            | "-q"
+            | "--legacy-output"
+            | "--no-color"
+            | "--no-suggestions"
+            | "--robot"
+    ) || (arg.starts_with('-') && !arg.starts_with("--") && arg[1..].chars().all(|c| c == 'v'))
+}
+
+fn top_level_flag_requested(args: &[String], long: &str, short: &str) -> bool {
+    let mut index = 1;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == long || arg == short {
+            return true;
+        }
+        if is_top_level_global_flag(arg) {
+            index += 1;
+            continue;
+        }
+        if arg == "--agent" {
+            index += 2;
+            continue;
+        }
+        if arg.starts_with("--agent=") {
+            index += 1;
+            continue;
+        }
+        return false;
+    }
+
+    false
+}
+
 fn remove_disabled_packs_for_agent(
     enabled_packs: &mut HashSet<String>,
     config: &Config,
@@ -302,13 +340,13 @@ fn main() {
 
     // Check for --version flag (useful when run directly, not as hook)
     let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--version" || a == "-V") {
+    if top_level_flag_requested(&args, "--version", "-V") {
         print_version();
         return;
     }
 
     // Check for --help flag
-    if args.iter().any(|a| a == "--help" || a == "-h") {
+    if top_level_flag_requested(&args, "--help", "-h") {
         print_help();
         return;
     }
@@ -319,8 +357,9 @@ fn main() {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(e) => {
+            let exit_code = e.exit_code();
             eprintln!("{e}");
-            std::process::exit(2);
+            std::process::exit(exit_code);
         }
     };
 
@@ -1027,6 +1066,79 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod top_level_dispatch_tests {
+        use super::*;
+
+        fn args(items: &[&str]) -> Vec<String> {
+            items.iter().map(|item| (*item).to_string()).collect()
+        }
+
+        #[test]
+        fn top_level_help_is_detected_before_subcommands() {
+            assert!(top_level_flag_requested(
+                &args(&["dcg", "--help"]),
+                "--help",
+                "-h"
+            ));
+            assert!(top_level_flag_requested(
+                &args(&["dcg", "--no-color", "-h"]),
+                "--help",
+                "-h"
+            ));
+        }
+
+        #[test]
+        fn subcommand_help_is_left_for_clap() {
+            assert!(!top_level_flag_requested(
+                &args(&["dcg", "simulate", "--help"]),
+                "--help",
+                "-h"
+            ));
+            assert!(!top_level_flag_requested(
+                &args(&["dcg", "--robot", "test", "-h"]),
+                "--help",
+                "-h"
+            ));
+        }
+
+        #[test]
+        fn update_version_flag_is_not_top_level_version() {
+            assert!(!top_level_flag_requested(
+                &args(&["dcg", "update", "--version", "v0.2.0"]),
+                "--version",
+                "-V"
+            ));
+            assert!(top_level_flag_requested(
+                &args(&["dcg", "-vv", "--version"]),
+                "--version",
+                "-V"
+            ));
+        }
+
+        #[test]
+        fn top_level_agent_override_does_not_hide_global_flags() {
+            assert!(top_level_flag_requested(
+                &args(&["dcg", "--agent", "custom-agent", "--version"]),
+                "--version",
+                "-V"
+            ));
+            assert!(top_level_flag_requested(
+                &args(&["dcg", "--agent=custom-agent", "--help"]),
+                "--help",
+                "-h"
+            ));
+        }
+
+        #[test]
+        fn subcommand_agent_override_is_left_for_clap() {
+            assert!(!top_level_flag_requested(
+                &args(&["dcg", "test", "--agent", "custom-agent", "--help"]),
+                "--help",
+                "-h"
+            ));
+        }
+    }
 
     mod input_parsing_tests {
         use super::*;

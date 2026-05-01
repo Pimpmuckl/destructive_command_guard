@@ -5,8 +5,8 @@
 //!
 //! # Detection Methods
 //!
-//! 1. **Environment variables** (primary): Most agents set identifying env vars
-//! 2. **Explicit flag**: `--agent=<name>` CLI flag for manual override
+//! 1. **Explicit flag**: `--agent=<name>` CLI flag for manual override
+//! 2. **Environment variables**: Most agents set identifying env vars
 //! 3. **Parent process inspection** (fallback): Check process tree for agent names
 //!
 //! # Supported Agents
@@ -104,7 +104,10 @@ impl Agent {
         )
     }
 
-    /// Returns `true` if this agent was explicitly specified (not auto-detected).
+    /// Returns `true` if this is a custom, non-built-in agent name.
+    ///
+    /// Whether a built-in agent was explicitly specified is stored on
+    /// [`DetectionResult::method`], not on the [`Agent`] enum.
     #[must_use]
     pub const fn is_explicit(&self) -> bool {
         matches!(self, Self::Custom(_))
@@ -242,8 +245,9 @@ thread_local! {
 ///
 /// # Detection Order
 ///
-/// 1. Environment variables (checked first as most reliable)
-/// 2. Parent process inspection (fallback)
+/// 1. Explicit `--agent` CLI flag
+/// 2. Environment variables
+/// 3. Parent process inspection (fallback)
 ///
 /// # Example
 ///
@@ -295,6 +299,11 @@ pub fn detect_agent_with_details() -> DetectionResult {
 
 /// Perform agent detection (not cached).
 fn perform_detection() -> DetectionResult {
+    // Honor explicit CLI override before ambient environment detection.
+    if let Some(agent_name) = explicit_agent_from_args(std::env::args()) {
+        return from_explicit(&agent_name);
+    }
+
     // Try environment variable detection first
     if let Some(result) = detect_from_environment() {
         return result;
@@ -306,6 +315,39 @@ fn perform_detection() -> DetectionResult {
     }
 
     DetectionResult::unknown()
+}
+
+fn explicit_agent_from_args<I, S>(args: I) -> Option<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut args = args.into_iter().skip(1);
+    while let Some(arg) = args.next() {
+        let arg = arg.as_ref();
+        if arg == "--" {
+            break;
+        }
+        if let Some(value) = arg.strip_prefix("--agent=") {
+            return non_empty_agent_name(value);
+        }
+        if arg == "--agent" {
+            return args
+                .next()
+                .and_then(|value| non_empty_agent_name(value.as_ref()));
+        }
+    }
+
+    None
+}
+
+fn non_empty_agent_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 /// Detect agent from environment variables.
@@ -891,6 +933,34 @@ mod tests {
         assert_eq!(result.agent, Agent::ClaudeCode);
         assert_eq!(result.method, DetectionMethod::Explicit);
         assert_eq!(result.matched_value, Some("claude-code".to_string()));
+    }
+
+    #[test]
+    fn test_explicit_agent_from_args_accepts_separate_value() {
+        let agent = explicit_agent_from_args(["dcg", "--agent", "custom-agent", "--version"]);
+
+        assert_eq!(agent, Some("custom-agent".to_string()));
+    }
+
+    #[test]
+    fn test_explicit_agent_from_args_accepts_equals_value() {
+        let agent = explicit_agent_from_args(["dcg", "--agent=codex-cli", "test"]);
+
+        assert_eq!(agent, Some("codex-cli".to_string()));
+    }
+
+    #[test]
+    fn test_explicit_agent_from_args_ignores_blank_value() {
+        let agent = explicit_agent_from_args(["dcg", "--agent", "  "]);
+
+        assert_eq!(agent, None);
+    }
+
+    #[test]
+    fn test_explicit_agent_from_args_stops_at_double_dash() {
+        let agent = explicit_agent_from_args(["dcg", "test", "--", "--agent=payload-agent"]);
+
+        assert_eq!(agent, None);
     }
 
     #[test]

@@ -503,6 +503,39 @@ fn test_test_subcommand_help_text_includes_key_flags() {
 }
 
 #[test]
+fn test_subcommand_help_flag_is_not_hijacked_by_top_level_help() {
+    let output = run_dcg_isolated(&["simulate", "--help"], None);
+    let combined = format!("{}{}", stdout_text(&output), stderr_text(&output));
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "subcommand help should use clap's help exit code\nstdout: {}\nstderr: {}",
+        stdout_text(&output),
+        stderr_text(&output)
+    );
+    assert!(combined.contains("Usage: dcg simulate [OPTIONS]"));
+    assert!(combined.contains("--max-command-bytes"));
+}
+
+#[test]
+fn test_update_version_flag_is_not_hijacked_by_top_level_version() {
+    let output = run_dcg_isolated(&["update", "--version", "v0.2.0", "--help"], None);
+    let combined = format!("{}{}", stdout_text(&output), stderr_text(&output));
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "update --version plus help should show update help, not top-level version\nstdout: {}\nstderr: {}",
+        stdout_text(&output),
+        stderr_text(&output)
+    );
+    assert!(combined.contains("Usage: dcg update [OPTIONS]"));
+    assert!(combined.contains("--version <VERSION>"));
+    assert!(!stdout_text(&output).starts_with(env!("CARGO_PKG_VERSION")));
+}
+
+#[test]
 fn test_verbose_output_includes_diagnostics() {
     let output = run_dcg_isolated(&["test", "--verbose", "git reset --hard"], None);
     let stdout = stdout_text(&output);

@@ -183,6 +183,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub robot: bool,
 
+    /// Override automatic agent detection for agent-specific profiles
+    #[arg(long, global = true, value_name = "AGENT")]
+    pub agent: Option<String>,
+
     /// Subcommand to run (omit to run in hook mode)
     #[command(subcommand)]
     pub command: Option<Command>,
