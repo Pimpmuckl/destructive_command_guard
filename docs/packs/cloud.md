@@ -49,7 +49,8 @@ These patterns match safe commands that are always allowed:
 | `aws-get` | `aws\b(?:\s+--?\S+(?:\s+\S+)?)*\s+\S+\s+get-` |
 | `s3-ls` | `aws\b(?:\s+--?\S+(?:\s+\S+)?)*\s+s3\s+ls(?=\s\|$)` |
 | `s3-cp` | `aws\b(?:\s+--?\S+(?:\s+\S+)?)*\s+s3\s+cp(?=\s\|$)` |
-| `aws-dry-run` | `aws\b.*--dry-run` |
+| `ec2-terminate-dry-run` | `aws\b(?:\s+--?\S+(?:\s+\S+)?)*\s+ec2\s+terminate-instances\b(?![^\n;&\|]*(?:\s--no-dry-run(?:\s\|$)\|\s--dry-run=false(?:\s\|$)))[^\n;&\|]*\s--dry-run(?:\s\|$)[^\n;&\|]*$` |
+| `ec2-delete-dry-run` | `aws\b(?:\s+--?\S+(?:\s+\S+)?)*\s+ec2\s+delete-[^\s;&\|]+\b(?![^\n;&\|]*(?:\s--no-dry-run(?:\s\|$)\|\s--dry-run=false(?:\s\|$)))[^\n;&\|]*\s--dry-run(?:\s\|$)[^\n;&\|]*$` |
 | `sts-identity` | `aws\b(?:\s+--?\S+(?:\s+\S+)?)*\s+sts\s+get-caller-identity(?=\s\|$)` |
 | `cfn-describe` | `aws\b(?:\s+--?\S+(?:\s+\S+)?)*\s+cloudformation\s+(?:describe\|list)-` |
 | `ecr-login` | `aws\b(?:\s+--?\S+(?:\s+\S+)?)*\s+ecr\s+get-login` |

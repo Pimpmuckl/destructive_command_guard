@@ -193,6 +193,8 @@ Generated: 2026-04-30T22:58:33.693996
 
 | Kind | Name | Reason | Regex Preview |
 |------|------|--------|---------------|
+| safe | `ec2-terminate-dry-run` | Found '!' | `aws\b(?:\s+--?\S+(?:\s+\S+)?)*\s+ec2\s+terminate-instances...` |
+| safe | `ec2-delete-dry-run` | Found '!' | `aws\b(?:\s+--?\S+(?:\s+\S+)?)*\s+ec2\s+delete-[^\s...` |
 | safe | `s3-ls` | Found '(?=' | `aws\b(?:\s+--?\S+(?:\s+\S+)?)*\s+s3\s+ls(?=\s\|$)` |
 | safe | `s3-cp` | Found '(?=' | `aws\b(?:\s+--?\S+(?:\s+\S+)?)*\s+s3\s+cp(?=\s\|$)` |
 | safe | `sts-identity` | Found '(?=' | `aws\b(?:\s+--?\S+(?:\s+\S+)?)*\s+sts\s+get-caller-identit...` |

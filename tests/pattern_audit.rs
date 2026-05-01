@@ -195,7 +195,14 @@ fn test_audit_backtracking_requirements() {
         ),
         (
             "cloud.aws",
-            HashSet::from(["athena-delete-with-where", "s3-cp", "s3-ls", "sts-identity"]),
+            HashSet::from([
+                "athena-delete-with-where",
+                "ec2-delete-dry-run",
+                "ec2-terminate-dry-run",
+                "s3-cp",
+                "s3-ls",
+                "sts-identity",
+            ]),
         ),
         (
             "cloud.azure",

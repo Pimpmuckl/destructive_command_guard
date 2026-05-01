@@ -71,8 +71,19 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         safe_pattern!("s3-ls", r"aws\b(?:\s+--?\S+(?:\s+\S+)?)*\s+s3\s+ls(?=\s|$)"),
         // s3 cp is generally safe (copy)
         safe_pattern!("s3-cp", r"aws\b(?:\s+--?\S+(?:\s+\S+)?)*\s+s3\s+cp(?=\s|$)"),
-        // dry-run flag
-        safe_pattern!("aws-dry-run", r"aws\b.*--dry-run"),
+        // EC2 commands expose a real `--dry-run` option that checks
+        // permissions without making the request. Keep this narrowly scoped:
+        // a global `aws ... --dry-run` safe pattern lets unsupported dry-run
+        // text bypass destructive commands in services such as IAM and
+        // CloudFormation.
+        safe_pattern!(
+            "ec2-terminate-dry-run",
+            r"aws\b(?:\s+--?\S+(?:\s+\S+)?)*\s+ec2\s+terminate-instances\b(?![^\n;&|]*(?:\s--no-dry-run(?:\s|$)|\s--dry-run=false(?:\s|$)))[^\n;&|]*\s--dry-run(?:\s|$)[^\n;&|]*$"
+        ),
+        safe_pattern!(
+            "ec2-delete-dry-run",
+            r"aws\b(?:\s+--?\S+(?:\s+\S+)?)*\s+ec2\s+delete-[^\s;&|]+\b(?![^\n;&|]*(?:\s--no-dry-run(?:\s|$)|\s--dry-run=false(?:\s|$)))[^\n;&|]*\s--dry-run(?:\s|$)[^\n;&|]*$"
+        ),
         // sts get-caller-identity is safe
         safe_pattern!(
             "sts-identity",
@@ -1013,6 +1024,76 @@ mod tests {
         );
         // s3 rb
         assert_blocks(&pack, "aws --profile prod s3 rb s3://prod-bucket", "s3 rb");
+    }
+
+    #[test]
+    fn aws_dry_run_safe_patterns_only_cover_real_ec2_dry_run_options() {
+        let pack = create_pack();
+
+        assert_safe_pattern_matches(
+            &pack,
+            "aws ec2 terminate-instances --instance-ids i-abc --dry-run",
+        );
+        assert_safe_pattern_matches(
+            &pack,
+            "aws --profile prod ec2 delete-snapshot --snapshot-id snap-abc --dry-run",
+        );
+        assert_allows(
+            &pack,
+            "aws ec2 delete-security-group --group-id sg-abc --dry-run --region us-east-1",
+        );
+
+        assert_no_safe_match(
+            &pack,
+            "aws cloudformation delete-stack --stack-name prod --dry-run",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "aws cloudformation delete-stack --stack-name prod --dry-run",
+            "cfn-delete-stack",
+        );
+        assert_no_safe_match(&pack, "aws iam delete-user --user-name --dry-run");
+        assert_blocks_with_pattern(
+            &pack,
+            "aws iam delete-user --user-name --dry-run",
+            "iam-delete",
+        );
+        assert_no_safe_match(
+            &pack,
+            "aws ec2 terminate-instances --instance-ids i-abc --dry-run=false",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "aws ec2 terminate-instances --instance-ids i-abc --dry-run=false",
+            "ec2-terminate",
+        );
+        assert_no_safe_match(
+            &pack,
+            "aws ec2 delete-snapshot --snapshot-id snap-abc --no-dry-run",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "aws ec2 delete-snapshot --snapshot-id snap-abc --no-dry-run",
+            "removes AWS resources",
+        );
+        assert_no_safe_match(
+            &pack,
+            "aws ec2 terminate-instances --instance-ids i-abc --dry-run --no-dry-run",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "aws ec2 terminate-instances --instance-ids i-abc --dry-run --no-dry-run",
+            "ec2-terminate",
+        );
+        assert_no_safe_match(
+            &pack,
+            "aws ec2 delete-snapshot --snapshot-id snap-abc --dry-run=false --dry-run",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "aws ec2 delete-snapshot --snapshot-id snap-abc --dry-run=false --dry-run",
+            "removes AWS resources",
+        );
     }
 
     #[test]

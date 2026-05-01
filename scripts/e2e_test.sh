@@ -1158,6 +1158,14 @@ test_command_with_packs "aws s3 sync s3://src s3://dest --delete --dryrun=false"
 test_command_with_packs "aws s3 sync s3://src s3://dest" "allow" "storage.s3" "aws s3 sync (s3 pack enabled, safe command)"
 test_command_with_packs "aws s3 ls s3://bucket" "allow" "storage.s3" "aws s3 ls (s3 pack enabled, safe command)"
 
+# AWS pack tests
+test_command_with_packs "aws ec2 terminate-instances --instance-ids i-123 --dry-run" "allow" "cloud.aws" "aws ec2 terminate-instances --dry-run (aws pack enabled, safe command)"
+test_command_with_packs "aws ec2 delete-snapshot --snapshot-id snap-123 --dry-run" "allow" "cloud.aws" "aws ec2 delete-snapshot --dry-run (aws pack enabled, safe command)"
+test_command_with_packs "aws ec2 terminate-instances --instance-ids i-123 --dry-run=false" "block" "cloud.aws" "aws ec2 terminate-instances --dry-run=false (aws pack enabled)"
+test_command_with_packs "aws ec2 terminate-instances --instance-ids i-123 --dry-run --no-dry-run" "block" "cloud.aws" "aws ec2 terminate-instances negated --dry-run (aws pack enabled)"
+test_command_with_packs "aws cloudformation delete-stack --stack-name prod --dry-run" "block" "cloud.aws" "aws cloudformation delete-stack unsupported --dry-run (aws pack enabled)"
+test_command_with_packs "aws iam delete-user --user-name --dry-run" "block" "cloud.aws" "aws iam delete-user unsupported --dry-run (aws pack enabled)"
+
 # rsync pack tests
 test_command_with_packs "rsync --delete src/ dest/" "block" "remote.rsync" "rsync --delete (rsync pack enabled)"
 test_command_with_packs "rsync --del src/ dest/" "block" "remote.rsync" "rsync --del (rsync pack enabled)"
