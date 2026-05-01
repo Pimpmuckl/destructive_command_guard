@@ -109,6 +109,25 @@ function Test-JsonObject {
   $null -ne $Value -and $Value.GetType() -eq [System.Management.Automation.PSCustomObject]
 }
 
+function Test-UserPathContains {
+  param([string]$PathValue, [string]$PathToFind)
+
+  if ([string]::IsNullOrWhiteSpace($PathToFind)) { return $false }
+
+  $target = $PathToFind.TrimEnd([char[]]@('\', '/'))
+  if ([string]::IsNullOrWhiteSpace($target)) { return $false }
+
+  if ([string]::IsNullOrEmpty($PathValue)) { return $false }
+  foreach ($part in ($PathValue -split ';')) {
+    if ([string]::IsNullOrWhiteSpace($part)) { continue }
+    if ($part.TrimEnd([char[]]@('\', '/')) -ieq $target) {
+      return $true
+    }
+  }
+
+  $false
+}
+
 function Test-CodexHookAlreadyCurrent {
   param([object]$Config, [string]$DcgPath)
 
@@ -286,10 +305,9 @@ if ($ArtifactUrl) {
   $url = "https://github.com/$Owner/$Repo/releases/download/$Version/$zip"
 }
 
-# Create temp directory
-$tmp = Join-Path ([System.IO.Path]::GetTempPath()) "dcg_install"
-if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
-New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+# Create a unique temp directory so concurrent installers cannot collide.
+$tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("dcg_install_" + [System.Guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $tmp | Out-Null
 $zipFile = Join-Path $tmp $zip
 
 Write-Info "Downloading $url"
@@ -364,9 +382,13 @@ Write-Ok "Installed to $Dest\dcg.exe"
 
 # PATH management
 $path = [Environment]::GetEnvironmentVariable("PATH", "User")
-if (-not $path.Contains($Dest)) {
+if (-not (Test-UserPathContains -PathValue $path -PathToFind $Dest)) {
   if ($EasyMode) {
-    [Environment]::SetEnvironmentVariable("PATH", "$path;$Dest", "User")
+    if ([string]::IsNullOrEmpty($path)) {
+      [Environment]::SetEnvironmentVariable("PATH", $Dest, "User")
+    } else {
+      [Environment]::SetEnvironmentVariable("PATH", "$path;$Dest", "User")
+    }
     Write-Ok "Added $Dest to PATH (User)"
   } else {
     Write-Warn "Add $Dest to PATH to use dcg"
