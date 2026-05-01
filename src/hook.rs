@@ -710,6 +710,9 @@ pub(crate) fn print_colorful_warning_to(
             let _ = writeln!(writer);
         }
         WarningAudience::CodexModel => {
+            if let Some(ref rule) = rule_id {
+                let _ = writeln!(writer, "{footer_style}Rule: {rule}{reset}");
+            }
             let _ = writeln!(
                 writer,
                 "{footer_style}This command is blocked. Do not retry it, create a bypass, or change dcg policy yourself. Ask the user for explicit permission if the operation is truly required.{reset}"
