@@ -1106,8 +1106,10 @@ pub(crate) fn write_warning_to(
             let _ = writeln!(stdout);
         }
         HookProtocol::Copilot => {
+            // Warnings should ask/surface policy context without using the
+            // legacy stop signal. Hard denials set `continue=false` above.
             let output = CopilotHookOutput {
-                continue_execution: false,
+                continue_execution: true,
                 stop_reason: Cow::Owned(format!("DCG warn: {reason}")),
                 permission_decision: "ask",
                 permission_decision_reason: Cow::Owned(warn_reason),
@@ -1592,7 +1594,7 @@ mod tests {
     #[test]
     fn test_copilot_warn_ask_json_shape() {
         let output = CopilotHookOutput {
-            continue_execution: false,
+            continue_execution: true,
             stop_reason: Cow::Borrowed("DCG warn: risky pattern"),
             permission_decision: "ask",
             permission_decision_reason: Cow::Borrowed("DCG warn: risky pattern"),
@@ -1606,7 +1608,7 @@ mod tests {
         };
         let json = serde_json::to_value(&output).unwrap();
         assert_eq!(json["permissionDecision"], "ask");
-        assert_eq!(json["continue"], false);
+        assert_eq!(json["continue"], true);
     }
 
     #[test]
@@ -2108,7 +2110,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\nstdout: {stdout_str}"));
 
         assert_eq!(json["permissionDecision"], "ask");
-        assert_eq!(json["continue"], false);
+        assert_eq!(json["continue"], true);
     }
 
     #[test]

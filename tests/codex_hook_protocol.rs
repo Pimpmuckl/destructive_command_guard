@@ -950,6 +950,49 @@ fn claude_warn_path_exits_zero_with_ask_json() {
     );
 }
 
+#[test]
+fn copilot_warn_path_exits_zero_with_ask_json_and_continue_true() {
+    let payload = serde_json::json!({
+        "event": "pre-tool-use",
+        "toolName": "bash",
+        "toolArgs": {
+            "command": "git reset --hard HEAD~1"
+        },
+    })
+    .to_string();
+
+    let outcome = run_hook_raw_with_config(
+        payload.as_bytes(),
+        r#"[policy.rules]
+"core.git:reset-hard" = "warn"
+"#,
+        &[],
+    );
+
+    assert_eq!(outcome.exit_code, 0, "Copilot warn must exit 0\n{outcome}");
+    assert!(
+        !outcome.stdout.is_empty(),
+        "Copilot warn must produce stdout JSON\n{outcome}"
+    );
+
+    let json = outcome.stdout_json();
+    assert_eq!(
+        json["permissionDecision"], "ask",
+        "Copilot warn must have permissionDecision='ask'\n{outcome}"
+    );
+    assert_eq!(
+        json["continue"], true,
+        "Copilot warn must not emit the legacy stop signal\n{outcome}"
+    );
+    assert!(
+        json["permissionDecisionReason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("warn"),
+        "Copilot warn reason must mention 'warn'\n{outcome}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // P2.9.4 — Claude bypass: DCG_BYPASS=1 → silent exit 0, both buffers empty
 //
