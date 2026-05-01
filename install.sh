@@ -1094,6 +1094,7 @@ AIDER_STATUS=""   # "created"|"merged"|"already"|"skipped"|"failed"
 CONTINUE_STATUS="" # "unsupported"|"skipped"
 CODEX_STATUS=""   # "created"|"merged"|"already"|"skipped"|"failed"
 CODEX_BACKUP=""
+CODEX_FAILURE_REASON=""
 CURSOR_STATUS=""  # "created"|"merged"|"already"|"skipped"|"failed"|"conflict"
 COPILOT_STATUS="" # "created"|"merged"|"already"|"skipped"|"no_repo"|"failed"
 CLAUDE_BACKUP=""
@@ -1629,6 +1630,7 @@ configure_codex() {
   # See: https://developers.openai.com/codex/hooks
 
   local settings_file="$CODEX_SETTINGS"
+  CODEX_FAILURE_REASON=""
   local settings_dir
   settings_dir=$(dirname "$settings_file")
 
@@ -1687,11 +1689,11 @@ try:
     with open(hooks_file, 'r') as f:
         config = json.load(f)
 except (IOError, ValueError, json.JSONDecodeError):
-    print("merge")
+    print("invalid")
     raise SystemExit(0)
 
 if not isinstance(config, dict):
-    print("merge")
+    print("invalid")
     raise SystemExit(0)
 
 hooks_obj = config.get("hooks", {})
@@ -1721,6 +1723,12 @@ else:
     print("merge")
 PYEOF
 )
+      if [ "$codex_hook_state" = "invalid" ]; then
+        CODEX_STATUS="failed"
+        CODEX_FAILURE_REASON="existing hooks.json is invalid; left unchanged"
+        warn "Codex hooks.json is invalid JSON; leaving it unchanged: $settings_file"
+        return 0
+      fi
       if [ "$codex_hook_state" = "already" ]; then
         CODEX_STATUS="already"
         AUTO_CONFIGURED=1
@@ -1728,12 +1736,14 @@ PYEOF
       fi
     fi
 
-    # hooks.json exists, need to merge
+    # hooks.json exists, need to merge. Invalid JSON was detected above and is
+    # deliberately not repaired here: replacing a hand-edited hooks file would
+    # silently discard user configuration.
     CODEX_BACKUP="${settings_file}.bak.$(date +%Y%m%d%H%M%S)"
     cp "$settings_file" "$CODEX_BACKUP"
 
     if command -v python3 >/dev/null 2>&1; then
-      python3 - "$settings_file" "$DEST/dcg" <<'PYEOF'
+      if python3 - "$settings_file" "$DEST/dcg" <<'PYEOF'
 import json
 import os
 import shlex
@@ -1761,11 +1771,13 @@ try:
     with open(hooks_file, 'r') as f:
         config = json.load(f)
 except (IOError, ValueError, json.JSONDecodeError):
-    config = {}
+    print(f"invalid Codex hooks.json: {hooks_file}", file=sys.stderr)
+    raise SystemExit(1)
 
 # Ensure hooks structure exists
 if not isinstance(config, dict):
-    config = {}
+    print(f"Codex hooks.json must contain a JSON object: {hooks_file}", file=sys.stderr)
+    raise SystemExit(1)
 if not isinstance(config.get('hooks'), dict):
     config['hooks'] = {}
 if not isinstance(config['hooks'].get('PreToolUse'), list):
@@ -1816,12 +1828,13 @@ config['hooks']['PreToolUse'] = new_pre_tool_use
 with open(hooks_file, 'w') as f:
     json.dump(config, f, indent=2)
 PYEOF
-      if [ $? -eq 0 ]; then
+      then
         CODEX_STATUS="merged"
         AUTO_CONFIGURED=1
       else
         mv "$CODEX_BACKUP" "$settings_file" 2>/dev/null || true
         CODEX_STATUS="failed"
+        CODEX_FAILURE_REASON="merge failed; restored backup"
         CODEX_BACKUP=""
       fi
     else
@@ -1829,7 +1842,8 @@ PYEOF
       rm -f "$CODEX_BACKUP" 2>/dev/null || true
       CODEX_BACKUP=""
       CODEX_STATUS="failed"
-      return 1
+      CODEX_FAILURE_REASON="python3 required for merge"
+      return 0
     fi
   else
     # Create new hooks.json file
@@ -2439,7 +2453,11 @@ case "$CODEX_STATUS" in
     summary_lines+=("Codex CLI:   Already configured (no changes)")
     ;;
   failed)
-    summary_lines+=("Codex CLI:   Configuration failed (python3 required for merge)")
+    if [ -n "$CODEX_FAILURE_REASON" ]; then
+      summary_lines+=("Codex CLI:   Configuration failed ($CODEX_FAILURE_REASON)")
+    else
+      summary_lines+=("Codex CLI:   Configuration failed")
+    fi
     ;;
   skipped|"")
     summary_lines+=("Codex CLI:   Not installed (skipped)")

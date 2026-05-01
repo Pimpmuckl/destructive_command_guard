@@ -160,11 +160,11 @@ function Configure-CodexHook {
   try {
     $config = Get-Content -Raw -Path $hooksFile | ConvertFrom-Json
   } catch {
-    $config = [pscustomobject][ordered]@{}
+    throw "Codex hooks.json is invalid JSON; leaving it unchanged: $hooksFile"
   }
 
   if (-not (Test-JsonObject $config)) {
-    $config = [pscustomobject][ordered]@{}
+    throw "Codex hooks.json must contain a JSON object; leaving it unchanged: $hooksFile"
   }
 
   if (Test-CodexHookAlreadyCurrent $config $DcgPath) {

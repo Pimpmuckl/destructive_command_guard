@@ -1089,6 +1089,28 @@ EOF
     grep -q "echo read-hook" "$CODEX_SETTINGS"
 }
 
+@test "configure_codex: invalid hooks.json is preserved and reports failed" {
+    log_test "Testing Codex invalid hooks.json preservation..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_codex
+    printf '%s\n' '{"hooks":{"PreToolUse":[' > "$CODEX_SETTINGS"
+    save_codex_hooks_snapshot
+
+    configure_codex
+    local rc=$?
+
+    log_test "CODEX_STATUS: $CODEX_STATUS"
+    log_test "CODEX_FAILURE_REASON: ${CODEX_FAILURE_REASON:-}"
+    log_codex_hooks_transition
+
+    [ "$rc" -eq 0 ]
+    [ "$CODEX_STATUS" = "failed" ]
+    [[ "$CODEX_FAILURE_REASON" == *"invalid"* ]]
+    [ -z "$CODEX_BACKUP" ]
+    assert_codex_hooks_unchanged
+}
+
 @test "configure_codex: fails without python3 and preserves existing hooks.json" {
     log_test "Testing Codex merge failure when python3 is unavailable..."
 
@@ -1127,8 +1149,9 @@ EOF
     log_test "Return code: $rc"
     log_test "After hooks.json: $after"
 
-    [ "$rc" -eq 1 ]
+    [ "$rc" -eq 0 ]
     [ "$CODEX_STATUS" = "failed" ]
+    [[ "$CODEX_FAILURE_REASON" == *"python3"* ]]
     [ "$after" = "$before" ]
     [ -z "$CODEX_BACKUP" ]
     if grep -q "$DEST/dcg" "$CODEX_SETTINGS"; then
