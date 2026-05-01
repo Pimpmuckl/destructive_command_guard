@@ -547,6 +547,23 @@ fn docker_in_echo_not_blocked() {
     // echo just outputs text, doesn't execute
     e.assert_allowed("echo 'docker system prune'");
     e.assert_allowed("echo 'docker rm -f container'");
+    e.assert_allowed(r#"echo "<(docker system prune -a --volumes)""#);
+    e.assert_allowed(r#"echo ">(docker system prune -a --volumes)""#);
+    e.assert_allowed(r#"echo "$(printf "%s" "<(docker system prune -a --volumes)")""#);
+    e.assert_allowed(r#"echo "$(printf "%s" ">(docker system prune -a --volumes)")""#);
+}
+
+#[test]
+fn docker_process_substitution_still_blocked_through_full_pipeline() {
+    let e = Eval::with_packs(&docker_only());
+    e.assert_denied(
+        "cat <(docker system prune -a --volumes)",
+        "docker system prune",
+    );
+    e.assert_denied(
+        "cat >(docker system prune -a --volumes)",
+        "docker system prune",
+    );
 }
 
 #[test]

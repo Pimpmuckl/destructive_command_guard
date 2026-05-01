@@ -753,6 +753,16 @@ pub fn consume_word_token(bytes: &[u8], mut i: usize, len: usize) -> usize {
             break;
         }
 
+        if b == b'$' && i + 1 < len && bytes[i + 1] == b'(' {
+            i = consume_shell_paren_construct(bytes, i + 2, len);
+            continue;
+        }
+
+        if matches!(b, b'<' | b'>') && i + 1 < len && bytes[i + 1] == b'(' {
+            i = consume_shell_paren_construct(bytes, i + 2, len);
+            continue;
+        }
+
         if matches!(b, b'|' | b';' | b'&' | b'(' | b')') {
             break;
         }
@@ -789,6 +799,9 @@ pub fn consume_word_token(bytes: &[u8], mut i: usize, len: usize) -> usize {
                         b'\\' => {
                             i = (i + 2).min(len);
                         }
+                        b'$' if i + 1 < len && bytes[i + 1] == b'(' => {
+                            i = consume_shell_paren_construct(bytes, i + 2, len);
+                        }
                         _ => {
                             i += 1;
                         }
@@ -802,6 +815,63 @@ pub fn consume_word_token(bytes: &[u8], mut i: usize, len: usize) -> usize {
     }
 
     i
+}
+
+fn consume_shell_paren_construct(bytes: &[u8], mut i: usize, len: usize) -> usize {
+    let mut depth = 1usize;
+
+    while i < len {
+        match bytes[i] {
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+                if depth == 0 {
+                    return i;
+                }
+            }
+            b'\\' => {
+                i = (i + 2).min(len);
+            }
+            b'\'' => {
+                i += 1;
+                while i < len && bytes[i] != b'\'' {
+                    i += 1;
+                }
+                if i < len {
+                    i += 1;
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < len {
+                    match bytes[i] {
+                        b'"' => {
+                            i += 1;
+                            break;
+                        }
+                        b'\\' => {
+                            i = (i + 2).min(len);
+                        }
+                        b'$' if i + 1 < len && bytes[i + 1] == b'(' => {
+                            i = consume_shell_paren_construct(bytes, i + 2, len);
+                        }
+                        _ => {
+                            i += 1;
+                        }
+                    }
+                }
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    len
 }
 
 /// Regex to strip absolute paths from git/rm/find/unlink/truncate binaries.
@@ -1928,6 +1998,21 @@ mod tests {
             dequote_segment_command_words(r#"git "reset" --hard"#).as_ref(),
             "git reset --hard"
         );
+    }
+
+    #[test]
+    fn test_normalize_preserves_nested_command_substitution_quotes() {
+        let cmd = r#"echo "$(printf "%s" "<(docker system prune -a --volumes)")""#;
+        assert_eq!(normalize_command(cmd).as_ref(), cmd);
+    }
+
+    #[test]
+    fn test_normalize_preserves_process_substitution_words() {
+        let input = "cat <(docker system prune -a --volumes)";
+        let output = "cat >(docker system prune -a --volumes)";
+
+        assert_eq!(normalize_command(input).as_ref(), input);
+        assert_eq!(normalize_command(output).as_ref(), output);
     }
 
     #[test]

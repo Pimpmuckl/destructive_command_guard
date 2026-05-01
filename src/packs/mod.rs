@@ -3071,8 +3071,19 @@ mod tests {
             ]
         );
         assert_eq!(
+            split_command_segments("cat >(docker system prune -a --volumes)"),
+            vec![
+                "docker system prune -a --volumes",
+                "cat >(docker system prune -a --volumes)"
+            ]
+        );
+        assert_eq!(
             split_command_segments(r#"echo "<(docker system prune -a --volumes)""#),
             vec![r#"echo "<(docker system prune -a --volumes)""#]
+        );
+        assert_eq!(
+            split_command_segments(r#"echo ">(docker system prune -a --volumes)""#),
+            vec![r#"echo ">(docker system prune -a --volumes)""#]
         );
         assert_eq!(
             split_command_segments(
@@ -3090,6 +3101,46 @@ mod tests {
         assert_eq!(
             split_command_segments("echo $((rm -rf /))"),
             vec!["echo $((rm -rf /))"]
+        );
+    }
+
+    #[test]
+    fn quoted_process_substitution_literals_are_masked_before_pack_matching() {
+        let docker = crate::packs::containers::docker::create_pack();
+        let input_literal = crate::context::sanitize_for_pattern_matching(
+            r#"echo "<(docker system prune -a --volumes)""#,
+        );
+        let output_literal = crate::context::sanitize_for_pattern_matching(
+            r#"echo ">(docker system prune -a --volumes)""#,
+        );
+
+        assert!(
+            !input_literal.as_ref().contains("docker system prune"),
+            "literal <(...) text inside double quotes must be masked before pack matching"
+        );
+        assert!(
+            !output_literal.as_ref().contains("docker system prune"),
+            "literal >(...) text inside double quotes must be masked before pack matching"
+        );
+        assert!(
+            docker.check(input_literal.as_ref()).is_none(),
+            "literal <(...) text inside double quotes must not be treated as executable"
+        );
+        assert!(
+            docker.check(output_literal.as_ref()).is_none(),
+            "literal >(...) text inside double quotes must not be treated as executable"
+        );
+        assert!(
+            docker
+                .check("cat <(docker system prune -a --volumes)")
+                .is_some(),
+            "real process substitution must still expose destructive inner commands"
+        );
+        assert!(
+            docker
+                .check("cat >(docker system prune -a --volumes)")
+                .is_some(),
+            "real output process substitution must still expose destructive inner commands"
         );
     }
 

@@ -1980,14 +1980,27 @@ fn evaluate_packs_with_allowlists(
                 }
 
                 let segment = &command_for_packs[segment_start..segment_end];
-                if pack.matches_safe_with_deadline(segment, deadline) {
+                let sanitized_segment = sanitize_for_pattern_matching(segment);
+                let segment_for_match = sanitized_segment.as_ref();
+
+                if pack.matches_safe_with_deadline(segment_for_match, deadline) {
                     continue;
                 }
+
+                let nested_segment_ranges: Vec<(usize, usize)> = segment_ranges
+                    .iter()
+                    .copied()
+                    .filter(|&(nested_start, nested_end)| {
+                        nested_start >= segment_start
+                            && nested_end <= segment_end
+                            && !(nested_start == segment_start && nested_end == segment_end)
+                    })
+                    .collect();
 
                 if let Some(result) = evaluate_pack_destructive_patterns(
                     pack_id,
                     pack,
-                    segment,
+                    segment_for_match,
                     segment_start,
                     original_command,
                     normalized_offset,
@@ -1996,6 +2009,7 @@ fn evaluate_packs_with_allowlists(
                     project_path,
                     &mut first_allowlist_hit,
                     deadline,
+                    &nested_segment_ranges,
                 ) {
                     return result;
                 }
@@ -2158,6 +2172,7 @@ fn evaluate_original_control_plane_payloads(
             project_path,
             first_allowlist_hit,
             deadline,
+            &[],
         );
     }
 
@@ -2176,6 +2191,7 @@ fn evaluate_original_control_plane_payloads(
                 project_path,
                 first_allowlist_hit,
                 deadline,
+                &[],
             ) {
                 return Some(result);
             }
@@ -2267,6 +2283,7 @@ fn evaluate_pack_destructive_patterns(
     project_path: Option<&Path>,
     first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
     deadline: Option<&Deadline>,
+    ignored_ranges: &[(usize, usize)],
 ) -> Option<EvaluationResult> {
     for pattern in &pack.destructive_patterns {
         if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
@@ -2288,6 +2305,10 @@ fn evaluate_pack_destructive_patterns(
         let Some(span) = matched_span else {
             continue;
         };
+
+        if span_is_inside_any_segment(span, ignored_ranges) {
+            continue;
+        }
 
         let reason = pattern.reason;
         let mapped_span = map_span_with_offset(span, normalized_offset, original_len);
