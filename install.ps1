@@ -25,7 +25,6 @@ Param(
 )
 
 $ErrorActionPreference = "Stop"
-$FallbackVersion = "v0.1.0"
 
 function Write-Info { param($msg) Write-Host "[*] $msg" -ForegroundColor Cyan }
 function Write-Ok { param($msg) Write-Host "[+] $msg" -ForegroundColor Green }
@@ -253,7 +252,7 @@ function Configure-CodexHook {
 }
 
 # Resolve latest version if not specified
-if (-not $Version) {
+if ((-not $Version) -and (-not $ArtifactUrl)) {
   Write-Info "Resolving latest version..."
   try {
     # Try GitHub API first
@@ -278,8 +277,8 @@ if (-not $Version) {
       }
     }
     if (-not $Version) {
-      $Version = $FallbackVersion
-      Write-Warn "Could not resolve latest version; defaulting to $Version"
+      Write-Err "Could not resolve latest release. Re-run with -Version vX.Y.Z or provide -ArtifactUrl."
+      exit 1
     }
   }
 }

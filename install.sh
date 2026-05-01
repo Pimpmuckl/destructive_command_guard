@@ -415,6 +415,7 @@ check_installed_version() {
 
 resolve_version() {
   if [ -n "$VERSION" ]; then return 0; fi
+  if [ "$FROM_SOURCE" -eq 1 ] || [ -n "$ARTIFACT_URL" ]; then return 0; fi
 
   info "Resolving latest version..."
   local latest_url="https://api.github.com/repos/${OWNER}/${REPO}/releases/latest"
@@ -437,8 +438,8 @@ resolve_version() {
         return 0
       fi
     fi
-    VERSION="v0.1.0"
-    warn "Could not resolve latest version; defaulting to $VERSION"
+    err "Could not resolve latest release. Re-run with --version vX.Y.Z or --from-source."
+    exit 1
   fi
 }
 
