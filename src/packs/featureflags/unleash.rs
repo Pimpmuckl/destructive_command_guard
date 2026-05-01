@@ -90,7 +90,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // API - GET requests
         safe_pattern!(
             "unleash-api-get",
-            r"(?i)^(?!(?=.*(?:-X\s+DELETE|--request\s+DELETE)\b)(?=.*/api/admin/))curl\s+.*(?:-X\s+GET|--request\s+GET)\s+.*/api/admin/"
+            r"(?i)^(?!(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*/api/admin/))curl\s+.*(?:-X\s*|--request(?:=|\s+))GET\b.*/api/admin/"
         ),
     ]
 }
@@ -179,7 +179,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // API - DELETE requests
         destructive_pattern!(
             "unleash-api-delete-features",
-            r"(?i)\bcurl\b(?=.*(?:-X\s+DELETE|--request\s+DELETE)\b)(?=.*?/api/admin/projects/.*/features/).*",
+            r"(?i)\bcurl\b(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*?/api/admin/projects/.*/features/).*",
             "DELETE request to Unleash API removes feature toggles.",
             Critical,
             "API DELETE calls to features permanently remove toggles without archive \
@@ -191,7 +191,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "unleash-api-delete-projects",
-            r"(?i)\bcurl\b(?=.*(?:-X\s+DELETE|--request\s+DELETE)\b)(?=.*?/api/admin/projects/[^/\s]+(?:\s|$)).*",
+            r"(?i)\bcurl\b(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*?/api/admin/projects/[^/\s]+(?:\s|$)).*",
             "DELETE request to Unleash API removes projects.",
             Critical,
             "API DELETE calls to projects remove ALL toggles, strategies, and \
@@ -204,7 +204,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "unleash-api-delete-generic",
-            r"(?i)\bcurl\b(?=.*(?:-X\s+DELETE|--request\s+DELETE)\b)(?=.*?/api/admin/).*",
+            r"(?i)\bcurl\b(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*?/api/admin/).*",
             "DELETE request to Unleash API can remove resources.",
             High,
             "Generic DELETE requests to the Unleash admin API can remove various \

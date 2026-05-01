@@ -94,7 +94,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // API - GET requests
         safe_pattern!(
             "split-api-get",
-            r"(?i)^(?!(?=.*(?:-X\s+DELETE|--request\s+DELETE)\b)(?=.*api\.split\.io))curl\s+.*(?:-X\s+GET|--request\s+GET)\s+.*api\.split\.io"
+            r"(?i)^(?!(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*api\.split\.io))curl\s+.*(?:-X\s*|--request(?:=|\s+))GET\b.*api\.split\.io"
         ),
     ]
 }
@@ -183,7 +183,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // API - DELETE requests
         destructive_pattern!(
             "split-api-delete-splits",
-            r"(?i)\bcurl\b(?=.*(?:-X\s+DELETE|--request\s+DELETE)\b)(?=.*api\.split\.io/.*/splits/).*",
+            r"(?i)\bcurl\b(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*api\.split\.io/.*/splits/).*",
             "DELETE request to Split.io API removes split definitions.",
             Critical,
             "API DELETE calls to splits permanently remove feature flags without CLI \
@@ -195,7 +195,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "split-api-delete-environments",
-            r"(?i)\bcurl\b(?=.*(?:-X\s+DELETE|--request\s+DELETE)\b)(?=.*api\.split\.io/.*/environments/).*",
+            r"(?i)\bcurl\b(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*api\.split\.io/.*/environments/).*",
             "DELETE request to Split.io API removes environments.",
             Critical,
             "API DELETE calls to environments invalidate all API keys and remove all \
@@ -208,7 +208,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "split-api-delete-segments",
-            r"(?i)\bcurl\b(?=.*(?:-X\s+DELETE|--request\s+DELETE)\b)(?=.*api\.split\.io/.*/segments/).*",
+            r"(?i)\bcurl\b(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*api\.split\.io/.*/segments/).*",
             "DELETE request to Split.io API removes segments.",
             High,
             "API DELETE calls to segments remove user groupings. Splits using this \
@@ -221,7 +221,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "split-api-delete-generic",
-            r"(?i)\bcurl\b(?=.*(?:-X\s+DELETE|--request\s+DELETE)\b)(?=.*api\.split\.io).*",
+            r"(?i)\bcurl\b(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*api\.split\.io).*",
             "DELETE request to Split.io API can remove resources.",
             High,
             "Generic DELETE requests to the Split.io API can remove various resources. \

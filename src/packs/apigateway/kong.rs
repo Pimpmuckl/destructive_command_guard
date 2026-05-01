@@ -72,7 +72,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // Kong Admin API - explicit GET requests only
         safe_pattern!(
             "kong-admin-explicit-get",
-            r"(?i)^(?!(?=.*(?:-X\s+DELETE|--request\s+DELETE)\b)(?=.*(?:localhost|127\.0\.0\.1):8001/))curl\s+.*(?:-X\s+GET|--request\s+GET)\s+.*(?:localhost|127\.0\.0\.1):8001/"
+            r"(?i)^(?!(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*(?:localhost|127\.0\.0\.1):8001/))curl\s+.*(?:-X\s*|--request(?:=|\s+))GET\b.*(?:localhost|127\.0\.0\.1):8001/"
         ),
     ]
 }
@@ -110,7 +110,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Kong Admin API - DELETE requests (supports both DELETE-first and URL-first ordering)
         destructive_pattern!(
             "kong-admin-delete-services",
-            r"curl\s+.*(?:(?:-X\s+DELETE|--request\s+DELETE).*(?:localhost|127\.0\.0\.1):8001/services|(?:localhost|127\.0\.0\.1):8001/services.*(?:-X\s+DELETE|--request\s+DELETE))",
+            r"curl\s+.*(?:(?:-X\s*|--request(?:=|\s+))DELETE\b.*(?:localhost|127\.0\.0\.1):8001/services|(?:localhost|127\.0\.0\.1):8001/services.*(?:-X\s*|--request(?:=|\s+))DELETE\b)",
             "DELETE request to Kong Admin API removes services.",
             High,
             "Deleting a Kong service removes the upstream service definition. All routes \
@@ -123,7 +123,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "kong-admin-delete-routes",
-            r"curl\s+.*(?:(?:-X\s+DELETE|--request\s+DELETE).*(?:localhost|127\.0\.0\.1):8001/routes|(?:localhost|127\.0\.0\.1):8001/routes.*(?:-X\s+DELETE|--request\s+DELETE))",
+            r"curl\s+.*(?:(?:-X\s*|--request(?:=|\s+))DELETE\b.*(?:localhost|127\.0\.0\.1):8001/routes|(?:localhost|127\.0\.0\.1):8001/routes.*(?:-X\s*|--request(?:=|\s+))DELETE\b)",
             "DELETE request to Kong Admin API removes routes.",
             High,
             "Deleting a Kong route removes the path-to-service mapping. Requests to that path \
@@ -136,7 +136,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "kong-admin-delete-plugins",
-            r"curl\s+.*(?:(?:-X\s+DELETE|--request\s+DELETE).*(?:localhost|127\.0\.0\.1):8001/plugins|(?:localhost|127\.0\.0\.1):8001/plugins.*(?:-X\s+DELETE|--request\s+DELETE))",
+            r"curl\s+.*(?:(?:-X\s*|--request(?:=|\s+))DELETE\b.*(?:localhost|127\.0\.0\.1):8001/plugins|(?:localhost|127\.0\.0\.1):8001/plugins.*(?:-X\s*|--request(?:=|\s+))DELETE\b)",
             "DELETE request to Kong Admin API removes plugins.",
             Medium,
             "Deleting a Kong plugin removes its functionality from the associated service, route, \
@@ -149,7 +149,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "kong-admin-delete-consumers",
-            r"curl\s+.*(?:(?:-X\s+DELETE|--request\s+DELETE).*(?:localhost|127\.0\.0\.1):8001/consumers|(?:localhost|127\.0\.0\.1):8001/consumers.*(?:-X\s+DELETE|--request\s+DELETE))",
+            r"curl\s+.*(?:(?:-X\s*|--request(?:=|\s+))DELETE\b.*(?:localhost|127\.0\.0\.1):8001/consumers|(?:localhost|127\.0\.0\.1):8001/consumers.*(?:-X\s*|--request(?:=|\s+))DELETE\b)",
             "DELETE request to Kong Admin API removes consumers.",
             High,
             "Deleting a Kong consumer removes the API client identity. All credentials (API keys, \
@@ -162,7 +162,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "kong-admin-delete-upstreams",
-            r"curl\s+.*(?:(?:-X\s+DELETE|--request\s+DELETE).*(?:localhost|127\.0\.0\.1):8001/upstreams|(?:localhost|127\.0\.0\.1):8001/upstreams.*(?:-X\s+DELETE|--request\s+DELETE))",
+            r"curl\s+.*(?:(?:-X\s*|--request(?:=|\s+))DELETE\b.*(?:localhost|127\.0\.0\.1):8001/upstreams|(?:localhost|127\.0\.0\.1):8001/upstreams.*(?:-X\s*|--request(?:=|\s+))DELETE\b)",
             "DELETE request to Kong Admin API removes upstreams.",
             High,
             "Deleting a Kong upstream removes the load balancer and all its targets. Services \
@@ -175,7 +175,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "kong-admin-delete-targets",
-            r"curl\s+.*(?:(?:-X\s+DELETE|--request\s+DELETE).*(?:localhost|127\.0\.0\.1):8001/.*targets|(?:localhost|127\.0\.0\.1):8001/.*targets.*(?:-X\s+DELETE|--request\s+DELETE))",
+            r"curl\s+.*(?:(?:-X\s*|--request(?:=|\s+))DELETE\b.*(?:localhost|127\.0\.0\.1):8001/.*targets|(?:localhost|127\.0\.0\.1):8001/.*targets.*(?:-X\s*|--request(?:=|\s+))DELETE\b)",
             "DELETE request to Kong Admin API removes targets.",
             Medium,
             "Deleting a Kong target removes a backend server from the upstream pool. Traffic \
@@ -188,7 +188,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "kong-admin-delete-certificates",
-            r"curl\s+.*(?:(?:-X\s+DELETE|--request\s+DELETE).*(?:localhost|127\.0\.0\.1):8001/certificates|(?:localhost|127\.0\.0\.1):8001/certificates.*(?:-X\s+DELETE|--request\s+DELETE))",
+            r"curl\s+.*(?:(?:-X\s*|--request(?:=|\s+))DELETE\b.*(?:localhost|127\.0\.0\.1):8001/certificates|(?:localhost|127\.0\.0\.1):8001/certificates.*(?:-X\s*|--request(?:=|\s+))DELETE\b)",
             "DELETE request to Kong Admin API removes certificates.",
             High,
             "Deleting a Kong certificate removes the TLS/SSL certificate. SNIs using this \
@@ -201,7 +201,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "kong-admin-delete-snis",
-            r"curl\s+.*(?:(?:-X\s+DELETE|--request\s+DELETE).*(?:localhost|127\.0\.0\.1):8001/snis|(?:localhost|127\.0\.0\.1):8001/snis.*(?:-X\s+DELETE|--request\s+DELETE))",
+            r"curl\s+.*(?:(?:-X\s*|--request(?:=|\s+))DELETE\b.*(?:localhost|127\.0\.0\.1):8001/snis|(?:localhost|127\.0\.0\.1):8001/snis.*(?:-X\s*|--request(?:=|\s+))DELETE\b)",
             "DELETE request to Kong Admin API removes SNIs.",
             High,
             "Deleting a Kong SNI removes the domain-to-certificate mapping. HTTPS requests \
@@ -215,7 +215,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Generic DELETE to any Kong Admin API endpoint
         destructive_pattern!(
             "kong-admin-delete-generic",
-            r"curl\s+.*(?:(?:-X\s+DELETE|--request\s+DELETE).*(?:localhost|127\.0\.0\.1):8001/|(?:localhost|127\.0\.0\.1):8001/.*(?:-X\s+DELETE|--request\s+DELETE))",
+            r"curl\s+.*(?:(?:-X\s*|--request(?:=|\s+))DELETE\b.*(?:localhost|127\.0\.0\.1):8001/|(?:localhost|127\.0\.0\.1):8001/.*(?:-X\s*|--request(?:=|\s+))DELETE\b)",
             "DELETE request to Kong Admin API can remove configuration.",
             Medium,
             "DELETE requests to the Kong Admin API remove configuration objects. The specific \

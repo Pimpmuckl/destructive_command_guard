@@ -98,7 +98,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // API - GET requests
         safe_pattern!(
             "launchdarkly-api-get",
-            r"(?i)^(?!(?=.*(?:-X\s+DELETE|--request\s+DELETE)\b)(?=.*app\.launchdarkly\.com/api/))curl\s+.*(?:-X\s+GET|--request\s+GET)\s+.*app\.launchdarkly\.com/api"
+            r"(?i)^(?!(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*app\.launchdarkly\.com/api/))curl\s+.*(?:-X\s*|--request(?:=|\s+))GET\b.*app\.launchdarkly\.com/api"
         ),
     ]
 }
@@ -187,7 +187,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // API - DELETE requests (ordered from most specific to least specific)
         destructive_pattern!(
             "launchdarkly-api-delete-environments",
-            r"(?i)\bcurl\b(?=.*(?:-X\s+DELETE|--request\s+DELETE)\b)(?=.*app\.launchdarkly\.com/api/.*/environments/).*",
+            r"(?i)\bcurl\b(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*app\.launchdarkly\.com/api/.*/environments/).*",
             "DELETE request to LaunchDarkly API removes environments.",
             Critical,
             "API DELETE calls to environments immediately invalidate SDK keys and remove \
@@ -200,7 +200,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "launchdarkly-api-delete-flags",
-            r"(?i)\bcurl\b(?=.*(?:-X\s+DELETE|--request\s+DELETE)\b)(?=.*app\.launchdarkly\.com/api/.*/flags/).*",
+            r"(?i)\bcurl\b(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*app\.launchdarkly\.com/api/.*/flags/).*",
             "DELETE request to LaunchDarkly API removes feature flags.",
             Critical,
             "API DELETE calls permanently remove flags without archive recovery options. \
@@ -213,7 +213,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "launchdarkly-api-delete-segments",
-            r"(?i)\bcurl\b(?=.*(?:-X\s+DELETE|--request\s+DELETE)\b)(?=.*app\.launchdarkly\.com/api/.*/segments/).*",
+            r"(?i)\bcurl\b(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*app\.launchdarkly\.com/api/.*/segments/).*",
             "DELETE request to LaunchDarkly API removes segments.",
             High,
             "API DELETE calls to segments remove user groupings immediately. Flags \
@@ -226,7 +226,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "launchdarkly-api-delete-projects",
-            r"(?i)\bcurl\b(?=.*(?:-X\s+DELETE|--request\s+DELETE)\b)(?=.*app\.launchdarkly\.com/api/v2/projects/[^/\s]+(?:\s|$)).*",
+            r"(?i)\bcurl\b(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*app\.launchdarkly\.com/api/v2/projects/[^/\s]+(?:\s|$)).*",
             "DELETE request to LaunchDarkly API removes projects.",
             Critical,
             "API DELETE calls to projects remove ALL resources: flags, environments, \
@@ -239,7 +239,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "launchdarkly-api-delete-generic",
-            r"(?i)\bcurl\b(?=.*(?:-X\s+DELETE|--request\s+DELETE)\b)(?=.*app\.launchdarkly\.com/api/).*",
+            r"(?i)\bcurl\b(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*app\.launchdarkly\.com/api/).*",
             "DELETE request to LaunchDarkly API can remove resources.",
             High,
             "Generic DELETE requests to the LaunchDarkly API can remove various \
@@ -426,7 +426,7 @@ mod tests {
 
         assert_blocks_with_pattern(
             &pack,
-            "curl https://app.launchdarkly.com/api/v2/projects/my-project -X DELETE",
+            "curl https://app.launchdarkly.com/api/v2/projects/my-project -XDELETE",
             "launchdarkly-api-delete-projects",
         );
     }
