@@ -2486,7 +2486,12 @@ fn collect_command_segments<'a>(
             }
         }
 
-        if !in_single && matches!(b, b'<' | b'>') && i + 1 < end && bytes[i + 1] == b'(' {
+        if !in_single
+            && !in_double
+            && matches!(b, b'<' | b'>')
+            && i + 1 < end
+            && bytes[i + 1] == b'('
+        {
             if let Some(close) = find_matching_command_substitution(cmd, i + 2, end) {
                 collect_command_segments(cmd, i + 2, close, recursion_depth + 1, true, segments);
                 i = close + 1;
@@ -2590,7 +2595,7 @@ fn find_matching_command_substitution(cmd: &str, start: usize, end: usize) -> Op
             }
         }
 
-        if matches!(b, b'<' | b'>') && i + 1 < end && bytes[i + 1] == b'(' {
+        if !in_double && matches!(b, b'<' | b'>') && i + 1 < end && bytes[i + 1] == b'(' {
             if let Some(close) = find_matching_command_substitution(cmd, i + 2, end) {
                 i = close + 1;
                 continue;
@@ -3030,6 +3035,19 @@ mod tests {
             vec![
                 "docker system prune -a --volumes",
                 "cat <(docker system prune -a --volumes)"
+            ]
+        );
+        assert_eq!(
+            split_command_segments(r#"echo "<(docker system prune -a --volumes)""#),
+            vec![r#"echo "<(docker system prune -a --volumes)""#]
+        );
+        assert_eq!(
+            split_command_segments(
+                r#"echo "$(printf "%s" "<(docker system prune -a --volumes)")""#
+            ),
+            vec![
+                r#"printf "%s" "<(docker system prune -a --volumes)""#,
+                r#"echo "$(printf "%s" "<(docker system prune -a --volumes)")""#
             ]
         );
         assert_eq!(
