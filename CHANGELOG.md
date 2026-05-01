@@ -3,20 +3,36 @@
 All notable changes to **dcg** (Destructive Command Guard) are documented here.
 
 Versions marked **[Release]** have published GitHub Releases with pre-built binaries.
+Versions marked **[Pre-release]** are GitHub prereleases that were not promoted
+to latest.
 Versions marked **[Tag]** are git tags only (no binaries published).
 
 Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
-## [Unreleased] (after v0.4.10)
+## [Unreleased] (after v0.4.11)
 
 No unreleased changes yet.
 
-## [v0.4.10](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.4.10) -- 2026-05-01 [Release]
+## [v0.4.11](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.4.11) -- 2026-05-01 [Release]
+
+Clean release target for the shell tokenization regression fix from v0.4.10.
+This supersedes the quarantined v0.4.10 prerelease; no behavior changes were
+made after v0.4.10.
+
+### Release Hygiene
+
+- Bumped the release version so official GitHub Actions can publish a clean
+  asset set without overwriting or deleting the quarantined v0.4.10 fallback
+  artifacts.
+
+## [v0.4.10](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.4.10) -- 2026-05-01 [Pre-release]
 
 Patch release after v0.4.9 for a shell tokenization regression found during
 fresh-eyes review of nested command and process substitution handling.
+This release was left as a prerelease and superseded by v0.4.11 after fallback
+artifact publication produced an incomplete asset set.
 
 ### Shell Parsing
 
