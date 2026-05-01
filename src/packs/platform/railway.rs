@@ -330,6 +330,14 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             VARIABLE_SUGGESTIONS
         ),
         destructive_pattern!(
+            "railway-api-variable-collection-replace",
+            r#"(?i)(?=(?:[^;&|\r\n]|\\\r?\n)*(?:backboard\.railway\.(?:app|com)|railway\.(?:app|com)/graphql|RAILWAY_API_(?:URL|TOKEN)))(?=(?:[^;&|\r\n]|\\\r?\n)*variableCollectionUpsert)(?=(?:[^;&|\r\n]|\\\r?\n)*["']?replace["']?\s*:\s*true)(?:[^;&|\r\n]|\\\r?\n)*"#,
+            "Railway Public API variableCollectionUpsert with replace=true detected.",
+            High,
+            "Railway variableCollectionUpsert with replace=true deletes variables omitted from the payload, which can remove production database credentials even when their names are not present.",
+            VARIABLE_SUGGESTIONS
+        ),
+        destructive_pattern!(
             "railway-api-database-variable-upsert",
             r"(?i)(?:backboard\.railway\.(?:app|com)|railway\.(?:app|com)/graphql|RAILWAY_API_(?:URL|TOKEN))(?:[^;&|\r\n]|\\\r?\n)*(?:variableCollectionUpsert|variableUpsert)(?:[^;&|\r\n]|\\\r?\n)*(?:DATABASE_URL|DATABASE_PRIVATE_URL|DATABASE_PUBLIC_URL|RAILWAY_DATABASE_URL|PGHOST|PGPORT|PGUSER|PGPASSWORD|PGDATABASE|POSTGRES_HOST|POSTGRES_PORT|POSTGRES_USER|POSTGRES_PASSWORD|POSTGRES_DB|POSTGRES_DATABASE|POSTGRES_URL|POSTGRES_PRIVATE_URL|POSTGRES_PUBLIC_URL|POSTGRESQL_URL|POSTGRESQL_PRIVATE_URL|POSTGRESQL_PUBLIC_URL|MYSQL_URL|MYSQL_PRIVATE_URL|MYSQL_PUBLIC_URL|MYSQLHOST|MYSQLPORT|MYSQLUSER|MYSQLPASSWORD|MYSQLDATABASE|REDIS_URL|REDIS_PRIVATE_URL|REDIS_PUBLIC_URL|REDISHOST|REDISUSER|REDISPORT|REDISPASSWORD|MONGO_URL|MONGO_PRIVATE_URL|MONGO_PUBLIC_URL|MONGODB_URI|MONGODB_URL|MONGODB_PRIVATE_URL|MONGODB_PUBLIC_URL|MONGOHOST|MONGOPORT|MONGOUSER|MONGOPASSWORD)|(?:variableCollectionUpsert|variableUpsert)(?:[^;&|\r\n]|\\\r?\n)*(?:DATABASE_URL|DATABASE_PRIVATE_URL|DATABASE_PUBLIC_URL|RAILWAY_DATABASE_URL|PGHOST|PGPORT|PGUSER|PGPASSWORD|PGDATABASE|POSTGRES_HOST|POSTGRES_PORT|POSTGRES_USER|POSTGRES_PASSWORD|POSTGRES_DB|POSTGRES_DATABASE|POSTGRES_URL|POSTGRES_PRIVATE_URL|POSTGRES_PUBLIC_URL|POSTGRESQL_URL|POSTGRESQL_PRIVATE_URL|POSTGRESQL_PUBLIC_URL|MYSQL_URL|MYSQL_PRIVATE_URL|MYSQL_PUBLIC_URL|MYSQLHOST|MYSQLPORT|MYSQLUSER|MYSQLPASSWORD|MYSQLDATABASE|REDIS_URL|REDIS_PRIVATE_URL|REDIS_PUBLIC_URL|REDISHOST|REDISUSER|REDISPORT|REDISPASSWORD|MONGO_URL|MONGO_PRIVATE_URL|MONGO_PUBLIC_URL|MONGODB_URI|MONGODB_URL|MONGODB_PRIVATE_URL|MONGODB_PUBLIC_URL|MONGOHOST|MONGOPORT|MONGOUSER|MONGOPASSWORD)(?:[^;&|\r\n]|\\\r?\n)*(?:backboard\.railway\.(?:app|com)|railway\.(?:app|com)/graphql|RAILWAY_API_(?:URL|TOKEN))",
             "Railway Public API upsert is changing a database connection variable.",
@@ -557,6 +565,14 @@ mod tests {
                 "railway-api-database-variable-upsert",
             ),
             (
+                r#"curl https://backboard.railway.app/graphql/v2 --data-binary '{"query":"mutation { variableCollectionUpsert(input:{projectId:\"p\", environmentId:\"e\", variables:{FEATURE_FLAG:\"true\"}, replace:true}) }"}'"#,
+                "railway-api-variable-collection-replace",
+            ),
+            (
+                r#"curl https://backboard.railway.com/graphql/v2 --data '{"variables":{"input":{"replace":true,"variables":{"FEATURE_FLAG":"true"}}},"query":"mutation($input: VariableCollectionUpsertInput!){variableCollectionUpsert(input:$input)}"}'"#,
+                "railway-api-variable-collection-replace",
+            ),
+            (
                 r#"curl https://backboard.railway.app/graphql/v2 -d '{"query":"mutation { deploymentRemove(id:\"d\") }"}'"#,
                 "railway-api-deployment-remove",
             ),
@@ -588,6 +604,14 @@ mod tests {
         assert_allows(&pack, "echo serviceDelete is a mutation name");
         assert_allows(&pack, "railway variable set FEATURE_FLAG=true");
         assert_allows(&pack, "railway variables --set FEATURE_FLAG=true");
+        assert_allows(
+            &pack,
+            r#"curl https://backboard.railway.app/graphql/v2 --data-binary '{"query":"mutation { variableCollectionUpsert(input:{variables:{FEATURE_FLAG:\"true\"}, replace:false}) }"}'"#,
+        );
+        assert_allows(
+            &pack,
+            r#"curl https://backboard.railway.app/graphql/v2 --data-binary '{"query":"query { project(id:\"p\") { id } }"}' && echo 'variableCollectionUpsert replace: true'"#,
+        );
     }
 
     #[test]
