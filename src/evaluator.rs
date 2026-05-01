@@ -2177,7 +2177,7 @@ fn evaluate_original_control_plane_payloads(
                 first_allowlist_hit,
                 deadline,
             ) {
-                return result;
+                return Some(result);
             }
         }
     }
