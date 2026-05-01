@@ -2225,6 +2225,42 @@ EOF
     assert_codex_hooks_not_contains "/usr/local/bin/dcg"
 }
 
+@test "unconfigure_codex: preserves non-Bash dcg command hook" {
+    log_test "Testing Codex uninstall only removes Bash-owned dcg hooks..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    seed_codex_hooks_json '{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [
+          {"type": "command", "command": "/opt/read-hook/dcg"}
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {"type": "command", "command": "/usr/local/bin/dcg"},
+          {"type": "command", "command": "atuin history start"}
+        ]
+      }
+    ]
+  }
+}'
+
+    run unconfigure_codex
+    log_test "unconfigure_codex status: $status"
+    log_test "unconfigure_codex output: $output"
+    log_codex_hooks_transition
+
+    [ "$status" -eq 0 ]
+    assert_codex_hooks_contains '"matcher": "Read"'
+    assert_codex_hooks_contains "/opt/read-hook/dcg"
+    assert_codex_hooks_contains "atuin history start"
+    assert_codex_hooks_not_contains "/usr/local/bin/dcg\""
+}
+
 @test "unconfigure_codex: preserves PostToolUse when only PreToolUse had dcg" {
     log_test "Testing Codex uninstall preserves PostToolUse hooks..."
     command -v python3 &>/dev/null || skip "python3 not available"

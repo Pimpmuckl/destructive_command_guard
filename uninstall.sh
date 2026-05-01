@@ -617,7 +617,7 @@ unconfigure_codex() {
         return 0
     fi
 
-    if ! json_settings_has_dcg_command_hook "$hooks_json" "PreToolUse"; then
+    if ! json_settings_has_dcg_command_hook "$hooks_json" "PreToolUse" "Bash"; then
         return 0
     fi
 
@@ -662,6 +662,9 @@ new_pre_tool_use = []
 removed = False
 for entry in pre_tool_use:
     if not isinstance(entry, dict):
+        new_pre_tool_use.append(entry)
+        continue
+    if entry.get('matcher') != 'Bash':
         new_pre_tool_use.append(entry)
         continue
     inner = entry.get('hooks', [])
@@ -858,7 +861,7 @@ main() {
         found_anything=1
     fi
     local codex_hooks_json="$HOME/.codex/hooks.json"
-    if json_settings_has_dcg_command_hook "$codex_hooks_json" "PreToolUse"; then
+    if json_settings_has_dcg_command_hook "$codex_hooks_json" "PreToolUse" "Bash"; then
         log "  • Codex CLI hook ($codex_hooks_json)"
         found_anything=1
     fi
