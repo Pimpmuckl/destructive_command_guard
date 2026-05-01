@@ -272,8 +272,8 @@ These patterns match safe commands that are always allowed:
 |--------------|----------|
 | `promtool-check-rules` | `\bpromtool\b(?:\s+--?\S+(?:\s+\S+)?)*\s+check\s+rules\b` |
 | `promtool-query` | `\bpromtool\b(?:\s+--?\S+(?:\s+\S+)?)*\s+query\b` |
-| `prometheus-api-get` | `(?i)^(?!(?=.*(?:-X\|--request)\s+(?:POST\|DELETE)\b)(?=.*(?:/api/v1/admin/tsdb/delete_series\b\|/api/(?:dashboards\|datasources\|alert-notifications)/)))curl\s+.*(?:-X\|--request)\s+GET\b.*\/api\/v1\/` |
-| `grafana-api-get` | `(?i)^(?!(?=.*(?:-X\|--request)\s+(?:POST\|DELETE)\b)(?=.*(?:/api/v1/admin/tsdb/delete_series\b\|/api/(?:dashboards\|datasources\|alert-notifications)/)))curl\s+.*(?:-X\|--request)\s+GET\b.*\/api\/` |
+| `prometheus-api-get` | `(?i)^(?!(?=.*(?:-X\s*\|--request(?:=\|\s+))(?:POST\|DELETE)\b)(?=.*(?:/api/v1/admin/tsdb/delete_series\b\|/api/(?:dashboards\|datasources\|alert-notifications)/)))curl\s+.*(?:-X\s*\|--request(?:=\|\s+))GET\b.*\/api\/v1\/` |
+| `grafana-api-get` | `(?i)^(?!(?=.*(?:-X\s*\|--request(?:=\|\s+))(?:POST\|DELETE)\b)(?=.*(?:/api/v1/admin/tsdb/delete_series\b\|/api/(?:dashboards\|datasources\|alert-notifications)/)))curl\s+.*(?:-X\s*\|--request(?:=\|\s+))GET\b.*\/api\/` |
 
 ### Destructive Patterns (Blocked)
 
