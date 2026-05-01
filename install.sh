@@ -1095,6 +1095,7 @@ CONTINUE_STATUS="" # "unsupported"|"skipped"
 CODEX_STATUS=""   # "created"|"merged"|"already"|"skipped"|"failed"
 CODEX_BACKUP=""
 CODEX_FAILURE_REASON=""
+GEMINI_FAILURE_REASON=""
 CURSOR_STATUS=""  # "created"|"merged"|"already"|"skipped"|"failed"|"conflict"
 COPILOT_STATUS="" # "created"|"merged"|"already"|"skipped"|"no_repo"|"failed"
 CLAUDE_BACKUP=""
@@ -1357,6 +1358,7 @@ EOFSET
 configure_gemini() {
   local settings_file="$1"
   local settings_dir=$(dirname "$settings_file")
+  GEMINI_FAILURE_REASON=""
 
   # Check if Gemini CLI appears to be installed (has config dir or gemini command exists)
   if [ ! -d "$settings_dir" ] && ! command -v gemini >/dev/null 2>&1; then
@@ -1371,17 +1373,100 @@ configure_gemini() {
   fi
 
   if [ -f "$settings_file" ]; then
-    if grep -q '"command".*dcg' "$settings_file" 2>/dev/null; then
-      GEMINI_STATUS="already"
-      AUTO_CONFIGURED=1
-      return 0
+    # Check whether the exact current dcg hook is already configured. Do not
+    # trust a raw substring match: unrelated commands can contain "dcg" in
+    # their path/name and would otherwise suppress Gemini hook installation.
+    if command -v python3 >/dev/null 2>&1; then
+      local gemini_hook_state
+      gemini_hook_state=$(python3 - "$settings_file" "$DEST/dcg" <<'PYEOF'
+import json
+import os
+import shlex
+import sys
+
+settings_file = sys.argv[1]
+dcg_path = sys.argv[2]
+
+def is_dcg_command(cmd):
+    if not isinstance(cmd, str) or not cmd:
+        return False
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    name = os.path.basename(tokens[0])
+    if name.endswith('.exe'):
+        name = name[:-4]
+    return name == 'dcg'
+
+try:
+    with open(settings_file, 'r') as f:
+        settings = json.load(f)
+except (IOError, ValueError, json.JSONDecodeError):
+    print("invalid")
+    raise SystemExit(0)
+
+if not isinstance(settings, dict):
+    print("invalid")
+    raise SystemExit(0)
+
+hooks_obj = settings.get("hooks", {})
+if not isinstance(hooks_obj, dict):
+    print("merge")
+    raise SystemExit(0)
+
+before_tool = hooks_obj.get("BeforeTool", [])
+if not isinstance(before_tool, list):
+    print("merge")
+    raise SystemExit(0)
+
+dcg_commands = []
+for entry in before_tool:
+    if not isinstance(entry, dict) or entry.get("matcher") != "run_shell_command":
+        continue
+    hooks = entry.get("hooks", [])
+    if not isinstance(hooks, list):
+        continue
+    for hook in hooks:
+        if isinstance(hook, dict) and is_dcg_command(hook.get("command")):
+            dcg_commands.append(hook.get("command"))
+
+if dcg_commands == [dcg_path]:
+    print("already")
+else:
+    print("merge")
+PYEOF
+)
+      if [ "$gemini_hook_state" = "invalid" ]; then
+        GEMINI_STATUS="failed"
+        GEMINI_FAILURE_REASON="existing settings.json is invalid; left unchanged"
+        warn "Gemini settings.json is invalid JSON; leaving it unchanged: $settings_file"
+        return 0
+      fi
+      if [ "$gemini_hook_state" = "already" ]; then
+        GEMINI_STATUS="already"
+        AUTO_CONFIGURED=1
+        return 0
+      fi
+    else
+      # Fallback for systems without python3; the merge path below also needs
+      # python3, so only claim "already" for the exact hook path dcg writes.
+      local dcg_hook_regex
+      dcg_hook_regex=$(printf '%s' "$DEST/dcg" | sed 's/[][\\.^$*+?{}()|]/\\&/g')
+      if grep -Eq "\"command\"[[:space:]]*:[[:space:]]*\"$dcg_hook_regex\"" "$settings_file" 2>/dev/null; then
+        GEMINI_STATUS="already"
+        AUTO_CONFIGURED=1
+        return 0
+      fi
     fi
 
     GEMINI_BACKUP="${settings_file}.bak.$(date +%Y%m%d%H%M%S)"
     cp "$settings_file" "$GEMINI_BACKUP"
 
     if command -v python3 >/dev/null 2>&1; then
-      python3 - "$settings_file" "$DEST/dcg" <<'PYEOF'
+      if python3 - "$settings_file" "$DEST/dcg" <<'PYEOF'
 import json
 import os
 import shlex
@@ -1409,12 +1494,21 @@ try:
     with open(settings_file, 'r') as f:
         settings = json.load(f)
 except (IOError, ValueError, json.JSONDecodeError):
-    settings = {}
+    print(f"invalid Gemini settings.json: {settings_file}", file=sys.stderr)
+    raise SystemExit(1)
+
+if not isinstance(settings, dict):
+    print(f"Gemini settings.json must contain a JSON object: {settings_file}", file=sys.stderr)
+    raise SystemExit(1)
 
 # Gemini CLI uses BeforeTool instead of PreToolUse
 if 'hooks' not in settings:
     settings['hooks'] = {}
+if not isinstance(settings['hooks'], dict):
+    settings['hooks'] = {}
 if 'BeforeTool' not in settings['hooks']:
+    settings['hooks']['BeforeTool'] = []
+if not isinstance(settings['hooks']['BeforeTool'], list):
     settings['hooks']['BeforeTool'] = []
 
 dcg_hook = {"name": "dcg", "type": "command", "command": dcg_path, "timeout": 5000}
@@ -1445,12 +1539,13 @@ else:
 with open(settings_file, 'w') as f:
     json.dump(settings, f, indent=2)
 PYEOF
-      if [ $? -eq 0 ]; then
+      then
         GEMINI_STATUS="merged"
         AUTO_CONFIGURED=1
       else
         mv "$GEMINI_BACKUP" "$settings_file" 2>/dev/null || true
         GEMINI_STATUS="failed"
+        GEMINI_FAILURE_REASON="merge failed; restored backup"
         GEMINI_BACKUP=""
       fi
     else
@@ -1458,7 +1553,8 @@ PYEOF
       rm -f "$GEMINI_BACKUP" 2>/dev/null || true
       GEMINI_BACKUP=""
       GEMINI_STATUS="failed"
-      return 1
+      GEMINI_FAILURE_REASON="python3 required for merge"
+      return 0
     fi
   else
     # Create new settings file with dcg hook
@@ -2406,7 +2502,11 @@ case "$GEMINI_STATUS" in
     summary_lines+=("Gemini CLI:  Not installed (skipped)")
     ;;
   failed)
-    summary_lines+=("Gemini CLI:  Configuration failed")
+    if [ -n "$GEMINI_FAILURE_REASON" ]; then
+      summary_lines+=("Gemini CLI:  Configuration failed ($GEMINI_FAILURE_REASON)")
+    else
+      summary_lines+=("Gemini CLI:  Configuration failed")
+    fi
     ;;
 esac
 

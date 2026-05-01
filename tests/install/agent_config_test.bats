@@ -394,6 +394,62 @@ EOF
     [ "$GEMINI_STATUS" = "already" ]
 }
 
+@test "configure_gemini: does not treat dcg substring commands as installed" {
+    log_test "Testing Gemini exact dcg command detection..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    GEMINI_SETTINGS="$HOME/.gemini/settings.json"
+    setup_mock_gemini
+
+    cat > "$GEMINI_SETTINGS" <<'EOF'
+{
+  "hooks": {
+    "BeforeTool": [
+      {
+        "matcher": "run_shell_command",
+        "hooks": [
+          {"name": "not-dcg", "type": "command", "command": "/opt/not-dcg-wrapper/bin/hook", "timeout": 5000}
+        ]
+      }
+    ]
+  }
+}
+EOF
+
+    configure_gemini "$GEMINI_SETTINGS"
+
+    log_test "GEMINI_STATUS: $GEMINI_STATUS"
+    log_test "Settings content: $(cat "$GEMINI_SETTINGS")"
+
+    [ "$GEMINI_STATUS" = "merged" ]
+    grep -q "\"command\": \"$DEST/dcg\"" "$GEMINI_SETTINGS"
+    grep -q "/opt/not-dcg-wrapper/bin/hook" "$GEMINI_SETTINGS"
+}
+
+@test "configure_gemini: invalid settings.json is preserved and reports failed" {
+    log_test "Testing Gemini invalid settings.json preservation..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    GEMINI_SETTINGS="$HOME/.gemini/settings.json"
+    setup_mock_gemini
+    printf '%s\n' '{"hooks":{"BeforeTool":[' > "$GEMINI_SETTINGS"
+    local before
+    before=$(cat "$GEMINI_SETTINGS")
+
+    configure_gemini "$GEMINI_SETTINGS"
+    local rc=$?
+
+    log_test "GEMINI_STATUS: $GEMINI_STATUS"
+    log_test "GEMINI_FAILURE_REASON: ${GEMINI_FAILURE_REASON:-}"
+    log_test "Settings content: $(cat "$GEMINI_SETTINGS")"
+
+    [ "$rc" -eq 0 ]
+    [ "$GEMINI_STATUS" = "failed" ]
+    [[ "$GEMINI_FAILURE_REASON" == *"invalid"* ]]
+    [ "$(cat "$GEMINI_SETTINGS")" = "$before" ]
+    [ -z "$GEMINI_BACKUP" ]
+}
+
 # ============================================================================
 # Predecessor Migration Tests
 # ============================================================================
