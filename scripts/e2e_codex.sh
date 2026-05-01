@@ -297,10 +297,25 @@ parse_args() {
 resolve_binary() {
     local candidate="$1"
     if [[ "$candidate" == */* ]]; then
-        [[ -x "$candidate" ]] && echo "$candidate"
+        if [[ -x "$candidate" ]]; then
+            local dir name
+            dir="$(dirname "$candidate")"
+            name="$(basename "$candidate")"
+            printf '%s/%s\n' "$(cd "$dir" && pwd)" "$name"
+        fi
         return
     fi
     command -v "$candidate" 2>/dev/null || true
+}
+
+resolve_dcg_binary_path() {
+    local resolved
+    resolved="$(resolve_binary "$DCG_BINARY")"
+    if [[ -z "$resolved" ]]; then
+        echo "dcg binary missing or not executable: $DCG_BINARY" >&2
+        exit 2
+    fi
+    DCG_BINARY="$resolved"
 }
 
 version_at_least() {
@@ -1299,6 +1314,7 @@ emit_summary() {
 
 main() {
     parse_args "$@"
+    resolve_dcg_binary_path
     ensure_artifacts_dir
 
     if ! $JSON_OUTPUT; then
