@@ -2107,26 +2107,17 @@ fn evaluate_packs_with_allowlists(
             return EvaluationResult::denied_by_pack(pack_id, reason, pattern.explanation);
         }
 
-        if should_check_original_control_plane_payload(
+        if let Some(result) = evaluate_original_control_plane_payloads(
             pack_id.as_str(),
+            pack,
             command_for_packs,
             original_command,
+            allowlists,
+            project_path,
+            &mut first_allowlist_hit,
+            deadline,
         ) {
-            if let Some(result) = evaluate_pack_destructive_patterns(
-                pack_id,
-                pack,
-                original_command,
-                0,
-                original_command,
-                Some(0),
-                original_len,
-                allowlists,
-                project_path,
-                &mut first_allowlist_hit,
-                deadline,
-            ) {
-                return result;
-            }
+            return result;
         }
     }
 
@@ -2135,6 +2126,63 @@ fn evaluate_packs_with_allowlists(
     }
 
     EvaluationResult::allowed()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_original_control_plane_payloads(
+    pack_id: &str,
+    pack: &crate::packs::Pack,
+    command_for_packs: &str,
+    original_command: &str,
+    allowlists: &LayeredAllowlist,
+    project_path: Option<&Path>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+    deadline: Option<&Deadline>,
+) -> Option<EvaluationResult> {
+    if !should_check_original_control_plane_payload(pack_id, command_for_packs, original_command) {
+        return None;
+    }
+
+    let original_len = original_command.len();
+    let segment_ranges = command_segment_ranges(original_command);
+    if segment_ranges.len() <= 1 {
+        return evaluate_pack_destructive_patterns(
+            pack_id,
+            pack,
+            original_command,
+            0,
+            original_command,
+            Some(0),
+            original_len,
+            allowlists,
+            project_path,
+            first_allowlist_hit,
+            deadline,
+        );
+    }
+
+    for (segment_start, segment_end) in segment_ranges {
+        let segment = &original_command[segment_start..segment_end];
+        if original_control_plane_segment_is_relevant(pack_id, segment) {
+            if let Some(result) = evaluate_pack_destructive_patterns(
+                pack_id,
+                pack,
+                segment,
+                segment_start,
+                original_command,
+                Some(0),
+                original_len,
+                allowlists,
+                project_path,
+                first_allowlist_hit,
+                deadline,
+            ) {
+                return result;
+            }
+        }
+    }
+
+    None
 }
 
 fn command_segment_ranges(cmd: &str) -> Vec<(usize, usize)> {
@@ -2168,6 +2216,12 @@ fn should_check_original_control_plane_payload(
         && matches!(pack_id, "platform.railway")
         && command_contains_curl_invocation(command_for_packs)
         && original_command_contains_railway_api_signal(original_command)
+}
+
+fn original_control_plane_segment_is_relevant(pack_id: &str, segment: &str) -> bool {
+    matches!(pack_id, "platform.railway")
+        && command_contains_curl_invocation(segment)
+        && original_command_contains_railway_api_signal(segment)
 }
 
 fn command_contains_curl_invocation(command: &str) -> bool {
@@ -3429,6 +3483,40 @@ mod tests {
         assert!(
             result.is_denied(),
             "Railway API mutation authenticated by token header must be blocked"
+        );
+        let info = result
+            .pattern_info
+            .expect("denial should include pattern info");
+        assert_eq!(info.pack_id.as_deref(), Some("platform.railway"));
+        assert_eq!(
+            info.pattern_name.as_deref(),
+            Some("railway-api-project-delete")
+        );
+    }
+
+    #[test]
+    fn railway_api_payload_recheck_does_not_cross_compound_segments() {
+        let result = evaluate_with_pack_ids(
+            r#"curl https://backboard.railway.app/graphql/v2 --data-binary '{"query":"query { project(id:\"p\") { id } }"}' && echo projectDelete"#,
+            &["platform.railway"],
+        );
+
+        assert!(
+            result.is_allowed(),
+            "safe Railway API query plus unrelated documentation text should stay allowed"
+        );
+    }
+
+    #[test]
+    fn railway_api_payload_recheck_still_blocks_destructive_curl_segment() {
+        let result = evaluate_with_pack_ids(
+            r#"curl https://backboard.railway.app/graphql/v2 --data-binary '{"query":"query { project(id:\"p\") { id } }"}' && curl https://backboard.railway.app/graphql/v2 --data-binary '{"query":"mutation { projectDelete(id:\"p\") }"}'"#,
+            &["platform.railway"],
+        );
+
+        assert!(
+            result.is_denied(),
+            "destructive Railway API mutation in a later curl segment must still be blocked"
         );
         let info = result
             .pattern_info
