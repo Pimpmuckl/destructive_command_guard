@@ -402,6 +402,39 @@ EOF
     [ "$(cat "$HOME/.cursor/hooks.json")" = "$before" ]
 }
 
+@test "unconfigure_cursor: preserves same-basename hook outside generated path" {
+    log_test "Testing Cursor IDE same-basename hook preservation..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+    extract_uninstall_functions
+
+    mkdir -p "$HOME/.cursor" "$TEST_TMPDIR/other-hooks"
+    local other_hook="$TEST_TMPDIR/other-hooks/dcg-pre-shell.py"
+    cat > "$HOME/.cursor/hooks.json" << EOF
+{
+  "version": 1,
+  "hooks": {
+    "beforeShellExecution": [
+      {
+        "command": "$other_hook"
+      }
+    ]
+  }
+}
+EOF
+    local before
+    before=$(cat "$HOME/.cursor/hooks.json")
+
+    run unconfigure_cursor
+
+    log_test "unconfigure_cursor status: $status"
+    log_test "unconfigure_cursor output: $output"
+    log_test "After: $(cat "$HOME/.cursor/hooks.json")"
+
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    [ "$(cat "$HOME/.cursor/hooks.json")" = "$before" ]
+}
+
 @test "unconfigure_cursor: removes generated hook script entry and preserves other entries" {
     log_test "Testing Cursor IDE generated hook removal..."
     command -v python3 &>/dev/null || skip "python3 not available"

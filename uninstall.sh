@@ -220,6 +220,7 @@ PYEOF
 
 json_cursor_has_dcg_hook() {
     local hooks_json="$1"
+    local hook_script="${2:-$HOME/.cursor/hooks/dcg-pre-shell.py}"
 
     if [ ! -f "$hooks_json" ]; then
         return 1
@@ -230,13 +231,13 @@ json_cursor_has_dcg_hook() {
         return $?
     fi
 
-    python3 - "$hooks_json" <<'PYEOF'
+    python3 - "$hooks_json" "$hook_script" <<'PYEOF'
 import json
-import os
 import shlex
 import sys
 
 hooks_file = sys.argv[1]
+expected_hook = sys.argv[2]
 
 def is_dcg_cursor_command(command):
     if not isinstance(command, str) or not command:
@@ -247,7 +248,7 @@ def is_dcg_cursor_command(command):
         return False
     if not parts:
         return False
-    return os.path.basename(parts[0]) == "dcg-pre-shell.py"
+    return parts[0] == expected_hook
 
 try:
     with open(hooks_file, "r", encoding="utf-8") as f:
@@ -725,15 +726,15 @@ unconfigure_cursor() {
     fi
 
     # Remove entry from hooks.json
-    if [ -f "$hooks_json" ] && json_cursor_has_dcg_hook "$hooks_json"; then
+    if [ -f "$hooks_json" ] && json_cursor_has_dcg_hook "$hooks_json" "$hook_script"; then
         if command -v python3 >/dev/null 2>&1; then
-            python3 - "$hooks_json" <<'PYEOF'
+            python3 - "$hooks_json" "$hook_script" <<'PYEOF'
 import json
-import os
 import shlex
 import sys
 
 hooks_file = sys.argv[1]
+expected_hook = sys.argv[2]
 
 try:
     with open(hooks_file, "r") as f:
@@ -761,8 +762,7 @@ def is_dcg_cursor_command(command):
         return False
     if not parts:
         return False
-    name = os.path.basename(parts[0])
-    return name == "dcg-pre-shell.py"
+    return parts[0] == expected_hook
 
 new_entries = [
     entry for entry in entries
