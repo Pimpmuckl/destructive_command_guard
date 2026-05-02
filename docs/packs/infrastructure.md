@@ -98,13 +98,13 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `ansible-check` | `ansible(?:-playbook)?\s+.*--check(?:\s\|$)` |
-| `ansible-list-hosts` | `ansible(?:-playbook)?\s+.*--list-hosts` |
-| `ansible-list-tasks` | `ansible(?:-playbook)?\s+.*--list-tasks` |
-| `ansible-syntax` | `ansible(?:-playbook)?\s+.*--syntax-check` |
-| `ansible-inventory` | `ansible-inventory` |
-| `ansible-doc` | `ansible-doc` |
-| `ansible-config` | `ansible-config` |
+| `ansible-check` | `ansible(?:-playbook)?\b[^\n;&\|]*--check(?:\s\|$)[^\n;&\|]*$` |
+| `ansible-list-hosts` | `ansible(?:-playbook)?\b[^\n;&\|]*--list-hosts(?:\s\|$)[^\n;&\|]*$` |
+| `ansible-list-tasks` | `ansible(?:-playbook)?\b[^\n;&\|]*--list-tasks(?:\s\|$)[^\n;&\|]*$` |
+| `ansible-syntax` | `ansible(?:-playbook)?\b[^\n;&\|]*--syntax-check(?:\s\|$)[^\n;&\|]*$` |
+| `ansible-inventory` | `ansible-inventory\b[^\n;&\|]*$` |
+| `ansible-doc` | `ansible-doc\b[^\n;&\|]*$` |
+| `ansible-config` | `ansible-config\b[^\n;&\|]*$` |
 
 ### Destructive Patterns (Blocked)
 

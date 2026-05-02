@@ -11,9 +11,112 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
-## [Unreleased] (after v0.4.11)
+## [Unreleased] (after v0.5.0)
 
 No unreleased changes yet.
+
+## [v0.5.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.5.0) -- 2026-05-02 [Release]
+
+Minor pre-1.0 release after v0.4.11 for the Codex hardening wave, installer
+preservation work, Railway/API guard improvements, and the latest safe-pattern
+bypass fixes. This release covers 75 commits since v0.4.11.
+
+### Codex & Multi-Agent Hook Support
+
+- Applied protocol-derived agent profiles, so Codex/Copilot/Gemini/Claude-style
+  hook payloads can select the right agent profile without relying only on
+  process environment detection
+  ([7f7d67e](https://github.com/Dicklesworthstone/destructive_command_guard/commit/7f7d67e)).
+- Kept blank Codex `turn_id` fields from forcing the Codex stderr-deny path,
+  preserving Claude-compatible JSON behavior for payloads that are not actually
+  Codex hook events
+  ([d0a1bef](https://github.com/Dicklesworthstone/destructive_command_guard/commit/d0a1bef)).
+- Hardened Copilot handling for PowerShell payloads, missing tool names, and
+  warn-severity decisions so Copilot warnings remain non-stopping while denies
+  still block
+  ([e11baea](https://github.com/Dicklesworthstone/destructive_command_guard/commit/e11baea),
+  [4862be4](https://github.com/Dicklesworthstone/destructive_command_guard/commit/4862be4),
+  [708536e](https://github.com/Dicklesworthstone/destructive_command_guard/commit/708536e)).
+- Added and expanded subprocess-level Codex protocol coverage, including
+  hermetic HOME isolation, allow-once/allowlist parity, pack enablement,
+  heredoc behavior, and cross-protocol block/allow shape checks
+  ([tests/codex_hook_protocol.rs](https://github.com/Dicklesworthstone/destructive_command_guard/blob/main/tests/codex_hook_protocol.rs)).
+
+### Installer & Uninstaller Reliability
+
+- Made Unix and Windows installers preserve malformed or user-owned hook
+  configuration instead of overwriting it for Claude Code, Codex CLI, Gemini
+  CLI, GitHub Copilot CLI, Cursor IDE, and PowerShell hook payloads
+  ([c55bf33](https://github.com/Dicklesworthstone/destructive_command_guard/commit/c55bf33),
+  [1a4b015](https://github.com/Dicklesworthstone/destructive_command_guard/commit/1a4b015),
+  [563d538](https://github.com/Dicklesworthstone/destructive_command_guard/commit/563d538),
+  [46f3764](https://github.com/Dicklesworthstone/destructive_command_guard/commit/46f3764),
+  [fba6067](https://github.com/Dicklesworthstone/destructive_command_guard/commit/fba6067)).
+- Preserved coexisting user hooks while keeping dcg first in the relevant Bash
+  hook lists, including mixed Copilot entries and existing Claude hooks
+  ([792236e](https://github.com/Dicklesworthstone/destructive_command_guard/commit/792236e),
+  [85028ce](https://github.com/Dicklesworthstone/destructive_command_guard/commit/85028ce),
+  [389ac52](https://github.com/Dicklesworthstone/destructive_command_guard/commit/389ac52)).
+- Rejected empty or flag-shaped installer option values so arguments like
+  `--version --system` fail as setup errors instead of treating `--system` as
+  the version value
+  ([e8cb117](https://github.com/Dicklesworthstone/destructive_command_guard/commit/e8cb117)).
+- Matched uninstall ownership checks more exactly for Cursor, Codex,
+  PowerShell, and non-dcg hook preservation so uninstallers remove only dcg's
+  own entries
+  ([6d71b68](https://github.com/Dicklesworthstone/destructive_command_guard/commit/6d71b68),
+  [af68c72](https://github.com/Dicklesworthstone/destructive_command_guard/commit/af68c72),
+  [b043068](https://github.com/Dicklesworthstone/destructive_command_guard/commit/b043068),
+  [e8e65d1](https://github.com/Dicklesworthstone/destructive_command_guard/commit/e8e65d1)).
+
+### Railway & API Pack Hardening
+
+- Expanded the Railway pack to recognize `Project-Access-Token` and
+  `RAILWAY_TOKEN` signals, multiline API payloads, curl executable suffixes,
+  and JSON database variable keys that can mutate production connection
+  settings
+  ([d6b49d5](https://github.com/Dicklesworthstone/destructive_command_guard/commit/d6b49d5),
+  [6220da9](https://github.com/Dicklesworthstone/destructive_command_guard/commit/6220da9),
+  [586afff](https://github.com/Dicklesworthstone/destructive_command_guard/commit/586afff),
+  [2193c67](https://github.com/Dicklesworthstone/destructive_command_guard/commit/2193c67)).
+- Closed broad safe-pattern masking gaps across cloud, database, Kubernetes,
+  package manager, backup, search, monitoring, feature flag, Kafka, and
+  Ansible packs, including attached/equal curl methods and false dry-run text
+  bypasses
+  ([8e86dbc](https://github.com/Dicklesworthstone/destructive_command_guard/commit/8e86dbc),
+  [1a1c1b0](https://github.com/Dicklesworthstone/destructive_command_guard/commit/1a1c1b0),
+  [2690864](https://github.com/Dicklesworthstone/destructive_command_guard/commit/2690864),
+  [c8faf44](https://github.com/Dicklesworthstone/destructive_command_guard/commit/c8faf44),
+  [552b83d](https://github.com/Dicklesworthstone/destructive_command_guard/commit/552b83d),
+  [7a02669](https://github.com/Dicklesworthstone/destructive_command_guard/commit/7a02669),
+  [535b01a](https://github.com/Dicklesworthstone/destructive_command_guard/commit/535b01a)).
+- Kept legitimate AWS S3 `--dryrun` previews allowed while blocking deceptive
+  dry-run-looking strings in destructive contexts
+  ([b5bea76](https://github.com/Dicklesworthstone/destructive_command_guard/commit/b5bea76)).
+
+### Command Parsing, Agent Detection, and Update Safety
+
+- Fixed shell redirection tokenization around attached `&>`, `&>>`, and `>&`
+  forms so destructive append/truncate redirections are not split or hidden
+  from filesystem rules
+  ([87766f9](https://github.com/Dicklesworthstone/destructive_command_guard/commit/87766f9),
+  [8aeffdc](https://github.com/Dicklesworthstone/destructive_command_guard/commit/8aeffdc),
+  [149255c](https://github.com/Dicklesworthstone/destructive_command_guard/commit/149255c),
+  [616cd75](https://github.com/Dicklesworthstone/destructive_command_guard/commit/616cd75)).
+- Reduced false positives in agent detection for domain/path substrings,
+  wrapper-launched agents, and Windows shim-launched processes while recording
+  the hook-protocol-detected agent type in history
+  ([224f2f8](https://github.com/Dicklesworthstone/destructive_command_guard/commit/224f2f8),
+  [97e91d4](https://github.com/Dicklesworthstone/destructive_command_guard/commit/97e91d4),
+  [dba007c](https://github.com/Dicklesworthstone/destructive_command_guard/commit/dba007c),
+  [77bfbaf](https://github.com/Dicklesworthstone/destructive_command_guard/commit/77bfbaf)).
+- Hardened `dcg update` so unknown latest installer tags fail closed, rollback
+  pruning preserves the intended target, and backup artifact names are
+  validated before use
+  ([a4d467c](https://github.com/Dicklesworthstone/destructive_command_guard/commit/a4d467c),
+  [5c7312b](https://github.com/Dicklesworthstone/destructive_command_guard/commit/5c7312b),
+  [1eea079](https://github.com/Dicklesworthstone/destructive_command_guard/commit/1eea079),
+  [ea3fcc5](https://github.com/Dicklesworthstone/destructive_command_guard/commit/ea3fcc5)).
 
 ## [v0.4.11](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.4.11) -- 2026-05-01 [Release]
 

@@ -1,13 +1,13 @@
 [package]
 name = "destructive_command_guard"
-version = "0.4.11"
+version = "0.5.0"
 edition = "2024"
 resolver = "2"
 authors = [
     "Jeffrey Emanuel <jeff@jeffreyemanuel.dev>",
     "Dowwie <dowwie@gmail.com>"
 ]
-description = "A Claude Code hook that blocks destructive commands before they execute"
+description = "An AI coding agent hook that blocks destructive commands before they execute"
 repository = "https://github.com/Dicklesworthstone/destructive_command_guard"
 homepage = "https://github.com/Dicklesworthstone/destructive_command_guard"
 license = "MIT"

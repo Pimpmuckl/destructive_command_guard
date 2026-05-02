@@ -11,7 +11,7 @@
 
 </div>
 
-A high-performance hook for AI coding agents that blocks destructive commands before they execute, protecting your work from accidental deletion.
+A high-performance hook for AI coding agents that blocks destructive commands before they execute, protecting your work from accidental deletion across Claude Code, Codex CLI, Gemini CLI, Copilot, Cursor, and related tools.
 
 **Supported:** [Claude Code](https://claude.ai/code), [Codex CLI 0.125.0+](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [GitHub Copilot CLI](https://docs.github.com/en/copilot/concepts/agents/coding-agent/about-hooks), [Cursor IDE](https://cursor.com), [OpenCode](https://opencode.ai) (via [community plugin](https://github.com/aspiers/ai-config/blob/main/.config/opencode/plugins/dcg-guard.js)), [Aider](https://aider.chat/) (limited—git hooks only), [Continue](https://continue.dev) (detection only)
 
@@ -29,7 +29,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_comm
 
 ## TL;DR
 
-**The Problem**: AI coding agents (Claude, GPT, etc.) occasionally run catastrophic commands like `git reset --hard`, `rm -rf ./src`, or `DROP TABLE users`—destroying hours of uncommitted work in seconds.
+**The Problem**: AI coding agents (Claude, Codex, Gemini, Copilot, etc.) occasionally run catastrophic commands like `git reset --hard`, `rm -rf ./src`, or `DROP TABLE users`—destroying hours of uncommitted work in seconds.
 
 **The Solution**: dcg is a high-performance hook that intercepts destructive commands *before* they execute, blocking them with clear explanations and safer alternatives.
 
@@ -44,6 +44,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_comm
 | **Smart Context Detection** | Won't block `grep "rm -rf"` (data) but will block `rm -rf /` (execution) |
 | **Rich Terminal Output** | Human-readable denial panels, rule context, and suggestions on stderr |
 | **Agent-Safe Streams** | Machine-readable hook output stays on stdout while rich UI stays on stderr |
+| **Native Codex Support** | Codex CLI 0.125.0+ uses the strict exit-code-2 + stderr denial path Codex expects |
 | **Graceful Degradation** | Plain output for CI, pipes, dumb terminals, and no-color environments |
 | **Scan Mode for CI** | Pre-commit hooks and CI integration to catch dangerous commands in code review |
 | **Fail-Open Design** | Never blocks your workflow due to timeouts or parse errors |
@@ -110,6 +111,27 @@ disabled_allowlist = true
 
 See [docs/agents.md](docs/agents.md) for full documentation on supported agents,
 trust levels, and configuration options.
+
+### Codex Support
+
+dcg now treats Codex CLI as a first-class hook target, not just a Claude-shaped
+compatibility path. The installer configures Codex CLI 0.125.0+ automatically
+when it detects `codex` on `PATH` or an existing `~/.codex/` directory.
+
+| Codex behavior | dcg handling |
+|----------------|--------------|
+| Hook config | Merges a `PreToolUse` Bash hook into `~/.codex/hooks.json` |
+| Denied command | Exits with code 2, writes the block reason to stderr, and writes no stdout JSON |
+| Allowed command | Exits 0 with empty stdout and stderr |
+| Existing hooks | Preserves coexisting hooks, keeps dcg first for Bash, and refuses to overwrite malformed JSON |
+| Validation | Covered by subprocess protocol tests plus an opt-in real Codex E2E harness |
+
+Codex's hook input is intentionally close to Claude Code's, but Codex rejects
+unknown fields in hook output. dcg detects Codex payloads from the non-empty
+`turn_id` field and switches to Codex's documented stderr denial path so a
+blocked command is reported as blocked rather than as a failed hook. See
+[docs/codex-integration.md](docs/codex-integration.md) for protocol details,
+manual probes, and troubleshooting.
 
 ---
 
@@ -651,7 +673,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_comm
 Install specific version:
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --version v0.1.0
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --version v0.5.0
 ```
 
 Install to /usr/local/bin (system-wide, requires sudo):
@@ -793,6 +815,34 @@ Add to `~/.claude/settings.json`:
 ```
 
 **Important:** Restart Claude Code after adding the hook configuration.
+
+## Codex CLI Configuration
+
+Codex CLI 0.125.0+ supports stable `PreToolUse` hooks. The installer writes or
+merges this automatically, but the manual configuration lives at
+`~/.codex/hooks.json`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "dcg"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Codex denials intentionally differ from Claude-compatible denials: dcg exits
+with code 2, writes the block reason to stderr, and leaves stdout empty. Allowed
+commands stay silent with exit code 0.
 
 ## Gemini CLI Configuration
 
