@@ -26,32 +26,35 @@ pub fn create_pack() -> Pack {
 
 fn create_safe_patterns() -> Vec<SafePattern> {
     vec![
-        // --check is dry-run mode (safe)
+        // Safe Ansible modes are only safe for the current shell command
+        // segment. Since safe patterns run before destructive patterns, keep
+        // them bounded so `ansible-playbook --check ...; ansible ... rm -rf`
+        // cannot make the whole compound command safe.
         safe_pattern!(
             "ansible-check",
-            r"ansible(?:-playbook)?\s+.*--check(?:\s|$)"
+            r"ansible(?:-playbook)?\b[^\n;&|]*--check(?:\s|$)[^\n;&|]*$"
         ),
         // --list-hosts just lists (safe)
         safe_pattern!(
             "ansible-list-hosts",
-            r"ansible(?:-playbook)?\s+.*--list-hosts"
+            r"ansible(?:-playbook)?\b[^\n;&|]*--list-hosts(?:\s|$)[^\n;&|]*$"
         ),
         // --list-tasks just lists (safe)
         safe_pattern!(
             "ansible-list-tasks",
-            r"ansible(?:-playbook)?\s+.*--list-tasks"
+            r"ansible(?:-playbook)?\b[^\n;&|]*--list-tasks(?:\s|$)[^\n;&|]*$"
         ),
         // --syntax-check is safe
         safe_pattern!(
             "ansible-syntax",
-            r"ansible(?:-playbook)?\s+.*--syntax-check"
+            r"ansible(?:-playbook)?\b[^\n;&|]*--syntax-check(?:\s|$)[^\n;&|]*$"
         ),
         // ansible-inventory is safe
-        safe_pattern!("ansible-inventory", r"ansible-inventory"),
+        safe_pattern!("ansible-inventory", r"ansible-inventory\b[^\n;&|]*$"),
         // ansible-doc is safe
-        safe_pattern!("ansible-doc", r"ansible-doc"),
+        safe_pattern!("ansible-doc", r"ansible-doc\b[^\n;&|]*$"),
         // ansible-config is safe
-        safe_pattern!("ansible-config", r"ansible-config"),
+        safe_pattern!("ansible-config", r"ansible-config\b[^\n;&|]*$"),
     ]
 }
 
@@ -229,6 +232,21 @@ mod tests {
             r"ansible all --diff -e 'action=delete' -m debug",
             "extra-vars-delete",
         );
+    }
+
+    #[test]
+    fn ansible_safe_modes_do_not_allow_compound_destructive_commands() {
+        let pack = create_pack();
+
+        let checked_then_destructive =
+            "ansible-playbook --check site.yml; ansible all -m shell -a 'rm -rf /data'";
+        assert_no_safe_match(&pack, checked_then_destructive);
+        assert_blocks_with_pattern(&pack, checked_then_destructive, "shell-rm-rf");
+
+        let inventory_then_destructive =
+            "ansible-inventory --list && ansible all -m shell -a 'reboot'";
+        assert_no_safe_match(&pack, inventory_then_destructive);
+        assert_blocks_with_pattern(&pack, inventory_then_destructive, "shell-reboot");
     }
 
     #[test]
