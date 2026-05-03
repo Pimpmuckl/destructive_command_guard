@@ -2788,6 +2788,43 @@ mod tests {
             } else {
                 panic!("Expected Extracted result, got {result:?}");
             }
+        }
+
+        // Regression test for issue #109: bash accepts `<<- 'EOF'` (with a
+        // space after the `-` tab-strip marker). Before the fix, the
+        // delimiter parser fell through to the unquoted branch with a
+        // leading space and bailed, leaving the heredoc body unmasked so
+        // pack matching denied dangerous-looking prose like "gh repo
+        // delete" inside `cat <<- 'EOF'`. All four spaced/non-spaced and
+        // single/double-quoted forms must extract the same delimiter.
+        #[test]
+        fn extracts_heredoc_tab_stripped_quoted_with_space_after_dash() {
+            for (form, cmd) in [
+                ("<<-'EOF'", "cat <<-'EOF'\n\tgh repo delete\n\tEOF"),
+                ("<<- 'EOF'", "cat <<- 'EOF'\n\tgh repo delete\n\tEOF"),
+                ("<<-\"EOF\"", "cat <<-\"EOF\"\n\tgh repo delete\n\tEOF"),
+                ("<<- \"EOF\"", "cat <<- \"EOF\"\n\tgh repo delete\n\tEOF"),
+                ("<<~ 'EOF'", "cat <<~ 'EOF'\n\tgh repo delete\n\tEOF"),
+            ] {
+                let result = extract_content(cmd, &ExtractionLimits::default());
+                let ExtractionResult::Extracted(contents) = result else {
+                    panic!("Expected extraction for {form}, got {result:?}");
+                };
+                assert_eq!(
+                    contents.len(),
+                    1,
+                    "{form}: expected single heredoc extraction"
+                );
+                assert_eq!(
+                    contents[0].delimiter.as_deref(),
+                    Some("EOF"),
+                    "{form}: delimiter must parse to EOF"
+                );
+                assert!(
+                    contents[0].quoted,
+                    "{form}: quoted delimiter must set quoted=true"
+                );
+            }
 
             let cmd = "cat << EOF\nline1\nEOF";
             let result = extract_content(cmd, &ExtractionLimits::default());
