@@ -11,9 +11,66 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
-## [Unreleased] (after v0.5.0)
+## [Unreleased] (after v0.5.1)
 
 No unreleased changes yet.
+
+## [v0.5.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.5.1) -- 2026-05-03 [Release]
+
+Patch release after v0.5.0 covering two false-positive/false-negative classes
+discovered during a wide review of recent agent-authored fixes: the heredoc
+parser's handling of the `<<-` / `<<~` markers and a missed-coverage gap in
+the compact `-XDELETE` / `--request=DELETE` / `--method=DELETE` curl/glab API
+forms. 5 commits since v0.5.0.
+
+### Heredoc parser hardening (issue #109)
+
+- Consumed whitespace between the `<<-` / `<<~` marker and the delimiter so
+  bash-legal forms like `cat <<- 'EOF'` no longer fall through the
+  quoted-delimiter strip and bail out unmasked. Pre-fix the body escaped
+  masking, and pack matching denied prose like "gh repo delete" inside a
+  heredoc fed to a non-executing target ([f3c96bd](https://github.com/Dicklesworthstone/destructive_command_guard/commit/f3c96bd),
+  test coverage added in [a739dc9](https://github.com/Dicklesworthstone/destructive_command_guard/commit/a739dc9)
+  and [03bf276](https://github.com/Dicklesworthstone/destructive_command_guard/commit/03bf276)).
+- Disambiguated `cat << -EOF` (whitespace before the dash, delimiter is
+  literally `-EOF`) from `cat <<-EOF` (tab-strip marker, delimiter is `EOF`)
+  by gating the marker classification on `skip_whitespace == 0`. Same fix
+  applied to `~` so `cat << ~TILDE` is also a Standard heredoc with
+  delimiter `~TILDE`. Aligned the manual `parse_heredoc_delimiter` path with
+  the regex-based `extract_heredocs` path so both correctly map `~` to
+  `IndentStripped` rather than `TabStripped`. Without this, a `cat <<~EOF`
+  with space-indented body lines and a space-indented terminator was never
+  recognized by the masker, the body escaped masking, and pack matching
+  produced false positives on documentation prose like `rm -rf /` inside
+  the heredoc body
+  ([a8a0a8d](https://github.com/Dicklesworthstone/destructive_command_guard/commit/a8a0a8d)).
+
+### Compact curl / glab API method forms
+
+- Closed a false-negative gap where four destructive-pattern regexes still
+  required whitespace between `-X` / `--request` / `--method` and the HTTP
+  verb. Pre-fix bypasses such as `glab api -XDELETE
+  projects/123/variables/SECRET`, `glab api --method=DELETE
+  /projects/123/protected_branches/main`, `curl -XDELETE
+  https://splunk.example.com:8089/services/data/inputs/abc`, and `curl
+  --request=DELETE
+  https://circleci.com/api/v2/.../envvar/FOO` slipped through unblocked
+  because curl and glab's cobra-based CLI accept those compact short forms
+  and equals long forms. Aligned the affected packs with the broader
+  `(?:-X\s*|--request(?:=|\s+))VERB` shape already used by `gh api`,
+  Datadog, PagerDuty, Prometheus, New Relic, Meilisearch, and the email
+  packs, and added regression tests for each block
+  ([1fdfbec](https://github.com/Dicklesworthstone/destructive_command_guard/commit/1fdfbec)).
+
+### Representative commits
+
+| Commit | Subject |
+|--------|---------|
+| [f3c96bd](https://github.com/Dicklesworthstone/destructive_command_guard/commit/f3c96bd) | fix(heredoc): consume whitespace between `<<-` / `<<~` marker and delimiter (issue #109) |
+| [a739dc9](https://github.com/Dicklesworthstone/destructive_command_guard/commit/a739dc9) | test(heredoc): cover `<<-` / `<<~` with space-after-marker quoted forms (issue #109) |
+| [03bf276](https://github.com/Dicklesworthstone/destructive_command_guard/commit/03bf276) | test(heredoc): restore unquoted-delimiter assertion to its parent test |
+| [a8a0a8d](https://github.com/Dicklesworthstone/destructive_command_guard/commit/a8a0a8d) | fix(heredoc): respect whitespace gap when classifying tab-strip marker |
+| [1fdfbec](https://github.com/Dicklesworthstone/destructive_command_guard/commit/1fdfbec) | fix(packs): match `curl -XDELETE` and `--request=DELETE` compact forms across CI/platform packs |
 
 ## [v0.5.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.5.0) -- 2026-05-02 [Release]
 
