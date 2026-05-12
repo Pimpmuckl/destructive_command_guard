@@ -31,11 +31,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux x86_64 (gnu to match existing release artifacts)
+          # Linux x86_64 — musl for portability. The previous gnu target
+          # linked against the build runner's glibc, which on
+          # ubuntu-latest is currently 2.39+ and rejects any host with
+          # glibc < 2.39 (Ubuntu 22.04 LTS, RHEL 8/9, etc.). See #114.
+          # `self_update`'s `rustls` feature avoids the OpenSSL link that
+          # would normally make musl builds painful — dcg has no other
+          # C-using deps, so musl-tools + the static target are
+          # sufficient.
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
             artifact_name: dcg
-          # Linux ARM64 (gnu to match existing release artifacts)
+            apt_install: musl-tools
+          # Linux ARM64 — gnu stays. musl on ARM has its own packaging
+          # ecosystem we don't currently support, and the gnu build
+          # runs on the native ubuntu-24.04-arm runner which keeps the
+          # binary kernel-compatible with every aarch64 distro we ship
+          # to. See #112 for the v0.5.1 release where the aarch64 asset
+          # was actually an x86-64 binary — fixed by the native ARM
+          # runner already in this matrix.
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             artifact_name: dcg
@@ -64,8 +78,47 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install apt build deps (Linux)
+        if: matrix.apt_install != ''
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ${{ matrix.apt_install }}
+
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Verify Linux x86_64 musl binary has no glibc symbols
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          set -euo pipefail
+          # Catch a future regression where the musl matrix entry
+          # silently links against glibc anyway. `objdump -T` exits
+          # 1 on a static binary (no dynamic symbol table), which is
+          # exactly what we want — that's the success signal. Any
+          # GLIBC_* symbol surfacing here is a release-blocker (see
+          # #114 for the original regression).
+          if objdump -T "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}" 2>/dev/null | grep -q "GLIBC_"; then
+            echo "::error::musl binary unexpectedly contains GLIBC symbols — release would re-introduce #114"
+            objdump -T "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}" | grep "GLIBC_" || true
+            exit 1
+          fi
+          echo "musl binary verified: no GLIBC_* symbols present"
+
+      - name: Verify Linux aarch64 binary is actually aarch64
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          set -euo pipefail
+          # Pin against the v0.5.1 regression (#112): the published
+          # aarch64 tarball contained an x86-64 ELF. Native ARM
+          # runners in this matrix make that impossible by
+          # construction, but the file-type check is cheap insurance.
+          arch_str="$(file "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}")"
+          if ! echo "$arch_str" | grep -q "aarch64"; then
+            echo "::error::aarch64 build produced a non-aarch64 binary — release would re-introduce #112"
+            echo "$arch_str"
+            exit 1
+          fi
+          echo "aarch64 binary verified: $arch_str"
 
       - name: Create tarball (Unix)
         if: runner.os != 'Windows'

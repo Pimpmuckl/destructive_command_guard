@@ -13,7 +13,26 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## [Unreleased] (after v0.5.1)
 
-No unreleased changes yet.
+### Release-engineering fixes
+
+- **Linux x86_64 now ships as static musl** ([#114](https://github.com/Dicklesworthstone/destructive_command_guard/issues/114)).
+  Previous releases linked against the build runner's glibc and required
+  GLIBC ≥ 2.39 on the host, which blocked Ubuntu 22.04 LTS and any
+  long-support distro. The dist matrix now uses `x86_64-unknown-linux-musl`
+  with the `rustls` feature on `self_update` so OpenSSL isn't dragged in,
+  plus an `objdump -T | grep GLIBC_` post-build check that fails the
+  release if the binary unexpectedly re-acquires glibc symbols.
+  `install.sh` was updated to map `linux-x86_64` to the musl target by
+  default, with a one-shot HEAD-probe fallback to the legacy gnu artifact
+  for older pinned versions so the transition doesn't break users who
+  ask for an older version explicitly.
+
+- **aarch64 release artifact verified at build time** ([#112](https://github.com/Dicklesworthstone/destructive_command_guard/issues/112)).
+  v0.5.1's `dcg-aarch64-unknown-linux-gnu.tar.xz` published an x86-64
+  ELF binary. Native ARM runners in the current matrix make that
+  impossible by construction, but a `file <target>/release/dcg | grep
+  aarch64` post-build check now fails the release if the architecture
+  ever drifts again.
 
 ## [v0.5.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.5.1) -- 2026-05-03 [Release]
 

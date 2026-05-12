@@ -476,7 +476,12 @@ detect_platform() {
 
   TARGET=""
   case "${OS}-${ARCH}" in
-    linux-x86_64) TARGET="x86_64-unknown-linux-gnu" ;;
+    # Linux x86_64 ships as a fully-static musl binary so the published
+    # artifact runs on every glibc generation, including the LTS releases
+    # (Ubuntu 22.04 ships glibc 2.35; RHEL 8/9, Amazon Linux 2, etc.).
+    # The previous gnu mapping linked against the build runner's glibc
+    # and rejected any older host with `GLIBC_2.39 not found`. See #114.
+    linux-x86_64) TARGET="x86_64-unknown-linux-musl" ;;
     linux-aarch64) TARGET="aarch64-unknown-linux-gnu" ;;
     darwin-x86_64) TARGET="x86_64-apple-darwin" ;;
     darwin-aarch64) TARGET="aarch64-apple-darwin" ;;
@@ -499,6 +504,29 @@ set_artifact_url() {
     elif [ -n "$TARGET" ]; then
       TAR="dcg-${TARGET}.tar.xz"
       URL="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${TAR}"
+
+      # Backward-compat fallback for the Linux x86_64 musl transition
+      # (#114). Releases v0.5.2+ ship musl artifacts; v0.5.1 and earlier
+      # ship gnu. If the operator pinned an older version that doesn't
+      # have a musl asset, fall back to the gnu naming so they still
+      # get a working binary. We probe with a HEAD request so this
+      # adds at most one round-trip on the older-release path.
+      if [ "$TARGET" = "x86_64-unknown-linux-musl" ] && command -v curl >/dev/null 2>&1; then
+        local http_code
+        http_code=$(curl -sSL -o /dev/null -w '%{http_code}' -I --max-time 10 "$URL" || echo "000")
+        if [ "$http_code" != "200" ] && [ "$http_code" != "302" ]; then
+          local legacy_target="x86_64-unknown-linux-gnu"
+          local legacy_url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/dcg-${legacy_target}.tar.xz"
+          local legacy_code
+          legacy_code=$(curl -sSL -o /dev/null -w '%{http_code}' -I --max-time 10 "$legacy_url" || echo "000")
+          if [ "$legacy_code" = "200" ] || [ "$legacy_code" = "302" ]; then
+            warn "No musl artifact for ${VERSION}; falling back to gnu (host glibc must be >= the build runner's, see #114)"
+            TARGET="$legacy_target"
+            TAR="dcg-${TARGET}.tar.xz"
+            URL="$legacy_url"
+          fi
+        fi
+      fi
     else
       warn "No prebuilt artifact for ${OS}/${ARCH}; falling back to build-from-source"
       FROM_SOURCE=1
