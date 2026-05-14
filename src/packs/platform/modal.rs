@@ -147,7 +147,12 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         ),
         safe_pattern!(
             "modal-secret-create-no-force",
-            r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+secret\s+create\b(?![^;&|\r\n]*(?:--force|--overwrite)\b)"
+            // Negative lookahead must allow `\\\r?\n` shell line continuation
+            // inside the scanned region, otherwise `modal secret create \
+            // --force ...` (continued across lines) is falsely matched as
+            // safe — the lookahead stops at `\n` and never sees `--force`.
+            // Mirrors the destructive pattern's `(?:[^;&|\r\n]|\\\r?\n)*` body.
+            r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+secret\s+create\b(?!(?:[^;&|\r\n]|\\\r?\n)*(?:--force|--overwrite)\b)"
         ),
         // Environment — list and non-destructive lifecycle
         safe_pattern!(
@@ -271,7 +276,12 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // --- Medium: single-item delete / overwrite ---
         destructive_pattern!(
             "modal-volume-rm",
-            r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+rm\b(?![^;&|\r\n]*(?:\s|=)(?:-r\b|-R\b|--recursive\b))",
+            // Negative lookahead must allow `\\\r?\n` shell line continuation
+            // so a command like `modal volume rm my-vol \\\n-r /dir` (continued
+            // across lines) is correctly routed to the High-severity recursive
+            // pattern rather than falling through to this Medium pattern. Same
+            // asymmetry-fix as the secret-create-no-force lookahead above.
+            r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+rm\b(?!(?:[^;&|\r\n]|\\\r?\n)*(?:\s|=)(?:-r\b|-R\b|--recursive\b))",
             "modal volume rm deletes a file inside a Modal Volume.",
             Medium,
             "Single-file deletion inside a Volume is recoverable only if you have an external copy. Verify the target path before running.",
@@ -475,6 +485,38 @@ mod tests {
         let recursive = pack
             .check("modal volume rm -r my-vol /dir")
             .expect("recursive rm should block at higher severity");
+        assert_eq!(recursive.severity, Severity::High);
+        assert_eq!(recursive.name, Some("modal-volume-rm-recursive"));
+    }
+
+    #[test]
+    fn detects_force_across_shell_line_continuation() {
+        // Regression: the safe pattern's negative lookahead must allow
+        // `\\\r?\n` shell line continuation, otherwise `modal secret create \
+        // --force ...` (split across lines) is misreported as safe because
+        // the lookahead stops at the `\n` and never sees `--force`.
+        let pack = create_pack();
+        assert_blocks_with_pattern(
+            &pack,
+            "modal secret create my-secret \\\n--force VALUE=new",
+            "modal-secret-create-force",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "modal secret create my-secret \\\r\n--overwrite VALUE=new",
+            "modal-secret-create-force",
+        );
+    }
+
+    #[test]
+    fn detects_recursive_volume_rm_across_shell_line_continuation() {
+        // Same asymmetry fix on `modal-volume-rm`'s negative lookahead — a
+        // recursive `rm` continued across lines must still route to the
+        // High-severity pattern, not fall through to the Medium one.
+        let pack = create_pack();
+        let recursive = pack
+            .check("modal volume rm my-vol \\\n-r /old-checkpoints")
+            .expect("line-continued recursive rm should block");
         assert_eq!(recursive.severity, Severity::High);
         assert_eq!(recursive.name, Some("modal-volume-rm-recursive"));
     }
