@@ -452,13 +452,30 @@ mod tests {
     }
 
     #[test]
-    fn allows_documentation_mentions() {
+    fn distinguishes_create_force_from_create_without_force() {
         let pack = create_pack();
-        assert_allows(&pack, "grep 'modal volume delete' docs/runbook.md");
-        assert_allows(&pack, "echo 'modal secret delete is destructive'");
-        assert_allows(
+        assert_allows(&pack, "modal secret create new-secret VALUE=abc");
+        assert_allows(&pack, "modal secret create --from-dotenv .env new-secret");
+        assert_blocks_with_pattern(
             &pack,
-            "rg 'modal app stop' --type md  # find runbook mentions",
+            "modal secret create --force my-secret VALUE=new",
+            "modal-secret-create-force",
         );
+    }
+
+    #[test]
+    fn distinguishes_volume_rm_recursive_from_single_file() {
+        let pack = create_pack();
+        let single = pack
+            .check("modal volume rm my-vol /file.bin")
+            .expect("single-file rm should still block");
+        assert_eq!(single.severity, Severity::Medium);
+        assert_eq!(single.name, Some("modal-volume-rm"));
+
+        let recursive = pack
+            .check("modal volume rm -r my-vol /dir")
+            .expect("recursive rm should block at higher severity");
+        assert_eq!(recursive.severity, Severity::High);
+        assert_eq!(recursive.name, Some("modal-volume-rm-recursive"));
     }
 }
