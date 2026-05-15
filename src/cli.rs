@@ -9170,11 +9170,15 @@ fn doctor_pretty(fix: bool) {
                     claude_compat_path.display()
                 );
             }
-        } else if claude_compat_exists && hook_diag.dcg_hook_count == 1 {
+        } else if claude_compat_exists && hook_diag.dcg_hook_count >= 1 {
             // Grok will use the Claude-compat path; this still works but the
-            // native path is preferred. Surface as a friendly WARN, not an
+            // native path is preferred. Surface as a friendly note, not an
             // error, so users who deliberately rely on Claude-compat aren't
-            // pestered.
+            // pestered. Any non-zero hook count is fine here because the
+            // "duplicate Claude hooks" case is already reported as a WARNING
+            // by Check 3 above — from Grok's point of view the compat layer
+            // is wired up either way, so we shouldn't escalate to
+            // "NOT REGISTERED" just because the Claude side has duplicates.
             println!("{}", "OK (via Claude compat)".green());
             println!(
                 "  No native ~/.grok/hooks/dcg.json — Grok will pick up dcg from {}.",

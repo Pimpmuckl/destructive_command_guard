@@ -508,34 +508,21 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
     }
 
     // --- Grok (xAI) indicators (checked alongside Hermes) ---
-    // Grok uses two distinctive markers:
+    // Grok uses two distinctive markers in its hook stdin envelope:
     //   - hookEventName="pre_tool_use" (snake_case "use"; Hermes uses "call",
     //     Claude uses PascalCase "PreToolUse", Copilot uses hyphenated
     //     "pre-tool-use" but only via the `event` field — never via
     //     `hookEventName`).
     //   - toolName="run_terminal_cmd" (Grok's internal shell tool name).
-    // Either signal alone is a strong Grok indicator. We also accept the
-    // env-var fallback for cases where Grok's hookEventName field is absent
-    // (e.g. SessionStart hooks proxied through Bash that re-invoke dcg).
+    // Either signal alone is a strong Grok indicator. We deliberately do
+    // NOT add a GROK_* env-var fallback: real Grok hook invocations always
+    // emit both fields, so the wire-level check is sufficient, and an
+    // env-var fallback would risk false positives when dcg is invoked from
+    // a shell that happens to live inside a Grok session (e.g. running
+    // `cargo test` from a Grok-spawned terminal).
     let is_grok_event = hook_event_name == "pre_tool_use";
     let is_grok_tool = tool_name == "run_terminal_cmd";
-    let has_grok_env = std::env::var_os("GROK_SESSION_ID").is_some()
-        || std::env::var_os("GROK_HOOK_EVENT").is_some()
-        || std::env::var_os("GROK_WORKSPACE_ROOT").is_some();
     if (is_grok_event || is_grok_tool) && input.event.is_none() && input.tool_args.is_none() {
-        return HookProtocol::Grok;
-    }
-    // Env-var-only fallback: Grok set its hook env vars but the wire shape
-    // doesn't yet have a distinctive marker (e.g. dcg invoked as a wrapper).
-    // Require absence of other agents' wire-level signals to avoid clobbering
-    // a more specific match upstream.
-    if has_grok_env
-        && hook_event_name.is_empty()
-        && tool_name.is_empty()
-        && input.event.is_none()
-        && input.tool_args.is_none()
-        && input.turn_id.is_none()
-    {
         return HookProtocol::Grok;
     }
 
