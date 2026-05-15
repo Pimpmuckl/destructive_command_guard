@@ -20,6 +20,10 @@
 //! - Copilot CLI: `COPILOT_CLI=1` or `COPILOT_AGENT_START_TIME_SEC` env var
 //! - Cursor IDE: `CURSOR_IDE=1` env var (set by dcg's Cursor hook script)
 //! - Hermes Agent: `HERMES_AGENT=1` or `HERMES_SESSION_ID` env var
+//! - Grok (xAI): `GROK_SESSION_ID`, `GROK_HOOK_EVENT`, or `GROK_WORKSPACE_ROOT`
+//!   env var (set when Grok invokes hooks defined in `~/.grok/hooks/*.json`,
+//!   `.grok/hooks/*.json`, or `~/.claude/settings.json` via the Claude-Code
+//!   compatibility layer)
 //!
 //! # Usage
 //!
@@ -64,6 +68,10 @@ pub enum Agent {
     CursorIde,
     /// `NousResearch` Hermes Agent (via shell `pre_tool_call` hook).
     Hermes,
+    /// xAI Grok CLI / Grok Build TUI (via `~/.grok/hooks/*.json` and the
+    /// `~/.claude/settings.json` compatibility layer; emits `pre_tool_use`
+    /// events with `run_terminal_cmd` as the shell tool).
+    Grok,
     /// A custom agent specified by name.
     Custom(String),
     /// Unknown or undetected agent.
@@ -87,6 +95,7 @@ impl Agent {
             Self::CopilotCli => "copilot-cli",
             Self::CursorIde => "cursor-ide",
             Self::Hermes => "hermes",
+            Self::Grok => "grok",
             Self::Custom(name) => name,
             Self::Unknown => "unknown",
         }
@@ -106,6 +115,7 @@ impl Agent {
                 | Self::CopilotCli
                 | Self::CursorIde
                 | Self::Hermes
+                | Self::Grok
         )
     }
 
@@ -143,6 +153,7 @@ impl Agent {
             "copilotcli" | "copilot" => Self::CopilotCli,
             "cursoride" | "cursor" => Self::CursorIde,
             "hermes" | "hermesagent" | "hermescli" => Self::Hermes,
+            "grok" | "grokcli" | "grokbuild" | "xai" | "xaigrok" => Self::Grok,
             "unknown" => Self::Unknown,
             _ => Self::Custom(name.to_string()),
         }
@@ -161,6 +172,7 @@ impl fmt::Display for Agent {
             Self::CopilotCli => write!(f, "GitHub Copilot CLI"),
             Self::CursorIde => write!(f, "Cursor IDE"),
             Self::Hermes => write!(f, "Hermes Agent"),
+            Self::Grok => write!(f, "Grok (xAI)"),
             Self::Custom(name) => write!(f, "{name}"),
             Self::Unknown => write!(f, "Unknown"),
         }
@@ -472,6 +484,34 @@ fn detect_from_environment() -> Option<DetectionResult> {
         ));
     }
 
+    // Grok (xAI) detection. Grok sets three variables when invoking hooks
+    // (per ~/.grok/docs/user-guide/10-hooks.md):
+    //   - GROK_HOOK_EVENT       (e.g. "pre_tool_use")
+    //   - GROK_SESSION_ID       (the current session id)
+    //   - GROK_WORKSPACE_ROOT   (workspace root path)
+    // Any one of these is sufficient to identify the invoking agent.
+    if std::env::var("GROK_SESSION_ID").is_ok() {
+        return Some(DetectionResult::new(
+            Agent::Grok,
+            DetectionMethod::Environment,
+            Some("GROK_SESSION_ID".to_string()),
+        ));
+    }
+    if std::env::var("GROK_HOOK_EVENT").is_ok() {
+        return Some(DetectionResult::new(
+            Agent::Grok,
+            DetectionMethod::Environment,
+            Some("GROK_HOOK_EVENT".to_string()),
+        ));
+    }
+    if std::env::var("GROK_WORKSPACE_ROOT").is_ok() {
+        return Some(DetectionResult::new(
+            Agent::Grok,
+            DetectionMethod::Environment,
+            Some("GROK_WORKSPACE_ROOT".to_string()),
+        ));
+    }
+
     None
 }
 
@@ -680,6 +720,7 @@ fn agent_for_basename(basename: &str) -> Option<Agent> {
         "copilot" | "copilot-cli" | "gh-copilot" => Some(Agent::CopilotCli),
         "cursor" | "cursor-ide" => Some(Agent::CursorIde),
         "hermes" | "hermes-agent" | "hermes-cli" => Some(Agent::Hermes),
+        "grok" | "grok-cli" | "grok-build" => Some(Agent::Grok),
         _ => None,
     }
 }
@@ -724,6 +765,7 @@ mod tests {
         assert_eq!(Agent::CopilotCli.config_key(), "copilot-cli");
         assert_eq!(Agent::CursorIde.config_key(), "cursor-ide");
         assert_eq!(Agent::Hermes.config_key(), "hermes");
+        assert_eq!(Agent::Grok.config_key(), "grok");
         assert_eq!(Agent::Unknown.config_key(), "unknown");
         assert_eq!(
             Agent::Custom("my-agent".to_string()).config_key(),
@@ -761,6 +803,12 @@ mod tests {
         assert_eq!(Agent::from_name("Hermes"), Agent::Hermes);
         assert_eq!(Agent::from_name("hermes-agent"), Agent::Hermes);
         assert_eq!(Agent::from_name("hermes_cli"), Agent::Hermes);
+        assert_eq!(Agent::from_name("grok"), Agent::Grok);
+        assert_eq!(Agent::from_name("Grok"), Agent::Grok);
+        assert_eq!(Agent::from_name("grok-cli"), Agent::Grok);
+        assert_eq!(Agent::from_name("grok_build"), Agent::Grok);
+        assert_eq!(Agent::from_name("xai"), Agent::Grok);
+        assert_eq!(Agent::from_name("xai-grok"), Agent::Grok);
 
         // Custom agents
         assert_eq!(
@@ -780,6 +828,7 @@ mod tests {
         assert_eq!(format!("{}", Agent::CopilotCli), "GitHub Copilot CLI");
         assert_eq!(format!("{}", Agent::CursorIde), "Cursor IDE");
         assert_eq!(format!("{}", Agent::Hermes), "Hermes Agent");
+        assert_eq!(format!("{}", Agent::Grok), "Grok (xAI)");
         assert_eq!(format!("{}", Agent::Unknown), "Unknown");
         assert_eq!(
             format!("{}", Agent::Custom("MyAgent".to_string())),
@@ -795,6 +844,7 @@ mod tests {
         assert!(Agent::CopilotCli.is_known());
         assert!(Agent::CursorIde.is_known());
         assert!(Agent::Hermes.is_known());
+        assert!(Agent::Grok.is_known());
         assert!(!Agent::Unknown.is_known());
         assert!(!Agent::Custom("x".to_string()).is_known());
     }
@@ -852,6 +902,13 @@ mod tests {
             agent_from_process_name("/usr/local/bin/hermes"),
             Some(Agent::Hermes)
         );
+        assert_eq!(agent_from_process_name("grok"), Some(Agent::Grok));
+        assert_eq!(agent_from_process_name("grok-cli"), Some(Agent::Grok));
+        assert_eq!(agent_from_process_name("grok-build"), Some(Agent::Grok));
+        assert_eq!(
+            agent_from_process_name("/home/user/.local/bin/grok"),
+            Some(Agent::Grok)
+        );
     }
 
     #[test]
@@ -888,6 +945,11 @@ mod tests {
         assert_eq!(agent_from_process_name("hermes-helper"), None);
         assert_eq!(agent_from_process_name("xhermes"), None);
         assert_eq!(agent_from_process_name("anti-hermes"), None);
+        // The word "grok" appears in unrelated tool names; require exact match.
+        assert_eq!(agent_from_process_name("grok-helper"), None);
+        assert_eq!(agent_from_process_name("xgrok"), None);
+        assert_eq!(agent_from_process_name("anti-grok"), None);
+        assert_eq!(agent_from_process_name("grokking"), None);
     }
 
     #[test]
@@ -1040,6 +1102,11 @@ mod env_tests {
         "COPILOT_CLI",
         "COPILOT_AGENT_START_TIME_SEC",
         "CURSOR_IDE",
+        "HERMES_AGENT",
+        "HERMES_SESSION_ID",
+        "GROK_SESSION_ID",
+        "GROK_HOOK_EVENT",
+        "GROK_WORKSPACE_ROOT",
     ];
 
     fn with_env_var<F, R>(key: &str, value: &str, f: F) -> R
@@ -1196,6 +1263,39 @@ mod env_tests {
             assert_eq!(result.agent, Agent::CursorIde);
             assert_eq!(result.method, DetectionMethod::Environment);
             assert_eq!(result.matched_value, Some("CURSOR_IDE".to_string()));
+        });
+    }
+
+    #[test]
+    fn test_detect_grok_session_id_env() {
+        with_env_var("GROK_SESSION_ID", "sess-abc-123", || {
+            let result = detect_agent_with_details();
+            assert_eq!(result.agent, Agent::Grok);
+            assert_eq!(result.method, DetectionMethod::Environment);
+            assert_eq!(result.matched_value, Some("GROK_SESSION_ID".to_string()));
+        });
+    }
+
+    #[test]
+    fn test_detect_grok_hook_event_env() {
+        with_env_var("GROK_HOOK_EVENT", "pre_tool_use", || {
+            let result = detect_agent_with_details();
+            assert_eq!(result.agent, Agent::Grok);
+            assert_eq!(result.method, DetectionMethod::Environment);
+            assert_eq!(result.matched_value, Some("GROK_HOOK_EVENT".to_string()));
+        });
+    }
+
+    #[test]
+    fn test_detect_grok_workspace_root_env() {
+        with_env_var("GROK_WORKSPACE_ROOT", "/work/repo", || {
+            let result = detect_agent_with_details();
+            assert_eq!(result.agent, Agent::Grok);
+            assert_eq!(result.method, DetectionMethod::Environment);
+            assert_eq!(
+                result.matched_value,
+                Some("GROK_WORKSPACE_ROOT".to_string())
+            );
         });
     }
 

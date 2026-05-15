@@ -280,7 +280,7 @@ These patterns match safe commands that are always allowed:
 | `modal-app-readonly` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+app\s+(?:list\|ls\|logs\|history\|dashboard\|rollback\|rollover)\b` |
 | `modal-container-readonly` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+container\s+(?:list\|ls\|logs\|exec)\b` |
 | `modal-secret-list` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+secret\s+(?:list\|ls)\b` |
-| `modal-secret-create-no-force` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+secret\s+create\b(?![^;&\|\r\n]*(?:--force\|--overwrite)\b)` |
+| `modal-secret-create-no-force` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+secret\s+create\b(?!(?:[^;&\|\r\n]\|\\\r?\n)*(?:--force\|--overwrite)\b)` |
 | `modal-environment-list` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+environment\s+(?:list\|ls)\b` |
 | `modal-environment-mutate` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+environment\s+(?:create\|update)\b` |
 | `modal-dict-readonly` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+dict\s+(?:list\|ls\|get\|items\|create)\b` |

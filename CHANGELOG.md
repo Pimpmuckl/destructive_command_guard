@@ -13,6 +13,43 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## [Unreleased] (after v0.5.1)
 
+### Agent support
+
+- **Grok (xAI) protocol added as a first-class agent and hook target.**
+  dcg now detects Grok CLI / Grok Build TUI and emits its native JSON wire
+  shape so blocking actually sticks when Grok invokes shell tools.
+  - **Detection.** Grok is recognised by any of three environment variables
+    (`GROK_SESSION_ID`, `GROK_HOOK_EVENT`, `GROK_WORKSPACE_ROOT`) and by
+    parent-process basename (`grok`, `grok-cli`, `grok-build`). The hook
+    protocol is auto-selected when stdin carries `hookEventName: "pre_tool_use"`
+    or `toolName: "run_terminal_cmd"`, with explicit guards so the
+    Hermes (`pre_tool_call`) and Copilot (`event` / `tool_args`) markers
+    still win on their own payloads.
+  - **Wire shape.** Denies emit `{"decision":"deny","reason":"…", …}` on
+    stdout — *not* Hermes' `"block"`. Allows are empty stdout + exit 0.
+    Warns become explicit `{"decision":"allow","reason":"DCG warn: …"}`
+    so Grok logs the advisory without escalating to a block.
+  - **Installer.** `dcg install --grok` writes a self-contained
+    `~/.grok/hooks/dcg.json` (`PreToolUse` / `matcher: "Bash"`, which Grok
+    internally aliases to `run_terminal_cmd`). `--grok --project` writes
+    `<repo>/.grok/hooks/dcg.json` for per-repo installs. Grok also picks dcg
+    up via the existing `~/.claude/settings.json` compatibility layer, so
+    users who already ran `dcg install` get protection with no further
+    action.
+  - **Doctor.** `dcg doctor` adds a "Checking Grok hook registration…" line
+    when a `.grok/` directory or `GROK_*` env var is present. `dcg doctor
+    --fix` will write the native hook for you if it's missing. The check is
+    silent on hosts that have never had Grok installed, to avoid noise.
+  - **Tests.** Eight new protocol-detection tests plus full
+    denial/warning JSON-shape assertions in `hook::tests`, three new env
+    detection tests in `agent::env_tests`, and CLI parse coverage for
+    `--grok`/`--grok --project`. Closes the contribution proposals in
+    [#117](https://github.com/Dicklesworthstone/destructive_command_guard/pull/117)
+    and [#118](https://github.com/Dicklesworthstone/destructive_command_guard/pull/118)
+    by reimplementing the feature independently, including the corrected
+    user-level hook path (`~/.grok/hooks/dcg.json`, not `~/.grok/settings.json`)
+    and the correct block keyword (`"deny"`, not `"block"`).
+
 ### Release-engineering fixes
 
 - **Linux x86_64 now ships as static musl** ([#114](https://github.com/Dicklesworthstone/destructive_command_guard/issues/114)).

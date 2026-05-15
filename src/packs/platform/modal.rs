@@ -174,10 +174,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+queue\s+(?:list|ls|peek|len|create)\b"
         ),
         // Shell / deploy / serve / token — non-destructive
-        safe_pattern!(
-            "modal-shell",
-            r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+shell\b"
-        ),
+        safe_pattern!("modal-shell", r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+shell\b"),
         safe_pattern!(
             "modal-deploy",
             r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:deploy|serve|run|profile|launch)\b"
@@ -366,17 +363,29 @@ mod tests {
                 "modal environment delete prod --yes",
                 "modal-environment-delete",
             ),
-            ("modal environment rm staging -y", "modal-environment-delete"),
-            ("modal volume delete model-weights --yes", "modal-volume-delete"),
+            (
+                "modal environment rm staging -y",
+                "modal-environment-delete",
+            ),
+            (
+                "modal volume delete model-weights --yes",
+                "modal-volume-delete",
+            ),
             ("modal volume remove checkpoints -y", "modal-volume-delete"),
-            ("modal secret delete openai-key --yes", "modal-secret-delete"),
+            (
+                "modal secret delete openai-key --yes",
+                "modal-secret-delete",
+            ),
             ("modal secret rm postgres-creds -y", "modal-secret-delete"),
             ("modal dict delete state -y", "modal-dict-delete"),
             ("modal queue delete jobs --yes", "modal-queue-delete"),
             // High — terminates work / wipes contents
             ("modal app stop my-prod-app -y", "modal-app-stop"),
             ("modal app stop ap-abc123 --yes", "modal-app-stop"),
-            ("modal container stop ta-deadbeef -y", "modal-container-stop"),
+            (
+                "modal container stop ta-deadbeef -y",
+                "modal-container-stop",
+            ),
             (
                 "modal volume rm -r model-weights /old-checkpoints",
                 "modal-volume-rm-recursive",

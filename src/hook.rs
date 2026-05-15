@@ -284,6 +284,57 @@ pub struct HermesHookOutput<'a> {
     pub remediation: Option<Remediation>,
 }
 
+/// Grok (xAI) denial output for `PreToolUse` hooks.
+///
+/// Grok documents one block-decision wire shape — `{"decision": "deny",
+/// "reason": "..."}` — paired with exit code 0 or 2 (both block; other
+/// exit codes are fail-open). dcg emits exit 0 plus the JSON payload so
+/// the wire form alone is authoritative, matching the documented preferred
+/// path.
+///
+/// Grok's hook input/output is permissive: extra fields beyond
+/// `decision`/`reason` are tolerated, so we include the same `ruleId` /
+/// `packId` / `severity` / `remediation` ergonomics fields as the Claude /
+/// Gemini outputs for any tooling that wants to surface them.
+///
+/// See: `~/.grok/docs/user-guide/10-hooks.md`
+#[derive(Debug, Serialize)]
+pub struct GrokHookOutput<'a> {
+    /// Block decision keyword. Grok requires `"deny"` (not `"block"`).
+    pub decision: &'static str,
+
+    /// Why the action was denied. Surfaced to the Grok user and the model.
+    pub reason: Cow<'a, str>,
+
+    /// Short allow-once code (if a pending exception was recorded).
+    #[serde(rename = "allowOnceCode", skip_serializing_if = "Option::is_none")]
+    pub allow_once_code: Option<String>,
+
+    /// Full hash for allow-once disambiguation (if available).
+    #[serde(rename = "allowOnceFullHash", skip_serializing_if = "Option::is_none")]
+    pub allow_once_full_hash: Option<String>,
+
+    /// Stable rule identifier (e.g., "core.git:reset-hard").
+    #[serde(rename = "ruleId", skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+
+    /// Pack identifier that matched (e.g., "core.git").
+    #[serde(rename = "packId", skip_serializing_if = "Option::is_none")]
+    pub pack_id: Option<String>,
+
+    /// Severity level of the matched pattern.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub severity: Option<crate::packs::Severity>,
+
+    /// Confidence score for this match (0.0-1.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+
+    /// Remediation suggestions for the blocked command.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remediation: Option<Remediation>,
+}
+
 /// Hook protocol variant for response formatting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookProtocol {
@@ -313,6 +364,18 @@ pub enum HookProtocol {
     /// disambiguate via the lowercase event name `"pre_tool_call"` and the
     /// distinctive `"terminal"` tool name.
     Hermes,
+    /// xAI Grok CLI / Grok Build TUI protocol. Wire shape: stdin carries
+    /// camelCase `hookEventName: "pre_tool_use"`, `sessionId`, `workspaceRoot`,
+    /// `toolName: "run_terminal_cmd"`, `toolInput.command`. Block decision is
+    /// expressed via stdout JSON `{"decision": "deny", "reason": "..."}`
+    /// (note: `"deny"`, not `"block"` — distinct from Hermes). Grok also
+    /// honors exit code 2 as an explicit deny, but per docs the JSON form is
+    /// preferred and works with exit code 0. Other exit codes are fail-open
+    /// (recorded but do not block). Grok's parser does NOT use
+    /// `deny_unknown_fields`, so dcg's ergonomics fields (`ruleId`, `packId`,
+    /// `severity`, `remediation`, …) pass through unmolested for any tooling
+    /// that wants them. See `~/.grok/docs/user-guide/10-hooks.md`.
+    Grok,
 }
 
 /// Allow-once metadata for denial output.
@@ -444,6 +507,38 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
         }
     }
 
+    // --- Grok (xAI) indicators (checked alongside Hermes) ---
+    // Grok uses two distinctive markers:
+    //   - hookEventName="pre_tool_use" (snake_case "use"; Hermes uses "call",
+    //     Claude uses PascalCase "PreToolUse", Copilot uses hyphenated
+    //     "pre-tool-use" but only via the `event` field — never via
+    //     `hookEventName`).
+    //   - toolName="run_terminal_cmd" (Grok's internal shell tool name).
+    // Either signal alone is a strong Grok indicator. We also accept the
+    // env-var fallback for cases where Grok's hookEventName field is absent
+    // (e.g. SessionStart hooks proxied through Bash that re-invoke dcg).
+    let is_grok_event = hook_event_name == "pre_tool_use";
+    let is_grok_tool = tool_name == "run_terminal_cmd";
+    let has_grok_env = std::env::var_os("GROK_SESSION_ID").is_some()
+        || std::env::var_os("GROK_HOOK_EVENT").is_some()
+        || std::env::var_os("GROK_WORKSPACE_ROOT").is_some();
+    if (is_grok_event || is_grok_tool) && input.event.is_none() && input.tool_args.is_none() {
+        return HookProtocol::Grok;
+    }
+    // Env-var-only fallback: Grok set its hook env vars but the wire shape
+    // doesn't yet have a distinctive marker (e.g. dcg invoked as a wrapper).
+    // Require absence of other agents' wire-level signals to avoid clobbering
+    // a more specific match upstream.
+    if has_grok_env
+        && hook_event_name.is_empty()
+        && tool_name.is_empty()
+        && input.event.is_none()
+        && input.tool_args.is_none()
+        && input.turn_id.is_none()
+    {
+        return HookProtocol::Grok;
+    }
+
     // --- Copilot indicators (checked first) ---
     // Copilot sends a distinctive `event` field (e.g. "pre-tool-use") that
     // neither Claude Code nor Gemini use. The `tool_args` field is also
@@ -554,6 +649,10 @@ pub(crate) fn is_supported_shell_tool(tool_name: Option<&str>) -> bool {
             // wrapper script which translates upstream to "Bash" before
             // invoking dcg, so the only path here is genuine Hermes input.
             | "terminal"
+            // Grok (xAI) shell tool. Grok aliases Claude-style "Bash" to its
+            // internal name `run_terminal_cmd` before invoking hooks, so the
+            // toolName field on the wire is always this canonical form.
+            | "run_terminal_cmd"
     )
 }
 
@@ -978,7 +1077,8 @@ pub fn write_denial_to(
         HookProtocol::ClaudeCompatible
         | HookProtocol::Copilot
         | HookProtocol::Gemini
-        | HookProtocol::Hermes => WarningAudience::HumanOperator,
+        | HookProtocol::Hermes
+        | HookProtocol::Grok => WarningAudience::HumanOperator,
     };
 
     print_colorful_warning_to(
@@ -1080,6 +1180,27 @@ pub fn write_denial_to(
                 reason: Cow::Owned(message.clone()),
                 action: "block",
                 message: Cow::Owned(message),
+                allow_once_code: allow_once.map(|info| info.code.clone()),
+                allow_once_full_hash: allow_once.map(|info| info.full_hash.clone()),
+                rule_id,
+                pack_id: pack.map(String::from),
+                severity,
+                confidence,
+                remediation,
+            };
+
+            let _ = serde_json::to_writer(&mut *stdout, &output);
+            let _ = writeln!(stdout);
+        }
+        HookProtocol::Grok => {
+            // Grok requires the keyword "deny" (not "block"). Exit code 0 +
+            // JSON is the documented preferred path and Grok will block on
+            // that alone. Other exit codes are fail-open, so we deliberately
+            // avoid relying on the exit code here. The colored deny message
+            // has already been written to stderr for human/model visibility.
+            let output = GrokHookOutput {
+                decision: "deny",
+                reason: Cow::Owned(message),
                 allow_once_code: allow_once.map(|info| info.code.clone()),
                 allow_once_full_hash: allow_once.map(|info| info.full_hash.clone()),
                 rule_id,
@@ -1286,6 +1407,29 @@ pub(crate) fn write_warning_to(
             }
             let output = HermesWarningOutput {
                 context: Cow::Owned(warn_reason),
+            };
+            let _ = serde_json::to_writer(&mut *stdout, &output);
+            let _ = writeln!(stdout);
+        }
+        HookProtocol::Grok => {
+            // Grok hooks support `{"decision":"allow"}` and `{"decision":
+            // "deny"}` but no documented "ask"/"warn" decision. Preserve dcg
+            // warn semantics as non-blocking by emitting an explicit "allow"
+            // (Grok's docs note that explicit allow short-circuits later
+            // hooks; for dcg this is the safe choice because we never want
+            // a warn to escalate to a deny later). The warning text is
+            // preserved via the optional `reason` field, which Grok logs in
+            // the hooks scrollback even on allow decisions.
+            let output = GrokHookOutput {
+                decision: "allow",
+                reason: Cow::Owned(warn_reason),
+                allow_once_code: None,
+                allow_once_full_hash: None,
+                rule_id,
+                pack_id: pack.map(String::from),
+                severity: None,
+                confidence: None,
+                remediation: None,
             };
             let _ = serde_json::to_writer(&mut *stdout, &output);
             let _ = writeln!(stdout);
@@ -1970,6 +2114,220 @@ mod tests {
         assert!(json.get("decision").is_none());
         assert!(json.get("action").is_none());
         assert!(!stderr.is_empty(), "stderr must contain warn text");
+    }
+
+    // =========================================================================
+    // Grok (xAI) protocol detection + denial / warning JSON shape.
+    //
+    // Grok's wire shape and JSON contract are documented in
+    // ~/.grok/docs/user-guide/10-hooks.md. The critical invariants:
+    //   - hookEventName="pre_tool_use" (snake_case; distinct from Hermes
+    //     "pre_tool_call" and Claude's PascalCase "PreToolUse").
+    //   - toolName="run_terminal_cmd" (Grok's internal shell tool).
+    //   - Block decision: {"decision":"deny","reason":...} — note "deny",
+    //     NOT "block" (Hermes uses "block").
+    //   - Allow / passive: {"decision":"allow"} or empty {}; exit 0 expected.
+    // =========================================================================
+
+    #[test]
+    fn test_grok_detected_via_event_alone() {
+        // pre_tool_use is unique to Grok; even with a generic toolName we
+        // must still route to the Grok protocol.
+        let json = r#"{
+            "hookEventName":"pre_tool_use",
+            "toolName":"bash",
+            "toolInput":{"command":"git status"}
+        }"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Grok);
+    }
+
+    #[test]
+    fn test_grok_detected_via_run_terminal_cmd_tool_alone() {
+        // run_terminal_cmd is Grok's internal shell tool name; no other
+        // supported agent uses it. Even without hookEventName we route to
+        // Grok.
+        let json = r#"{
+            "toolName":"run_terminal_cmd",
+            "toolInput":{"command":"echo hi"}
+        }"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Grok);
+    }
+
+    #[test]
+    fn test_grok_full_envelope_camelcase() {
+        // Realistic Grok payload, every documented field present.
+        let json = r#"{
+            "hookEventName":"pre_tool_use",
+            "sessionId":"sess-abc",
+            "cwd":"/home/user/proj",
+            "workspaceRoot":"/home/user/proj",
+            "toolName":"run_terminal_cmd",
+            "toolInput":{"command":"rm -rf /"},
+            "timestamp":"2026-05-14T12:00:00Z"
+        }"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Grok);
+    }
+
+    #[test]
+    fn test_grok_loses_to_copilot_when_event_field_present() {
+        // The Copilot-specific `event` field wins over Grok's hookEventName,
+        // matching the Hermes guard. Copilot can ship its own tool names.
+        let json = r#"{
+            "event":"pre-tool-use",
+            "hookEventName":"pre_tool_use",
+            "toolName":"run_terminal_cmd",
+            "toolInput":{"command":"git status"}
+        }"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Copilot);
+    }
+
+    #[test]
+    fn test_grok_loses_to_copilot_when_tool_args_present() {
+        let json = r#"{
+            "hookEventName":"pre_tool_use",
+            "toolName":"run_terminal_cmd",
+            "toolArgs":"{\"command\":\"git status\"}"
+        }"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Copilot);
+    }
+
+    #[test]
+    fn test_grok_event_does_not_misroute_to_hermes() {
+        // Regression guard: "pre_tool_use" must NOT match Hermes's
+        // "pre_tool_call". The strings differ by one letter at the end.
+        let json = r#"{
+            "hook_event_name":"pre_tool_use",
+            "tool_name":"run_terminal_cmd",
+            "tool_input":{"command":"ls"}
+        }"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Grok);
+    }
+
+    #[test]
+    fn test_grok_hook_output_deny_decision_json_shape() {
+        // The wire shape must be EXACTLY {"decision":"deny","reason":...}
+        // — Grok's parser will silently drop the block on "block"/"deny" mismatch.
+        let output = GrokHookOutput {
+            decision: "deny",
+            reason: Cow::Borrowed("blocked for safety"),
+            allow_once_code: None,
+            allow_once_full_hash: None,
+            rule_id: Some("core.git:reset-hard".to_string()),
+            pack_id: Some("core.git".to_string()),
+            severity: None,
+            confidence: None,
+            remediation: None,
+        };
+        let json = serde_json::to_value(&output).unwrap();
+        assert_eq!(json["decision"], "deny");
+        assert_eq!(json["reason"], "blocked for safety");
+        assert_eq!(json["ruleId"], "core.git:reset-hard");
+        assert_eq!(json["packId"], "core.git");
+        // Must NOT carry other agents' decision keys.
+        assert!(json.get("action").is_none(), "no Hermes 'action'");
+        assert!(json.get("message").is_none(), "no Hermes 'message'");
+        assert!(
+            json.get("permissionDecision").is_none(),
+            "no Claude 'permissionDecision'"
+        );
+        assert!(
+            json.get("hookSpecificOutput").is_none(),
+            "no Claude 'hookSpecificOutput'"
+        );
+        assert!(json.get("continue").is_none(), "no Copilot 'continue'");
+    }
+
+    #[test]
+    fn test_write_denial_grok_produces_deny_json() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_denial_to(
+            &mut stdout,
+            &mut stderr,
+            HookProtocol::Grok,
+            "rm -rf /",
+            "catastrophic filesystem deletion",
+            Some("core.filesystem"),
+            Some("rm-rf-root"),
+            None,
+            None,
+            None,
+            Some(crate::packs::Severity::Critical),
+            None,
+            &[],
+            None,
+        );
+
+        let stdout_str = String::from_utf8_lossy(&stdout);
+        let json: serde_json::Value = serde_json::from_str(stdout_str.trim())
+            .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\nstdout: {stdout_str}"));
+
+        assert_eq!(json["decision"], "deny");
+        assert!(
+            json["reason"]
+                .as_str()
+                .unwrap()
+                .contains("catastrophic filesystem deletion"),
+            "reason must surface the human-readable explanation, got: {}",
+            json["reason"]
+        );
+        // Grok must NOT emit Hermes-style or Claude-style fields.
+        assert!(json.get("action").is_none());
+        assert!(json.get("message").is_none());
+        assert!(json.get("hookSpecificOutput").is_none());
+        // stderr must still carry the colored warning text for human/model visibility.
+        assert!(
+            !stderr.is_empty(),
+            "Grok denial must still surface stderr warning text"
+        );
+    }
+
+    #[test]
+    fn test_write_warning_grok_produces_allow_with_reason() {
+        // Grok has no "ask"/"warn" decision. We emit an explicit allow so the
+        // tool call proceeds, with the warning text preserved in `reason`.
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_warning_to(
+            &mut stdout,
+            &mut stderr,
+            HookProtocol::Grok,
+            "git stash drop",
+            "drops stashed changes",
+            Some("core.git"),
+            Some("stash-drop"),
+            None,
+        );
+
+        let stdout_str = String::from_utf8_lossy(&stdout);
+        let json: serde_json::Value = serde_json::from_str(stdout_str.trim())
+            .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\nstdout: {stdout_str}"));
+
+        assert_eq!(
+            json["decision"], "allow",
+            "warn must NOT escalate to deny on Grok"
+        );
+        assert!(
+            json["reason"].as_str().unwrap().starts_with("DCG warn:"),
+            "reason should be prefixed so the model knows this is advisory"
+        );
+        assert!(!stderr.is_empty(), "stderr must contain warn text");
+    }
+
+    #[test]
+    fn test_grok_run_terminal_cmd_recognized_as_shell_tool() {
+        // is_supported_shell_tool() must know about Grok's tool name so the
+        // command is actually evaluated rather than skipped.
+        assert!(is_supported_shell_tool(Some("run_terminal_cmd")));
+        assert!(is_supported_shell_tool(Some("RUN_TERMINAL_CMD")));
     }
 
     #[test]

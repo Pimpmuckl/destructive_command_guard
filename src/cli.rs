@@ -287,7 +287,7 @@ pub enum Command {
         ttl: Option<u64>,
     },
 
-    /// Install the hook into Claude Code settings
+    /// Install the hook into Claude Code settings (or Grok with `--grok`)
     #[command(name = "install")]
     Install {
         /// Force overwrite existing hook configuration
@@ -298,6 +298,14 @@ pub enum Command {
         /// instead of user-level `~/.claude/settings.json`
         #[arg(long)]
         project: bool,
+
+        /// Install the dcg PreToolUse hook for Grok (xAI) at
+        /// `~/.grok/hooks/dcg.json` (user-level) or `./.grok/hooks/dcg.json`
+        /// (when combined with `--project`). Grok also picks up dcg from
+        /// `~/.claude/settings.json` via its Claude-Code compatibility layer,
+        /// but the native path gives the cleanest doctor output.
+        #[arg(long)]
+        grok: bool,
     },
 
     /// Full setup: install hook + add shell startup check
@@ -1955,8 +1963,16 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Hook(cmd)) => {
             run_hook_command(&config, &cmd)?;
         }
-        Some(Command::Install { force, project }) => {
-            install_hook(force, project)?;
+        Some(Command::Install {
+            force,
+            project,
+            grok,
+        }) => {
+            if grok {
+                install_grok_hook(force, project)?;
+            } else {
+                install_hook(force, project)?;
+            }
         }
         Some(Command::Setup {
             force,
@@ -9122,6 +9138,72 @@ fn doctor_pretty(fix: bool) {
         println!("{}", "OK".green());
     }
 
+    // Check 3b: Grok (xAI) native hook registration.
+    //
+    // We only surface this check when Grok is plausibly in use, to avoid
+    // adding noise for users who don't have Grok installed. Plausible signals:
+    //   - GROK_* env vars present in the current process (Grok is the parent)
+    //   - ~/.grok directory exists (Grok was installed at some point)
+    //
+    // Grok also works via the Claude compatibility layer (~/.claude/settings.json
+    // — covered by Check 3 above). The native dcg.json gives a cleaner doctor
+    // output and avoids coupling Grok's behavior to Claude's settings file.
+    let grok_session_present = std::env::var_os("GROK_SESSION_ID").is_some()
+        || std::env::var_os("GROK_HOOK_EVENT").is_some()
+        || std::env::var_os("GROK_WORKSPACE_ROOT").is_some();
+    let grok_home = dirs::home_dir().map(|h| h.join(".grok"));
+    let grok_home_exists = grok_home.as_ref().is_some_and(|p| p.exists() && p.is_dir());
+    if grok_session_present || grok_home_exists {
+        print!("Checking Grok hook registration... ");
+
+        let user_hook = grok_user_hook_path();
+        let user_hook_exists = user_hook.exists();
+        let claude_compat_path = claude_settings_path();
+        let claude_compat_exists = claude_compat_path.exists();
+
+        if user_hook_exists {
+            println!("{}", "OK".green());
+            println!("  Found: {}", user_hook.display());
+            if claude_compat_exists {
+                println!(
+                    "  Grok also picks up dcg from {} (Claude compatibility layer).",
+                    claude_compat_path.display()
+                );
+            }
+        } else if claude_compat_exists && hook_diag.dcg_hook_count == 1 {
+            // Grok will use the Claude-compat path; this still works but the
+            // native path is preferred. Surface as a friendly WARN, not an
+            // error, so users who deliberately rely on Claude-compat aren't
+            // pestered.
+            println!("{}", "OK (via Claude compat)".green());
+            println!(
+                "  No native ~/.grok/hooks/dcg.json — Grok will pick up dcg from {}.",
+                claude_compat_path.display()
+            );
+            println!(
+                "  For a native install, run 'dcg install --grok' (creates {}).",
+                user_hook.display()
+            );
+        } else {
+            println!("{}", "NOT REGISTERED".yellow());
+            if fix {
+                println!("  Attempting native install...");
+                if install_grok_hook(false, false).is_ok() {
+                    println!("  {}", "Fixed!".green());
+                    fixed += 1;
+                } else {
+                    println!("  {}", "Failed to fix".red());
+                }
+            } else {
+                println!("  → Run 'dcg install --grok' to register the native hook");
+                println!(
+                    "    (or 'dcg install' for the Claude-compat path at {})",
+                    claude_compat_path.display()
+                );
+            }
+        }
+    }
+
     // Check 4: Config validation (expanded diagnostics)
     print!("Checking configuration... ");
     let config_diag = validate_config_diagnostics();
@@ -10049,6 +10131,101 @@ fn install_hook(force: bool, project: bool) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+/// Build the JSON body for a Grok `~/.grok/hooks/dcg.json` hook file.
+///
+/// Resolves the dcg binary path via `current_exe()` so the installed hook
+/// always points at the same executable that was used to install it
+/// (matching Claude's installer behavior). Falls back to bare `"dcg"` when
+/// the exe path is unavailable — Grok will then resolve it via PATH.
+///
+/// The `matcher: "Bash"` field uses Grok's documented Claude-compat alias
+/// which Grok internally rewrites to `run_terminal_cmd` before dispatching.
+/// Timeout matches dcg's hook fast-path budget (well under 5s in practice).
+fn build_grok_hook_config() -> serde_json::Value {
+    let dcg_cmd = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string))
+        .unwrap_or_else(|| "dcg".to_string());
+
+    serde_json::json!({
+        "description": "dcg (Destructive Command Guard) — blocks rm -rf, git reset --hard, force pushes, DROP DATABASE, kubectl delete, and similar destructive commands before Grok's run_terminal_cmd tool can execute them.",
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "matcher": "Bash",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": dcg_cmd,
+                            "timeout": 5
+                        }
+                    ]
+                }
+            ]
+        }
+    })
+}
+
+/// Install the dcg hook into Grok's hook directory.
+///
+/// Writes a self-contained `dcg.json` to `~/.grok/hooks/` (user-level) or
+/// `<repo>/.grok/hooks/` (with `--project`). Grok auto-discovers every
+/// `*.json` in those directories and merges them at session start, so we
+/// don't touch `user-settings.json` or `settings.json`.
+///
+/// Returns `Err` if the file cannot be written or, for project installs, if
+/// the current directory is not inside a git repository.
+fn install_grok_hook(force: bool, project: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    let hook_path = if project {
+        project_grok_hook_path()?
+    } else {
+        grok_user_hook_path()
+    };
+
+    if hook_path.exists() && !force {
+        println!(
+            "{} Grok hook already exists at {}",
+            "Hook already installed!".yellow(),
+            hook_path.display()
+        );
+        println!("Use --force to reinstall");
+        return Ok(());
+    }
+
+    if let Some(parent) = hook_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let body = build_grok_hook_config();
+    let content = serde_json::to_string_pretty(&body)?;
+    std::fs::write(&hook_path, content)?;
+
+    let level = if project { "project" } else { "user" };
+    println!("{}", "Grok hook installed successfully!".green().bold());
+    println!("Hook file written ({level}): {}", hook_path.display());
+    println!();
+    if project {
+        println!(
+            "{}",
+            "Project hooks require explicit trust the first time Grok opens this repo —".yellow()
+        );
+        println!(
+            "{}",
+            "open the hooks modal in Grok (Ctrl+L) and accept, or run /hooks-trust.".yellow()
+        );
+    } else {
+        println!(
+            "{}",
+            "Restart Grok (or press 'l' in the hooks modal) for the change to take effect."
+                .yellow()
+        );
+    }
+
+    Ok(())
+}
+
 /// The shell snippet that checks whether the DCG hook is still present in
 /// Claude Code settings on every new shell session. Runs in milliseconds,
 /// silent when the hook is present, yellow warning when missing.
@@ -10684,6 +10861,29 @@ fn project_claude_settings_path() -> Result<std::path::PathBuf, Box<dyn std::err
     let repo_root = find_repo_root_from_cwd()
         .ok_or("Not inside a git repository — cannot determine project root")?;
     Ok(repo_root.join(".claude").join("settings.json"))
+}
+
+/// Path to the user-level Grok dcg hook file (`~/.grok/hooks/dcg.json`).
+///
+/// Per `~/.grok/docs/user-guide/10-hooks.md`, Grok auto-discovers every
+/// `*.json` under `~/.grok/hooks/`. A separate file per integration (rather
+/// than editing `~/.grok/user-settings.json`) keeps installs/uninstalls
+/// independent of unrelated user settings.
+fn grok_user_hook_path() -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join(".grok")
+        .join("hooks")
+        .join("dcg.json")
+}
+
+/// Path to a project-level Grok dcg hook file (`<repo>/.grok/hooks/dcg.json`).
+///
+/// Returns `Err` if the current directory is not inside a git repository.
+fn project_grok_hook_path() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let repo_root = find_repo_root_from_cwd()
+        .ok_or("Not inside a git repository — cannot determine project root")?;
+    Ok(repo_root.join(".grok").join("hooks").join("dcg.json"))
 }
 
 /// Get the path to dcg config directory.
@@ -14387,9 +14587,15 @@ mod tests {
     #[test]
     fn test_cli_parse_install_project() {
         let cli = Cli::parse_from(["dcg", "install", "--project"]);
-        if let Some(Command::Install { force, project }) = cli.command {
+        if let Some(Command::Install {
+            force,
+            project,
+            grok,
+        }) = cli.command
+        {
             assert!(!force);
             assert!(project);
+            assert!(!grok);
         } else {
             unreachable!("Expected Install command");
         }
@@ -14398,9 +14604,49 @@ mod tests {
     #[test]
     fn test_cli_parse_install_force_and_project() {
         let cli = Cli::parse_from(["dcg", "install", "--force", "--project"]);
-        if let Some(Command::Install { force, project }) = cli.command {
+        if let Some(Command::Install {
+            force,
+            project,
+            grok,
+        }) = cli.command
+        {
             assert!(force);
             assert!(project);
+            assert!(!grok);
+        } else {
+            unreachable!("Expected Install command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_install_grok() {
+        let cli = Cli::parse_from(["dcg", "install", "--grok"]);
+        if let Some(Command::Install {
+            force,
+            project,
+            grok,
+        }) = cli.command
+        {
+            assert!(!force);
+            assert!(!project);
+            assert!(grok);
+        } else {
+            unreachable!("Expected Install command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_install_grok_with_project() {
+        let cli = Cli::parse_from(["dcg", "install", "--grok", "--project"]);
+        if let Some(Command::Install {
+            force,
+            project,
+            grok,
+        }) = cli.command
+        {
+            assert!(!force);
+            assert!(project);
+            assert!(grok);
         } else {
             unreachable!("Expected Install command");
         }
