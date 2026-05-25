@@ -55,8 +55,13 @@ fn test_multiline_commit_message_mentioning_force_push_is_allowed() {
 
     // The single-line equivalent (already allowed pre-fix) must stay allowed.
     let cmd_single = format!("git add x && git commit -m \"ref to {inner}\"");
-    let result_single =
-        evaluate_command(&cmd_single, &config, keywords, &compiled_overrides, &allowlists);
+    let result_single = evaluate_command(
+        &cmd_single,
+        &config,
+        keywords,
+        &compiled_overrides,
+        &allowlists,
+    );
     assert!(
         result_single.is_allowed(),
         "single-line commit message mentioning a force push must be allowed; cmd={cmd_single}"
@@ -67,8 +72,13 @@ fn test_multiline_commit_message_mentioning_force_push_is_allowed() {
     let inner_short = ["git", "push", "-f"].join(" ");
     let cmd_short =
         format!("git commit -m \"title\n\nbody line referencing {inner_short} for context\"");
-    let result_short =
-        evaluate_command(&cmd_short, &config, keywords, &compiled_overrides, &allowlists);
+    let result_short = evaluate_command(
+        &cmd_short,
+        &config,
+        keywords,
+        &compiled_overrides,
+        &allowlists,
+    );
     assert!(
         result_short.is_allowed(),
         "multi-line commit body mentioning a short-flag force push must be allowed; cmd={cmd_short}"
@@ -78,8 +88,13 @@ fn test_multiline_commit_message_mentioning_force_push_is_allowed() {
     // be denied — masking the commit body must not mask a real subsequent push.
     let cmd_real =
         format!("git commit -m \"safe message\n\nmentions {inner}\" && {inner} origin main");
-    let result_real =
-        evaluate_command(&cmd_real, &config, keywords, &compiled_overrides, &allowlists);
+    let result_real = evaluate_command(
+        &cmd_real,
+        &config,
+        keywords,
+        &compiled_overrides,
+        &allowlists,
+    );
     assert!(
         result_real.is_denied(),
         "a real force-push after a safe multi-line commit must still be denied; cmd={cmd_real}"

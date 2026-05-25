@@ -2713,8 +2713,10 @@ mod tests {
         #[test]
         fn extracts_powershell_command_body() {
             // Bare host name, single-quoted body.
-            let result =
-                extract_content("powershell -Command 'echo hi'", &ExtractionLimits::default());
+            let result = extract_content(
+                "powershell -Command 'echo hi'",
+                &ExtractionLimits::default(),
+            );
             if let ExtractionResult::Extracted(contents) = result {
                 assert_eq!(contents.len(), 1);
                 assert_eq!(contents[0].content, "echo hi");
@@ -2742,8 +2744,7 @@ mod tests {
         #[test]
         fn extracts_pwsh_short_flag_body() {
             // PowerShell accepts `-c` as an abbreviation of `-Command`.
-            let result =
-                extract_content("pwsh -c 'echo hi'", &ExtractionLimits::default());
+            let result = extract_content("pwsh -c 'echo hi'", &ExtractionLimits::default());
             if let ExtractionResult::Extracted(contents) = result {
                 assert_eq!(contents.len(), 1);
                 assert_eq!(contents[0].content, "echo hi");
@@ -2761,8 +2762,9 @@ mod tests {
             let result = extract_content(cmd, &ExtractionLimits::default());
             if let ExtractionResult::Extracted(contents) = result {
                 assert!(
-                    contents.iter().any(|c| c.content == "echo hi"
-                        && c.language == ScriptLanguage::Bash),
+                    contents
+                        .iter()
+                        .any(|c| c.content == "echo hi" && c.language == ScriptLanguage::Bash),
                     "expected to extract the -Command body from a quoted powershell.exe path; got {contents:?}"
                 );
             } else {
