@@ -1,5 +1,10 @@
 name: ci
 
+# NOTE: rust-toolchain is pinned to nightly-2026-05-22 (not @nightly) as a
+# stopgap. Newer nightlies surface a codegen-sensitive PrimaryKeyViolation in
+# fsqlite 0.1.3's FTS5/rowid handling that fails the history tests — tracked
+# upstream in Dicklesworthstone/frankensqlite#94. Revert to @nightly once fixed.
+
 on:
   pull_request:
   push:
@@ -24,7 +29,7 @@ jobs:
         run: |
           ruby -e 'require "yaml"; config = YAML.load_file(".github/dependabot.yml"); puts "Dependabot config:"; puts config.inspect'
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@nightly-2026-05-22
         with:
           components: rustfmt, clippy
 
@@ -174,7 +179,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@nightly-2026-05-22
         with:
           # cargo-fuzz defaults to building under x86_64-unknown-linux-musl
           # because libFuzzer + AddressSanitizer require statically-linked
@@ -210,7 +215,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@nightly-2026-05-22
         with:
           components: llvm-tools-preview
 
@@ -364,7 +369,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@nightly-2026-05-22
 
       - name: Cache cargo registry and target
         uses: actions/cache@v5
@@ -482,7 +487,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@nightly-2026-05-22
 
       - name: Cache cargo registry and target
         uses: actions/cache@v5
@@ -555,7 +560,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@nightly-2026-05-22
 
       - name: Cache cargo registry and target
         uses: actions/cache@v5
@@ -629,7 +634,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@nightly-2026-05-22
 
       - name: Cache cargo registry and target
         uses: actions/cache@v5
@@ -689,7 +694,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@nightly-2026-05-22
 
       - name: Cache cargo registry and target
         uses: actions/cache@v5
@@ -826,7 +831,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@nightly-2026-05-22
 
       - name: Cache cargo registry and target
         uses: actions/cache@v5
@@ -902,7 +907,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@nightly-2026-05-22
 
       - name: Cache cargo registry and target
         uses: actions/cache@v5
@@ -1064,7 +1069,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@nightly-2026-05-22
         with:
           components: llvm-tools-preview
           # See fuzz-smoke job above — cargo-fuzz needs the musl target to
