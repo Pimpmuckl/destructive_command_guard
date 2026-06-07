@@ -335,10 +335,15 @@ pub fn scan_executing_sink_fallback(code: &str, language: ScriptLanguage) -> Opt
 
     for caps in sink_regex.captures_iter(code) {
         let Some(m) = caps.get(0) else { continue };
-        let Some(payload) = string_literal_from_caps(&caps) else {
-            continue;
-        };
-        let Some(hit) = detect_shell_payload(payload) else {
+
+        // Scan the sink call's full argument region — not just its first string
+        // literal — so a destructive payload nested inside a list/tuple literal
+        // (`subprocess.run(["sh", "-c", "rm -rf /etc"])`) is caught even when the
+        // first literal (`"sh"`) is inert (#136). The region spans from the
+        // opening paren of this match to the balanced close paren (bounded to the
+        // remainder of the source), descending into bracketed list elements.
+        let arg_region = exec_sink_arg_region(code, m.start());
+        let Some(hit) = detect_destructive_in_args(arg_region) else {
             continue;
         };
 
@@ -387,9 +392,14 @@ static JS_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static PY_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
-    // Aliased/qualified Python shell sinks with a string-literal first arg.
+    // Aliased/qualified Python shell sinks invoked as a call. Only the sink NAME
+    // + opening paren is anchored here; the destructive-payload search runs over
+    // the call's full balanced argument region (see `exec_sink_arg_region` +
+    // `detect_destructive_in_args`), so it descends into list/tuple elements and
+    // is not fooled by an inert first literal (#136). Longer names precede their
+    // prefixes (`check_call` before `call`) so alternation picks the full sink.
     Regex::new(
-        r#"(?m)\b(?P<sink>system|popen|run|call|Popen|check_output|getoutput|getstatusoutput)\s*\(\s*\[?\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
+        r"(?m)\b(?P<sink>system|popen|check_call|check_output|call|run|Popen|getoutput|getstatusoutput)\s*\(",
     )
     .expect("python exec sink literal regex compiles")
 });
@@ -637,16 +647,6 @@ static RUBY_FIRST_STRING_ARG: LazyLock<Regex> = LazyLock::new(|| {
         .expect("ruby first string arg regex compiles")
 });
 
-static PY_FIRST_STRING_ARG: LazyLock<Regex> = LazyLock::new(|| {
-    // Captures the first string-literal argument in a Python call expression,
-    // e.g. os.system("rm -rf x") or subprocess.run('rm -rf x', shell=True).
-    // Tolerates a leading list bracket so subprocess.run(["rm", ...]) still
-    // surfaces the first element (conservative; falls through to warn-only when
-    // no shell payload is detected).
-    Regex::new(r#"(?m)\(\s*\[?\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#)
-        .expect("python first string arg regex compiles")
-});
-
 fn refine_match_meta(
     language: ScriptLanguage,
     meta: &CompiledPattern,
@@ -701,26 +701,24 @@ fn refine_python_match(meta: &CompiledPattern, matched_text: &str) -> RefinedMat
     };
 
     if is_exec_sink {
-        let payload = PY_FIRST_STRING_ARG
-            .captures(matched_text)
-            .and_then(|caps| string_literal_from_caps(&caps));
-
-        if let Some(payload) = payload {
-            if let Some(hit) = detect_shell_payload(payload) {
-                // A destructive shell command is being executed. Escalate to at
-                // least High so the AST path blocks even for non-catastrophic
-                // targets (the sink unambiguously runs `rm -rf`/`git reset`).
-                let severity = match hit.severity {
-                    Severity::Critical => Severity::Critical,
-                    _ => Severity::High,
-                };
-                return RefinedMatchMeta {
-                    rule_id: format!("{rule_id}.{}", hit.rule_suffix),
-                    reason: hit.reason.to_string(),
-                    severity,
-                    suggestion: hit.suggestion.map(str::to_string),
-                };
-            }
+        // Scan *every* string literal in the call's argument list, descending
+        // into list/tuple literal elements. This catches the list-arg form
+        // `subprocess.run(["sh", "-c", "rm -rf /etc"])` whose first literal
+        // (`"sh"`) is inert but which genuinely executes `rm -rf` (#136).
+        if let Some(hit) = detect_destructive_in_args(matched_text) {
+            // A destructive shell command is being executed. Escalate to at
+            // least High so the AST path blocks even for non-catastrophic
+            // targets (the sink unambiguously runs `rm -rf`/`git reset`).
+            let severity = match hit.severity {
+                Severity::Critical => Severity::Critical,
+                _ => Severity::High,
+            };
+            return RefinedMatchMeta {
+                rule_id: format!("{rule_id}.{}", hit.rule_suffix),
+                reason: hit.reason.to_string(),
+                severity,
+                suggestion: hit.suggestion.map(str::to_string),
+            };
         }
 
         // Dynamic / non-destructive payload: keep warn-only meta (fail-open).
@@ -1469,6 +1467,92 @@ fn string_literal_from_caps<'t>(caps: &regex::Captures<'t>) -> Option<&'t str> {
     caps.name("dq")
         .or_else(|| caps.name("sq"))
         .map(|m| m.as_str())
+}
+
+/// Matches every single- or double-quoted string literal in a fragment of
+/// source text, exposing the inner content via the `dq`/`sq` capture groups.
+///
+/// Used to scan an exec-sink call's *entire* argument list — including string
+/// elements nested inside a list/tuple literal — for a destructive payload, so
+/// `subprocess.run(["sh", "-c", "rm -rf /etc"])` is caught even though its first
+/// literal (`"sh"`) is inert. Literals are matched independently of position, so
+/// this is intentionally permissive: it is only ever invoked once a known
+/// exec-sink call has already been identified.
+static ANY_STRING_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#""(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)'"#).expect("any string literal regex compiles")
+});
+
+/// Return the slice of `code` covering an exec-sink call's argument region,
+/// starting at `match_start` (the sink name) and ending at the balanced closing
+/// `)` of the call's argument list.
+///
+/// String literals are skipped so parens/brackets inside them don't perturb the
+/// depth count. If the closing paren can't be found (malformed/truncated source),
+/// the region is bounded to the end of the current line so we still scan the
+/// visible arguments. This lets [`detect_destructive_in_args`] see every literal
+/// in `subprocess.run(["sh", "-c", "rm -rf /etc"])`, not just the first.
+fn exec_sink_arg_region(code: &str, match_start: usize) -> &str {
+    let bytes = code.as_bytes();
+    let mut depth: i32 = 0;
+    let mut seen_open = false;
+    let mut quote: Option<u8> = None;
+    let mut i = match_start;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            // Inside a string literal: only its terminator (un-escaped) matters.
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' | b'\'' => quote = Some(b),
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                seen_open = true;
+            }
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                if seen_open && depth <= 0 {
+                    return code
+                        .get(match_start..=i)
+                        .unwrap_or_else(|| &code[match_start..]);
+                }
+            }
+            b'\n' if !seen_open => {
+                // Sink name with no opening paren on this line: bail to line end.
+                return code
+                    .get(match_start..i)
+                    .unwrap_or_else(|| &code[match_start..]);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    &code[match_start..]
+}
+
+/// Scan **every** string literal in an exec-sink call's text for a destructive
+/// shell payload and return the first hit.
+///
+/// This descends into list/tuple literal elements (e.g. the `"rm -rf /etc"`
+/// inside `subprocess.run(["sh", "-c", "rm -rf /etc"])`), closing the list-arg
+/// exec-sink false negative where only the first literal was inspected (#136).
+/// Callers MUST only invoke this once the surrounding call is confirmed to be a
+/// real exec sink, so inert literals (`print("rm -rf x")`) never reach here.
+fn detect_destructive_in_args(call_text: &str) -> Option<ShellPayloadHit> {
+    ANY_STRING_LITERAL
+        .captures_iter(call_text)
+        .filter_map(|caps| string_literal_from_caps(&caps).map(str::to_string))
+        .find_map(|lit| detect_shell_payload(&lit))
 }
 
 fn push_perl_shell_payload_match(
@@ -3417,6 +3501,79 @@ mod tests {
         }
 
         #[test]
+        fn subprocess_run_list_arg_destructive_blocks() {
+            // Regression (#136): a destructive payload nested inside a LIST arg
+            // must escalate to blocking even though the first element ("sh") is
+            // inert. `subprocess.run(["sh","-c","rm -rf /etc"])` really executes
+            // `sh -c "rm -rf /etc"`, so it must BLOCK, not warn.
+            let ast_matcher = AstMatcher::new();
+            let code = "import subprocess\nsubprocess.run([\"sh\",\"-c\",\"rm -rf /etc\"])";
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Python)
+                .unwrap();
+            assert!(!matches.is_empty(), "subprocess.run(list) must match");
+            assert!(
+                matches[0].severity.blocks_by_default(),
+                "destructive list-arg payload must escalate to blocking, got {:?} ({})",
+                matches[0].severity,
+                matches[0].rule_id
+            );
+            assert!(
+                matches[0]
+                    .rule_id
+                    .starts_with("heredoc.python.subprocess_run"),
+                "unexpected rule id: {}",
+                matches[0].rule_id
+            );
+        }
+
+        #[test]
+        fn subprocess_popen_list_arg_destructive_blocks() {
+            // Regression (#136): same hole via subprocess.Popen([...]).
+            let ast_matcher = AstMatcher::new();
+            let code = "import subprocess\nsubprocess.Popen([\"sh\",\"-c\",\"rm -rf /etc\"])";
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Python)
+                .unwrap();
+            assert!(!matches.is_empty(), "subprocess.Popen(list) must match");
+            assert!(
+                matches[0].severity.blocks_by_default(),
+                "destructive list-arg payload via Popen must block, got {:?} ({})",
+                matches[0].severity,
+                matches[0].rule_id
+            );
+        }
+
+        #[test]
+        fn subprocess_run_list_arg_inert_warns() {
+            // Guard against over-block: a benign list arg must stay warn-only.
+            let ast_matcher = AstMatcher::new();
+            let code = "import subprocess\nsubprocess.run([\"sh\",\"-c\",\"rm -rf ./build\"])";
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Python)
+                .unwrap();
+            // rm -rf in an exec sink still escalates (the sink unambiguously runs
+            // it), but a non-rm benign command must remain warn-only.
+            let benign = "import subprocess\nsubprocess.run([\"ls\",\"-la\"])";
+            let benign_matches = ast_matcher
+                .find_matches(benign, ScriptLanguage::Python)
+                .unwrap();
+            assert!(
+                !benign_matches.is_empty(),
+                "benign subprocess.run(list) still matches at warn level"
+            );
+            assert!(
+                !benign_matches[0].severity.blocks_by_default(),
+                "benign list arg must not block"
+            );
+            // The destructive build-dir case still blocks (rm -rf via exec sink).
+            assert!(
+                matches[0].severity.blocks_by_default(),
+                "rm -rf via exec sink blocks regardless of target"
+            );
+        }
+
+        #[test]
         fn os_system_warns() {
             // os.system is Medium severity - warns but doesn't block by default
             let ast_matcher = AstMatcher::new();
@@ -3457,6 +3614,27 @@ mod tests {
                 .find_matches(code, ScriptLanguage::Python)
                 .unwrap();
             assert!(matches.is_empty(), "imports alone must not match");
+        }
+
+        #[test]
+        fn inert_list_literal_assigned_then_printed_does_not_match() {
+            // Regression guard (#136): a destructive token inside a list that is
+            // merely assigned and printed (no exec sink) must stay ALLOWED. Only
+            // actual exec-sink CALLS escalate, never inert list literals.
+            let ast_matcher = AstMatcher::new();
+            let code = "x = [\"sh\",\"-c\",\"rm -rf /etc\"]\nprint(x)";
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Python)
+                .unwrap();
+            assert!(
+                matches.is_empty(),
+                "inert list literal must not match, got {matches:?}"
+            );
+            // The conservative exec-sink backstop must also stay silent here.
+            assert!(
+                scan_executing_sink_fallback(code, ScriptLanguage::Python).is_none(),
+                "exec-sink fallback must not fire on an inert list literal"
+            );
         }
 
         #[test]
@@ -3658,6 +3836,47 @@ def cleanup():
             assert!(
                 scan_executing_sink_fallback(&code, ScriptLanguage::Bash).is_none(),
                 "bash bodies are never masked, so the backstop is a no-op for them"
+            );
+        }
+
+        #[test]
+        fn fallback_catches_python_list_arg_destructive() {
+            // Regression (#136): the backstop must descend into list elements, so
+            // a destructive payload after an inert "sh" first element is caught.
+            let code = format!(
+                "import subprocess\nsubprocess.run([\"sh\",\"-c\",\"{} /etc\"])",
+                rmrf()
+            );
+            let hit = scan_executing_sink_fallback(&code, ScriptLanguage::Python);
+            assert!(
+                hit.is_some_and(|m| m.severity.blocks_by_default()),
+                "destructive list-arg payload must be caught by the backstop"
+            );
+        }
+
+        #[test]
+        fn fallback_catches_python_aliased_check_call_list_arg() {
+            // check_call has no dedicated AST rule; the backstop must still catch
+            // its destructive list-arg form (#136).
+            let code = format!(
+                "import subprocess as s\ns.check_call([\"sh\",\"-c\",\"{} /etc\"])",
+                rmrf()
+            );
+            let hit = scan_executing_sink_fallback(&code, ScriptLanguage::Python);
+            assert!(
+                hit.is_some_and(|m| m.severity.blocks_by_default()),
+                "check_call(list) destructive payload must be caught by the backstop"
+            );
+        }
+
+        #[test]
+        fn fallback_ignores_python_inert_list_literal() {
+            // An inert list literal that is never passed to an exec sink must not
+            // trip the backstop, even though it contains a destructive token.
+            let code = format!("x = [\"sh\",\"-c\",\"{} build\"]\nprint(x)", rmrf());
+            assert!(
+                scan_executing_sink_fallback(&code, ScriptLanguage::Python).is_none(),
+                "inert list literal must not fire the python backstop"
             );
         }
     }
