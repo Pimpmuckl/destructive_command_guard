@@ -1748,6 +1748,44 @@ pub fn is_non_executing_heredoc_command(cmd: &str) -> bool {
     NON_EXECUTING_HEREDOC_COMMANDS.contains(&cmd_name)
 }
 
+/// Check if a heredoc target is a non-shell interpreter that reads its *program*
+/// from the heredoc body (e.g. `python3 - <<PY`, `node - <<JS`, `ruby <<RB`).
+///
+/// For these targets the body is source code in a concrete, AST-supported
+/// language (Python/JS/TS/Ruby/Perl/PHP/Go) — NOT shell. The language-aware
+/// heredoc pipeline (`evaluate_heredoc` + `AstMatcher`) is the *authoritative*
+/// check for that body: it blocks executing sinks (`os.system`,
+/// `subprocess.*`, `child_process.exec*`, Ruby/Perl `system`/backticks, …) while
+/// treating destructive tokens inside inert string/comment literals as harmless.
+///
+/// Re-scanning that same source as *raw shell* (Step 7 of the evaluator) is
+/// meaningless and only produces false positives such as
+/// `print("rm -rf build")` tripping `core.filesystem` (#136). So callers mask
+/// these bodies out of the raw-shell rescan, exactly like `cat`/`tee` data.
+///
+/// **Shell interpreters are deliberately excluded.** `bash`/`sh`/`zsh`/`fish`
+/// (and PowerShell, which maps to [`ScriptLanguage::Bash`]) read *shell* from
+/// stdin; their bodies must keep flowing through the raw-shell pack scan and the
+/// recursive shell analysis, so a real `bash <<SH … rm -rf /etc … SH` still
+/// blocks. Returning `false` here is the fail-safe (never mask shell).
+#[must_use]
+pub fn is_interpreter_source_heredoc_command(cmd: &str) -> bool {
+    let cmd_name = cmd.rsplit('/').next().unwrap_or(cmd);
+    match ScriptLanguage::from_command(cmd_name) {
+        // Concrete non-shell languages whose source is authoritatively analyzed
+        // by the AST matcher / Perl regex fallback.
+        ScriptLanguage::Python
+        | ScriptLanguage::JavaScript
+        | ScriptLanguage::TypeScript
+        | ScriptLanguage::Ruby
+        | ScriptLanguage::Perl
+        | ScriptLanguage::Php
+        | ScriptLanguage::Go => true,
+        // Bash/shell bodies stay raw-shell-scanned; Unknown is never masked.
+        ScriptLanguage::Bash | ScriptLanguage::Unknown => false,
+    }
+}
+
 /// Mask heredoc content when the target command doesn't execute it.
 ///
 /// This prevents false positives where dangerous patterns in DATA (not CODE)
@@ -1778,9 +1816,10 @@ pub fn mask_non_executing_heredocs(command: &str) -> std::borrow::Cow<'_, str> {
             if heredoc_start + 3 <= command.len() && bytes.get(heredoc_start + 2) == Some(&b'<') {
                 // Extract target command for here-string
                 let target_cmd = extract_heredoc_target_command(command, heredoc_start);
-                let should_mask_herestring = target_cmd
-                    .as_ref()
-                    .is_some_and(|cmd| is_non_executing_heredoc_command(cmd));
+                let should_mask_herestring = target_cmd.as_ref().is_some_and(|cmd| {
+                    is_non_executing_heredoc_command(cmd)
+                        || is_interpreter_source_heredoc_command(cmd)
+                });
 
                 if should_mask_herestring {
                     // Mask here-string content for non-executing targets
@@ -1811,10 +1850,15 @@ pub fn mask_non_executing_heredocs(command: &str) -> std::borrow::Cow<'_, str> {
             // Extract target command (what receives the heredoc)
             let target_cmd = extract_heredoc_target_command(command, heredoc_start);
 
-            // Check if target is non-executing
-            let should_mask = target_cmd
-                .as_ref()
-                .is_some_and(|cmd| is_non_executing_heredoc_command(cmd));
+            // Mask the body out of the raw-shell rescan when the target either
+            // (a) does not execute its stdin at all (cat/tee/…), or
+            // (b) is a non-shell interpreter reading its program from the body
+            //     (python -/node -/ruby/…), which the language-aware AST path has
+            //     already analyzed authoritatively (#136). Shell interpreters are
+            //     excluded so real `bash <<SH … rm -rf … SH` still blocks.
+            let should_mask = target_cmd.as_ref().is_some_and(|cmd| {
+                is_non_executing_heredoc_command(cmd) || is_interpreter_source_heredoc_command(cmd)
+            });
 
             if should_mask {
                 // Parse the heredoc delimiter
@@ -4072,6 +4116,74 @@ fi"#;
         assert_eq!(
             extract_heredoc_target_command(sudo_cmd, sudo_start).as_deref(),
             Some("bash")
+        );
+    }
+
+    /// #136: non-shell interpreters whose body is masked out of the raw-shell
+    /// rescan vs. shell/data targets that must NOT be classified as such.
+    #[test]
+    fn interpreter_source_heredoc_command_classification_136() {
+        // Non-shell interpreters reading a program from stdin → masked.
+        for cmd in [
+            "python",
+            "python3",
+            "python3.11",
+            "node",
+            "nodejs",
+            "ruby",
+            "perl",
+            "php",
+            "deno",
+            "bun",
+            "go",
+            "/usr/bin/python3",
+        ] {
+            assert!(
+                is_interpreter_source_heredoc_command(cmd),
+                "{cmd} should be treated as interpreter source"
+            );
+        }
+
+        // Shells read SHELL from stdin → must stay raw-shell scanned (NOT masked).
+        for cmd in ["bash", "sh", "zsh", "fish", "powershell", "pwsh"] {
+            assert!(
+                !is_interpreter_source_heredoc_command(cmd),
+                "{cmd} is a shell and must not be masked as interpreter source"
+            );
+        }
+
+        // Data sinks / unknown commands are handled by the non-executing path,
+        // not this predicate.
+        for cmd in ["cat", "tee", "grep", "totally-unknown-cmd"] {
+            assert!(
+                !is_interpreter_source_heredoc_command(cmd),
+                "{cmd} must not be classified as interpreter source"
+            );
+        }
+    }
+
+    /// #136: a python interpreter heredoc body is masked out of the raw-shell
+    /// rescan, while a bash heredoc body is left intact.
+    #[test]
+    fn mask_interpreter_source_body_136() {
+        let rmrf = format!("{}{}{}", "rm", " -", "rf");
+
+        let py = format!("python3 - <<PY\nprint(\"{rmrf} /etc/important\")\nPY");
+        let masked = mask_non_executing_heredocs(&py);
+        assert!(
+            matches!(masked, std::borrow::Cow::Owned(_)),
+            "python interpreter body should be masked: {masked:?}"
+        );
+        assert!(
+            !masked.contains(&rmrf),
+            "masked python body must not retain the destructive token: {masked:?}"
+        );
+
+        let sh = format!("bash <<SH\n{rmrf} /etc/important\nSH");
+        let masked_sh = mask_non_executing_heredocs(&sh);
+        assert!(
+            masked_sh.contains(&rmrf),
+            "bash interpreter body must be left intact for raw-shell scanning: {masked_sh:?}"
         );
     }
 }

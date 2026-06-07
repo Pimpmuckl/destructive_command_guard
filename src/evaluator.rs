@@ -2980,6 +2980,78 @@ fn evaluate_heredoc(
                 bypass_method: None,
             });
         }
+
+        // Conservative exec-sink backstop (#136).
+        //
+        // Interpreter-source heredoc bodies (python -/node -/ruby/…) are masked
+        // out of the evaluator's later raw-shell rescan because this AST path is
+        // authoritative. ast-grep patterns only match specific call shapes, so an
+        // aliased / inline-imported sink (e.g. `const cp = require("child_process");
+        // cp.execSync("rm -rf /etc")`) can slip past them. Re-scan the raw body
+        // for name-anchored exec sinks called with a destructive string literal so
+        // masking never converts a real executing deletion into a false negative.
+        // Inert literals with no sink call (`print("rm -rf x")`) do not match.
+        if content
+            .target_command
+            .as_ref()
+            .is_some_and(|cmd| crate::heredoc::is_interpreter_source_heredoc_command(cmd))
+        {
+            if let Some(m) =
+                crate::ast_matcher::scan_executing_sink_fallback(&content.content, content.language)
+            {
+                if m.severity.blocks_by_default() {
+                    let (pack_id, pattern_name) = split_ast_rule_id(&m.rule_id);
+
+                    if let Some(hit) = context.allowlists.match_rule(&pack_id, &pattern_name) {
+                        if first_allowlist_hit.is_none() {
+                            let reason =
+                                format_heredoc_denial_reason(&content, &m, &pack_id, &pattern_name);
+                            let mapped_span = map_heredoc_span(command, &content, m.start, m.end);
+                            *first_allowlist_hit = Some((
+                                PatternMatch {
+                                    pack_id: Some(pack_id),
+                                    pattern_name: Some(pattern_name),
+                                    severity: Some(ast_severity_to_pack_severity(m.severity)),
+                                    reason,
+                                    source: MatchSource::HeredocAst,
+                                    matched_span: mapped_span,
+                                    matched_text_preview: Some(m.matched_text_preview),
+                                    explanation: None,
+                                    suggestions: &[],
+                                },
+                                hit.layer,
+                                hit.entry.reason.clone(),
+                            ));
+                        }
+                    } else {
+                        let reason =
+                            format_heredoc_denial_reason(&content, &m, &pack_id, &pattern_name);
+                        let mapped_span = map_heredoc_span(command, &content, m.start, m.end);
+                        return Some(EvaluationResult {
+                            decision: EvaluationDecision::Deny,
+                            pattern_info: Some(PatternMatch {
+                                pack_id: Some(pack_id),
+                                pattern_name: Some(pattern_name),
+                                severity: Some(ast_severity_to_pack_severity(m.severity)),
+                                reason,
+                                source: MatchSource::HeredocAst,
+                                matched_span: mapped_span,
+                                matched_text_preview: Some(m.matched_text_preview),
+                                explanation: None,
+                                suggestions: &[],
+                            }),
+                            allowlist_override: None,
+                            effective_mode: Some(crate::packs::DecisionMode::Deny),
+                            skipped_due_to_budget: false,
+                            branch_context: None,
+                            session_occurrence: None,
+                            graduated_response: None,
+                            bypass_method: None,
+                        });
+                    }
+                }
+            }
+        }
     }
 
     if fallback_needed {
@@ -4533,6 +4605,177 @@ mod tests {
                 .map(|p| p.matched_text_preview.as_ref()),
             "Match text preview should be deterministic"
         );
+    }
+
+    // =========================================================================
+    // #136: Language-aware string-literal scanning for interpreter-stdin heredocs
+    //
+    // `python3 - <<PY` / `node - <<JS` feed a *program* to an interpreter's
+    // stdin. A destructive token inside an inert string/comment literal
+    // (`print("rm -rf x")`) must NOT block, but the same token in a real
+    // executing sink (`os.system`, `subprocess.*`, `child_process.exec*`,
+    // Ruby/Perl `system`/backticks, …) MUST still block. The destructive token
+    // is assembled at runtime so this test source itself can't trip a pre-exec
+    // hook scanning the repo.
+    // =========================================================================
+
+    mod interpreter_heredoc_string_literals_136 {
+        use super::*;
+
+        const CORE: &[&str] = &["core.filesystem", "core.git"];
+
+        fn rmrf() -> String {
+            // "rm -rf" without writing the literal token in source.
+            format!("{}{}{}", "rm", " -", "rf")
+        }
+
+        fn blocked(command: &str) -> bool {
+            evaluate_with_pack_ids(command, CORE).is_denied()
+        }
+
+        // ---- Inert literals / comments: MUST be allowed -------------------
+
+        #[test]
+        fn python_print_string_literal_is_allowed() {
+            let cmd = format!("python3 - <<PY\nprint(\"{} /etc/important\")\nPY", rmrf());
+            assert!(
+                !blocked(&cmd),
+                "inert print() literal must not block: {cmd:?}"
+            );
+        }
+
+        #[test]
+        fn python_print_relative_path_literal_is_allowed() {
+            let cmd = format!("python3 - <<PY\nimport os\nprint(\"{} build\")\nPY", rmrf());
+            assert!(!blocked(&cmd), "reporter case must not block: {cmd:?}");
+        }
+
+        #[test]
+        fn python_comment_is_allowed() {
+            let cmd = format!("python3 - <<PY\n# {} /etc note\nprint(1)\nPY", rmrf());
+            assert!(!blocked(&cmd), "inert comment must not block: {cmd:?}");
+        }
+
+        #[test]
+        fn node_console_log_string_literal_is_allowed() {
+            let cmd = format!("node - <<JS\nconsole.log(\"{} build\")\nJS", rmrf());
+            assert!(
+                !blocked(&cmd),
+                "inert console.log() literal must not block: {cmd:?}"
+            );
+        }
+
+        #[test]
+        fn node_variable_assignment_without_sink_is_allowed() {
+            // The destructive string is assigned and merely logged — no exec sink.
+            let cmd = format!(
+                "node - <<JS\nconst x = \"{} /etc\"\nconsole.log(x)\nJS",
+                rmrf()
+            );
+            assert!(!blocked(&cmd), "no exec sink must not block: {cmd:?}");
+        }
+
+        // ---- Executing sinks: MUST stay blocked ---------------------------
+
+        #[test]
+        fn python_os_system_real_deletion_is_blocked() {
+            let cmd = format!(
+                "python3 - <<PY\nimport os\nos.system(\"{} /etc/important\")\nPY",
+                rmrf()
+            );
+            assert!(blocked(&cmd), "os.system exec sink must block: {cmd:?}");
+        }
+
+        #[test]
+        fn python_os_popen_real_deletion_is_blocked() {
+            let cmd = format!(
+                "python3 - <<PY\nimport os\nos.popen(\"{} /etc/important\")\nPY",
+                rmrf()
+            );
+            assert!(blocked(&cmd), "os.popen exec sink must block: {cmd:?}");
+        }
+
+        #[test]
+        fn python_subprocess_run_shell_true_is_blocked() {
+            let cmd = format!(
+                "python3 - <<PY\nimport subprocess\nsubprocess.run(\"{} /etc/important\", shell=True)\nPY",
+                rmrf()
+            );
+            assert!(
+                blocked(&cmd),
+                "subprocess.run exec sink must block: {cmd:?}"
+            );
+        }
+
+        #[test]
+        fn node_child_process_execsync_is_blocked() {
+            let cmd = format!(
+                "node - <<JS\nchild_process.execSync(\"{} /etc/important\")\nJS",
+                rmrf()
+            );
+            assert!(blocked(&cmd), "child_process.execSync must block: {cmd:?}");
+        }
+
+        #[test]
+        fn node_aliased_require_execsync_is_blocked() {
+            // Aliased require — slips past ast-grep call-shape patterns; the
+            // name-anchored exec-sink backstop must still catch it.
+            let cmd = format!(
+                "node - <<JS\nconst cp = require(\"child_process\")\ncp.execSync(\"{} /etc/important\")\nJS",
+                rmrf()
+            );
+            assert!(
+                blocked(&cmd),
+                "aliased require().execSync must block (backstop): {cmd:?}"
+            );
+        }
+
+        #[test]
+        fn node_double_quote_require_execsync_is_blocked() {
+            let cmd = format!(
+                "node - <<JS\nrequire(\"child_process\").execSync(\"{} /etc/important\")\nJS",
+                rmrf()
+            );
+            assert!(
+                blocked(&cmd),
+                "double-quote require().execSync must block (backstop): {cmd:?}"
+            );
+        }
+
+        #[test]
+        fn ruby_system_real_deletion_is_blocked() {
+            let cmd = format!("ruby - <<RB\nsystem(\"{} /etc/important\")\nRB", rmrf());
+            assert!(blocked(&cmd), "ruby system() must block: {cmd:?}");
+        }
+
+        #[test]
+        fn perl_system_real_deletion_is_blocked() {
+            let cmd = format!("perl - <<PL\nsystem(\"{} /etc/important\");\nPL", rmrf());
+            assert!(blocked(&cmd), "perl system() must block: {cmd:?}");
+        }
+
+        #[test]
+        fn python_shutil_rmtree_is_blocked() {
+            let cmd = "python3 - <<PY\nimport shutil\nshutil.rmtree(\"/etc\")\nPY";
+            assert!(blocked(cmd), "shutil.rmtree must block: {cmd:?}");
+        }
+
+        // ---- Shell heredocs are NOT a non-shell interpreter: stay blocked --
+
+        #[test]
+        fn bash_heredoc_real_deletion_stays_blocked() {
+            let cmd = format!("bash <<SH\n{} /etc/important\nSH", rmrf());
+            assert!(
+                blocked(&cmd),
+                "bash heredoc shell body must stay blocked: {cmd:?}"
+            );
+        }
+
+        #[test]
+        fn cat_sink_string_literal_is_allowed() {
+            let cmd = format!("cat > f.py <<PY\nprint(\"{} build\")\nPY", rmrf());
+            assert!(!blocked(&cmd), "cat data sink must not block: {cmd:?}");
+        }
     }
 
     // =========================================================================

@@ -298,6 +298,110 @@ impl AstMatcher {
     }
 }
 
+/// Conservative exec-sink backstop for interpreter-source heredocs (#136).
+///
+/// Bodies of `python -`/`node -`/`ruby` (etc.) heredocs are masked out of the
+/// evaluator's raw-shell rescan because the language AST is authoritative. But
+/// ast-grep structural patterns only match *specific call shapes*
+/// (`child_process.execSync(...)`, `os.system(...)`, …). Aliased or
+/// indirectly-imported sinks — e.g. `const cp = require("child_process");
+/// cp.execSync("rm -rf /etc")` — slip past those patterns. Without a backstop,
+/// masking would turn such a genuinely-executing deletion into a false negative,
+/// violating the zero-false-negative invariant.
+///
+/// This scan is **name-anchored and literal-only**: it fires only when a known
+/// shell-exec sink *name* (`execSync`, `exec`, `spawnSync`, `spawn`,
+/// `os.system`, `os.popen`, `subprocess.{run,call,Popen}`, `system`, `popen`)
+/// is called with a string-literal argument whose content
+/// [`detect_shell_payload`] flags as destructive (`rm -rf …`,
+/// `git reset --hard`, …). A destructive token sitting in an inert literal with
+/// no sink call (`print("rm -rf x")`, `console.log("rm -rf x")`) does NOT match,
+/// so the reporter's false positive stays fixed.
+///
+/// Returns the first blocking match, or `None`. Language-scoped to the
+/// non-shell interpreter languages that get masked.
+#[must_use]
+pub fn scan_executing_sink_fallback(code: &str, language: ScriptLanguage) -> Option<PatternMatch> {
+    let newline_positions: Vec<usize> = memchr_iter(b'\n', code.as_bytes()).collect();
+
+    let sink_regex: &Regex = match language {
+        ScriptLanguage::JavaScript | ScriptLanguage::TypeScript => &JS_EXEC_SINK_LITERAL,
+        ScriptLanguage::Python => &PY_EXEC_SINK_LITERAL,
+        ScriptLanguage::Ruby => &RUBY_EXEC_SINK_LITERAL,
+        // Bash is never masked; Perl/Php/Go use their own primary paths and have
+        // no aliasing gap this backstop needs to close for the #136 scope.
+        _ => return None,
+    };
+
+    for caps in sink_regex.captures_iter(code) {
+        let Some(m) = caps.get(0) else { continue };
+        let Some(payload) = string_literal_from_caps(&caps) else {
+            continue;
+        };
+        let Some(hit) = detect_shell_payload(payload) else {
+            continue;
+        };
+
+        // Escalate destructive exec-sink payloads to a blocking severity.
+        let severity = match hit.severity {
+            Severity::Critical => Severity::Critical,
+            _ => Severity::High,
+        };
+        if !severity.blocks_by_default() {
+            continue;
+        }
+
+        let sink = caps.name("sink").map_or("exec", |s| s.as_str());
+        let lang_id = match language {
+            ScriptLanguage::JavaScript => "javascript",
+            ScriptLanguage::TypeScript => "typescript",
+            ScriptLanguage::Python => "python",
+            ScriptLanguage::Ruby => "ruby",
+            _ => "unknown",
+        };
+        let line_number = newline_positions.partition_point(|&idx| idx < m.start()) + 1;
+
+        return Some(PatternMatch {
+            rule_id: format!("heredoc.{lang_id}.exec_sink.{}", hit.rule_suffix),
+            reason: format!("{} via {sink}() exec sink", hit.reason),
+            matched_text_preview: truncate_preview(code.get(m.start()..m.end()).unwrap_or(""), 60),
+            start: m.start(),
+            end: m.end(),
+            line_number,
+            severity,
+            suggestion: hit.suggestion.map(str::to_string),
+        });
+    }
+
+    None
+}
+
+static JS_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
+    // Any aliased/inline shell-exec sink called with a string literal:
+    //   cp.execSync("rm -rf /etc") / exec('git reset --hard') / spawnSync("rm", ...
+    // Anchored on the sink method name, NOT the receiver, so aliasing is moot.
+    Regex::new(
+        r#"(?m)\b(?P<sink>execSync|exec|spawnSync|spawn)\s*\(\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
+    )
+    .expect("js exec sink literal regex compiles")
+});
+
+static PY_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
+    // Aliased/qualified Python shell sinks with a string-literal first arg.
+    Regex::new(
+        r#"(?m)\b(?P<sink>system|popen|run|call|Popen|check_output|getoutput|getstatusoutput)\s*\(\s*\[?\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
+    )
+    .expect("python exec sink literal regex compiles")
+});
+
+static RUBY_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
+    // Aliased/qualified Ruby shell sinks with a string-literal first arg.
+    Regex::new(
+        r#"(?m)\b(?P<sink>system|exec|spawn)\b(?:\s*\(\s*|\s+)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
+    )
+    .expect("ruby exec sink literal regex compiles")
+});
+
 #[allow(clippy::cast_possible_truncation)] // Timeout values are always small
 fn timeout_error(start_time: Instant, budget_ms: u64) -> MatchError {
     MatchError::Timeout {
@@ -533,6 +637,16 @@ static RUBY_FIRST_STRING_ARG: LazyLock<Regex> = LazyLock::new(|| {
         .expect("ruby first string arg regex compiles")
 });
 
+static PY_FIRST_STRING_ARG: LazyLock<Regex> = LazyLock::new(|| {
+    // Captures the first string-literal argument in a Python call expression,
+    // e.g. os.system("rm -rf x") or subprocess.run('rm -rf x', shell=True).
+    // Tolerates a leading list bracket so subprocess.run(["rm", ...]) still
+    // surfaces the first element (conservative; falls through to warn-only when
+    // no shell payload is detected).
+    Regex::new(r#"(?m)\(\s*\[?\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#)
+        .expect("python first string arg regex compiles")
+});
+
 fn refine_match_meta(
     language: ScriptLanguage,
     meta: &CompiledPattern,
@@ -542,6 +656,7 @@ fn refine_match_meta(
         ScriptLanguage::JavaScript => refine_javascript_match(meta, matched_text),
         ScriptLanguage::TypeScript => refine_typescript_match(meta, matched_text),
         ScriptLanguage::Ruby => refine_ruby_match(meta, matched_text),
+        ScriptLanguage::Python => Some(refine_python_match(meta, matched_text)),
         _ => Some(RefinedMatchMeta {
             rule_id: meta.rule_id.clone(),
             reason: meta.reason.clone(),
@@ -549,6 +664,70 @@ fn refine_match_meta(
             suggestion: meta.suggestion.clone(),
         }),
     }
+}
+
+/// Refine a Python exec-sink match (#136).
+///
+/// Python shell sinks (`os.system`, `os.popen`, `subprocess.run/call/Popen`) are
+/// registered at `Medium` severity so a bare, benign call (e.g.
+/// `subprocess.run(["ls"])`) only warns. This refinement escalates the match to a
+/// BLOCKING severity when the first string-literal argument is a genuinely
+/// destructive shell command (`rm -rf …`, `git reset --hard`, …). This is what
+/// lets the language-aware heredoc path stay authoritative for executing sinks:
+/// an interpreter-stdin heredoc body whose only destructive token lives inside an
+/// inert literal (e.g. `print("rm -rf x")`) is masked from the raw-shell rescan,
+/// but a real `os.system("rm -rf /etc")` is caught right here.
+///
+/// Fail-safe: if the payload cannot be extracted as a literal (dynamic argument),
+/// we keep the original `Medium` warn-only meta rather than dropping the match, so
+/// the raw-shell rescan (when not masked) still has a chance to act.
+fn refine_python_match(meta: &CompiledPattern, matched_text: &str) -> RefinedMatchMeta {
+    let rule_id = meta.rule_id.as_str();
+
+    let is_exec_sink = matches!(
+        rule_id,
+        "heredoc.python.os_system"
+            | "heredoc.python.os_popen"
+            | "heredoc.python.subprocess_run"
+            | "heredoc.python.subprocess_call"
+            | "heredoc.python.subprocess_popen"
+    );
+
+    let unchanged = || RefinedMatchMeta {
+        rule_id: meta.rule_id.clone(),
+        reason: meta.reason.clone(),
+        severity: meta.severity,
+        suggestion: meta.suggestion.clone(),
+    };
+
+    if is_exec_sink {
+        let payload = PY_FIRST_STRING_ARG
+            .captures(matched_text)
+            .and_then(|caps| string_literal_from_caps(&caps));
+
+        if let Some(payload) = payload {
+            if let Some(hit) = detect_shell_payload(payload) {
+                // A destructive shell command is being executed. Escalate to at
+                // least High so the AST path blocks even for non-catastrophic
+                // targets (the sink unambiguously runs `rm -rf`/`git reset`).
+                let severity = match hit.severity {
+                    Severity::Critical => Severity::Critical,
+                    _ => Severity::High,
+                };
+                return RefinedMatchMeta {
+                    rule_id: format!("{rule_id}.{}", hit.rule_suffix),
+                    reason: hit.reason.to_string(),
+                    severity,
+                    suggestion: hit.suggestion.map(str::to_string),
+                };
+            }
+        }
+
+        // Dynamic / non-destructive payload: keep warn-only meta (fail-open).
+        return unchanged();
+    }
+
+    unchanged()
 }
 
 fn refine_javascript_match(meta: &CompiledPattern, matched_text: &str) -> Option<RefinedMatchMeta> {
@@ -3392,6 +3571,94 @@ def cleanup():
             // /tmp_backup should NOT be matched as /tmp (and thus fall through to sys_dirs check)
             // Since it's not in sys_dirs, it should return false.
             assert!(!is_catastrophic_path("/tmp_backup"));
+        }
+
+        // ---- #136: Python exec-sink refinement & exec-sink backstop ---------
+
+        fn rmrf() -> String {
+            format!("{}{}{}", "rm", " -", "rf")
+        }
+
+        #[test]
+        fn python_os_system_destructive_literal_escalates_to_blocking() {
+            let matcher = AstMatcher::new();
+            let code = format!("import os\nos.system(\"{} /etc/important\")", rmrf());
+            let matches = matcher.find_matches(&code, ScriptLanguage::Python).unwrap();
+            assert!(
+                matches
+                    .iter()
+                    .any(|m| m.rule_id.starts_with("heredoc.python.os_system")
+                        && m.severity.blocks_by_default()),
+                "os.system(rm -rf /etc) must escalate to a blocking severity: {matches:?}"
+            );
+        }
+
+        #[test]
+        fn python_os_system_benign_literal_warns_only() {
+            let matcher = AstMatcher::new();
+            let code = "import os\nos.system(\"echo hello\")";
+            let matches = matcher.find_matches(code, ScriptLanguage::Python).unwrap();
+            // The os.system match is still reported but must remain warn-only.
+            assert!(
+                matches
+                    .iter()
+                    .filter(|m| m.rule_id.starts_with("heredoc.python.os_system"))
+                    .all(|m| !m.severity.blocks_by_default()),
+                "benign os.system must stay warn-only: {matches:?}"
+            );
+        }
+
+        #[test]
+        fn python_print_literal_has_no_match() {
+            let matcher = AstMatcher::new();
+            // print() is not a registered sink: a destructive token in its inert
+            // literal yields no AST match at all.
+            let code = format!("print(\"{} /etc/important\")", rmrf());
+            let matches = matcher.find_matches(&code, ScriptLanguage::Python).unwrap();
+            assert!(
+                matches.is_empty(),
+                "inert print() literal must not match any python pattern: {matches:?}"
+            );
+        }
+
+        #[test]
+        fn fallback_catches_aliased_execsync_literal() {
+            let code = format!(
+                "const cp = require(\"child_process\")\ncp.execSync(\"{} /etc/important\")",
+                rmrf()
+            );
+            let hit = scan_executing_sink_fallback(&code, ScriptLanguage::JavaScript);
+            assert!(
+                hit.is_some_and(|m| m.severity.blocks_by_default()),
+                "aliased execSync(rm -rf /etc) must be caught by the backstop"
+            );
+        }
+
+        #[test]
+        fn fallback_ignores_inert_literal_without_sink() {
+            let code = format!("const x = \"{} /etc\"\nconsole.log(x)", rmrf());
+            assert!(
+                scan_executing_sink_fallback(&code, ScriptLanguage::JavaScript).is_none(),
+                "no exec sink => backstop must not fire"
+            );
+        }
+
+        #[test]
+        fn fallback_ignores_console_log_literal() {
+            let code = format!("console.log(\"{} build\")", rmrf());
+            assert!(
+                scan_executing_sink_fallback(&code, ScriptLanguage::JavaScript).is_none(),
+                "console.log is not an exec sink => backstop must not fire"
+            );
+        }
+
+        #[test]
+        fn fallback_does_not_run_for_bash() {
+            let code = format!("{} /etc/important", rmrf());
+            assert!(
+                scan_executing_sink_fallback(&code, ScriptLanguage::Bash).is_none(),
+                "bash bodies are never masked, so the backstop is a no-op for them"
+            );
         }
     }
 }
