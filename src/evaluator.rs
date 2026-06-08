@@ -4754,6 +4754,180 @@ mod tests {
             assert!(blocked(&cmd), "perl system() must block: {cmd:?}");
         }
 
+        // ---- #136 regression: exec-sink FNs the masking previously leaked ----
+        // PHP/Go/Perl were masked WITHOUT comprehensive exec-sink escalation, so
+        // these slipped through. They are now unmasked (conservative raw-shell
+        // scan), and Node/Ruby coverage was widened. Every case MUST block.
+
+        #[test]
+        fn php_system_real_deletion_is_blocked() {
+            let cmd = format!(
+                "php - <<PHP\n<?php system(\"{} /etc/important\"); ?>\nPHP",
+                rmrf()
+            );
+            assert!(blocked(&cmd), "php system() must block: {cmd:?}");
+        }
+
+        #[test]
+        fn php_shell_exec_real_deletion_is_blocked() {
+            let cmd = format!(
+                "php - <<PHP\n<?php shell_exec(\"{} /etc/important\"); ?>\nPHP",
+                rmrf()
+            );
+            assert!(blocked(&cmd), "php shell_exec() must block: {cmd:?}");
+        }
+
+        #[test]
+        fn php_exec_passthru_real_deletion_is_blocked() {
+            for sink in ["exec", "passthru", "popen"] {
+                let cmd = format!(
+                    "php - <<PHP\n<?php {sink}(\"{} /etc/important\"); ?>\nPHP",
+                    rmrf()
+                );
+                assert!(blocked(&cmd), "php {sink}() must block: {cmd:?}");
+            }
+        }
+
+        #[test]
+        fn go_exec_command_real_deletion_is_blocked() {
+            let cmd = format!(
+                "go run - <<GO\npackage main\nimport \"os/exec\"\nfunc main(){{ exec.Command(\"sh\",\"-c\",\"{} /etc/important\").Run() }}\nGO",
+                rmrf()
+            );
+            assert!(blocked(&cmd), "go exec.Command() must block: {cmd:?}");
+        }
+
+        #[test]
+        fn perl_qx_real_deletion_is_blocked() {
+            let cmd = format!("perl - <<PL\nqx({} /etc/important);\nPL", rmrf());
+            assert!(blocked(&cmd), "perl qx() must block: {cmd:?}");
+        }
+
+        #[test]
+        fn perl_open_pipe_real_deletion_is_blocked() {
+            let cmd = format!("perl - <<PL\nopen(F,\"{} /etc/important|\");\nPL", rmrf());
+            assert!(blocked(&cmd), "perl open(\"cmd|\") must block: {cmd:?}");
+        }
+
+        #[test]
+        fn node_execfile_real_deletion_is_blocked() {
+            let cmd = format!(
+                "node - <<JS\nrequire(\"child_process\").execFile(\"sh\",[\"-c\",\"{} /etc/important\"])\nJS",
+                rmrf()
+            );
+            assert!(blocked(&cmd), "node execFile() must block: {cmd:?}");
+        }
+
+        #[test]
+        fn node_execfilesync_real_deletion_is_blocked() {
+            let cmd = format!(
+                "node - <<JS\nrequire(\"child_process\").execFileSync(\"sh\",[\"-c\",\"{} /etc/important\"])\nJS",
+                rmrf()
+            );
+            assert!(blocked(&cmd), "node execFileSync() must block: {cmd:?}");
+        }
+
+        #[test]
+        fn node_fork_real_deletion_is_blocked() {
+            let cmd = format!(
+                "node - <<JS\nrequire(\"child_process\").fork(\"{} /etc/important\")\nJS",
+                rmrf()
+            );
+            assert!(blocked(&cmd), "node fork() must block: {cmd:?}");
+        }
+
+        #[test]
+        fn node_spawn_argv_command_name_is_blocked() {
+            // Command name in the first literal, flags/target split across the
+            // list arg — argv reconstruction must reassemble `rm -rf /etc`.
+            for sink in ["spawnSync", "spawn"] {
+                let cmd = format!(
+                    "node - <<JS\nrequire(\"child_process\").{sink}(\"rm\",[\"-rf\",\"/etc/important\"])\nJS"
+                );
+                assert!(blocked(&cmd), "node {sink}(argv) must block: {cmd:?}");
+            }
+        }
+
+        #[test]
+        fn node_execfile_non_catastrophic_target_is_blocked() {
+            // Non-catastrophic relative target inside a real exec sink must still
+            // block (escalation to >= High).
+            let cmd = format!(
+                "node - <<JS\nrequire(\"child_process\").execFile(\"sh\",[\"-c\",\"{} myproj/data\"])\nJS",
+                rmrf()
+            );
+            assert!(
+                blocked(&cmd),
+                "node execFile() non-catastrophic target must block: {cmd:?}"
+            );
+        }
+
+        #[test]
+        fn ruby_percent_x_real_deletion_is_blocked() {
+            for cmd in [
+                format!("ruby - <<RB\n%x({} /etc/important)\nRB", rmrf()),
+                format!("ruby - <<RB\n%x{{{} /etc/important}}\nRB", rmrf()),
+                format!("ruby - <<RB\n%x[{} /etc/important]\nRB", rmrf()),
+            ] {
+                assert!(blocked(&cmd), "ruby %x command must block: {cmd:?}");
+            }
+        }
+
+        #[test]
+        fn ruby_backticks_real_deletion_is_blocked() {
+            let cmd = format!("ruby - <<RB\n`{} /etc/important`\nRB", rmrf());
+            assert!(blocked(&cmd), "ruby backticks must block: {cmd:?}");
+        }
+
+        #[test]
+        fn ruby_io_popen_real_deletion_is_blocked() {
+            let cmd = format!("ruby - <<RB\nIO.popen(\"{} /etc/important\")\nRB", rmrf());
+            assert!(blocked(&cmd), "ruby IO.popen() must block: {cmd:?}");
+        }
+
+        #[test]
+        fn ruby_open3_real_deletion_is_blocked() {
+            let cmd = format!(
+                "ruby - <<RB\nOpen3.capture2(\"{} /etc/important\")\nRB",
+                rmrf()
+            );
+            assert!(blocked(&cmd), "ruby Open3.capture2() must block: {cmd:?}");
+        }
+
+        #[test]
+        fn ruby_system_non_catastrophic_target_is_blocked() {
+            // Non-catastrophic relative target inside a real Ruby exec sink must
+            // still block (escalation to >= High).
+            let cmd = format!("ruby - <<RB\nsystem(\"{} myproj/data\")\nRB", rmrf());
+            assert!(
+                blocked(&cmd),
+                "ruby system() non-catastrophic target must block: {cmd:?}"
+            );
+        }
+
+        // ---- #136 win preserved: inert literals in kept-masked languages -----
+
+        #[test]
+        fn ruby_puts_string_literal_is_allowed() {
+            let cmd = format!("ruby - <<RB\nputs(\"{} build\")\nRB", rmrf());
+            assert!(
+                !blocked(&cmd),
+                "inert ruby puts() literal must not block: {cmd:?}"
+            );
+        }
+
+        #[test]
+        fn python_inert_list_literal_is_allowed() {
+            let cmd = format!(
+                "python3 - <<PY\nx = [\"sh\",\"-c\",\"{} build\"]\nprint(x)\nPY",
+                rmrf()
+            );
+            assert!(
+                !blocked(&cmd),
+                "inert python list literal must not block: {cmd:?}"
+            );
+        }
+
         #[test]
         fn python_shutil_rmtree_is_blocked() {
             let cmd = "python3 - <<PY\nimport shutil\nshutil.rmtree(\"/etc\")\nPY";

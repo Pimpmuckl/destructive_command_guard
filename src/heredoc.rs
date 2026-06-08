@@ -1773,16 +1773,31 @@ pub fn is_interpreter_source_heredoc_command(cmd: &str) -> bool {
     let cmd_name = cmd.rsplit('/').next().unwrap_or(cmd);
     match ScriptLanguage::from_command(cmd_name) {
         // Concrete non-shell languages whose source is authoritatively analyzed
-        // by the AST matcher / Perl regex fallback.
+        // by the AST matcher / exec-sink escalation path. Masking the heredoc body
+        // here removes it from the conservative raw-shell rescan, so we ONLY mask
+        // languages where exec-sink escalation is comprehensive enough to guarantee
+        // ZERO false negatives. Python, JavaScript, TypeScript, and Ruby are covered
+        // by `refine_python_match` / `scan_executing_sink_fallback` and their AST
+        // backstops.
+        //
+        // Perl, PHP, and Go are DELIBERATELY EXCLUDED (#136 regression fix): their
+        // exec-sink escalation was incomplete (`scan_executing_sink_fallback`
+        // explicitly returned None for them), so masking let literal destructive
+        // tokens inside `system()`/`exec.Command(...)`/`qx(...)`/etc. slip through.
+        // By leaving them unmasked, their bodies fall back to the conservative
+        // raw-shell scan, which BLOCKS destructive tokens (acceptable false
+        // positives, zero false negatives).
         ScriptLanguage::Python
         | ScriptLanguage::JavaScript
         | ScriptLanguage::TypeScript
-        | ScriptLanguage::Ruby
+        | ScriptLanguage::Ruby => true,
+        // Shell, Perl, PHP, Go, and Unknown are never masked — their bodies stay
+        // raw-shell-scanned so real destructive tokens still block.
+        ScriptLanguage::Bash
         | ScriptLanguage::Perl
         | ScriptLanguage::Php
-        | ScriptLanguage::Go => true,
-        // Bash/shell bodies stay raw-shell-scanned; Unknown is never masked.
-        ScriptLanguage::Bash | ScriptLanguage::Unknown => false,
+        | ScriptLanguage::Go
+        | ScriptLanguage::Unknown => false,
     }
 }
 
@@ -4119,11 +4134,15 @@ fi"#;
         );
     }
 
-    /// #136: non-shell interpreters whose body is masked out of the raw-shell
-    /// rescan vs. shell/data targets that must NOT be classified as such.
+    /// #136: only the languages with comprehensive exec-sink escalation
+    /// (Python, JavaScript, TypeScript, Ruby) get their heredoc body masked out
+    /// of the raw-shell rescan. Perl/PHP/Go were REMOVED from the masked set
+    /// (their exec-sink escalation was incomplete, so masking leaked literal
+    /// destructive tokens inside `system()`/`exec.Command(...)`/`qx(...)`); they
+    /// now fall back to the conservative raw-shell scan.
     #[test]
     fn interpreter_source_heredoc_command_classification_136() {
-        // Non-shell interpreters reading a program from stdin → masked.
+        // Non-shell interpreters with comprehensive exec-sink escalation → masked.
         for cmd in [
             "python",
             "python3",
@@ -4131,16 +4150,22 @@ fi"#;
             "node",
             "nodejs",
             "ruby",
-            "perl",
-            "php",
             "deno",
             "bun",
-            "go",
             "/usr/bin/python3",
         ] {
             assert!(
                 is_interpreter_source_heredoc_command(cmd),
                 "{cmd} should be treated as interpreter source"
+            );
+        }
+
+        // Perl/PHP/Go are DELIBERATELY NOT masked: their bodies stay raw-shell
+        // scanned so literal destructive tokens in their exec sinks still BLOCK.
+        for cmd in ["perl", "php", "go", "/usr/local/bin/php"] {
+            assert!(
+                !is_interpreter_source_heredoc_command(cmd),
+                "{cmd} must NOT be masked (incomplete exec-sink escalation; #136 FN fix)"
             );
         }
 

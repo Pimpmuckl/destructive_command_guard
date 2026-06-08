@@ -324,6 +324,17 @@ impl AstMatcher {
 pub fn scan_executing_sink_fallback(code: &str, language: ScriptLanguage) -> Option<PatternMatch> {
     let newline_positions: Vec<usize> = memchr_iter(b'\n', code.as_bytes()).collect();
 
+    // Ruby has command-execution forms whose payload is NOT a quoted string
+    // literal (`%x(rm -rf /etc)`, backticks `` `rm -rf /etc` ``). Handle those
+    // (plus `IO.popen`/`Open3.*` whose payloads ARE quoted) in a dedicated pass so
+    // the heredoc masking never converts a real executing deletion into a false
+    // negative (#136).
+    if language == ScriptLanguage::Ruby {
+        if let Some(m) = scan_ruby_exec_sink_fallback(code, &newline_positions) {
+            return Some(m);
+        }
+    }
+
     let sink_regex: &Regex = match language {
         ScriptLanguage::JavaScript | ScriptLanguage::TypeScript => &JS_EXEC_SINK_LITERAL,
         ScriptLanguage::Python => &PY_EXEC_SINK_LITERAL,
@@ -381,12 +392,114 @@ pub fn scan_executing_sink_fallback(code: &str, language: ScriptLanguage) -> Opt
     None
 }
 
+/// Ruby-specific exec-sink backstop covering forms whose destructive payload is
+/// not a quoted string literal (`%x(...)`/`%x{...}`/`%x[...]`, backticks) as well
+/// as quoted-arg sinks (`system`/`exec`/`spawn`, `IO.popen`, `Open3.*`). Any
+/// confirmed destructive payload is escalated to a blocking severity (>= High) via
+/// the shared escalation rule, so even a non-catastrophic `rm -rf <relpath>`
+/// inside one of these sinks BLOCKS (#136).
+fn scan_ruby_exec_sink_fallback(code: &str, newline_positions: &[usize]) -> Option<PatternMatch> {
+    // 1) `%x(...)` / `%x{...}` / `%x[...]` command-substitution literals and
+    //    backticks: the payload IS the delimited text, not a nested string.
+    for caps in RUBY_PERCENT_X_LITERAL.captures_iter(code) {
+        let Some(m) = caps.get(0) else { continue };
+        let cmd = ["cmd", "cmd2", "cmd3", "cmd4"]
+            .iter()
+            .find_map(|name| caps.name(name).map(|c| c.as_str()))
+            .unwrap_or("");
+        if let Some(hit) = detect_shell_payload(cmd) {
+            return Some(ruby_exec_sink_match(code, newline_positions, m, "%x", &hit));
+        }
+    }
+    for caps in RUBY_BACKTICKS_LITERAL.captures_iter(code) {
+        let Some(m) = caps.get(0) else { continue };
+        let cmd = caps.name("cmd").map_or("", |c| c.as_str());
+        if let Some(hit) = detect_shell_payload(cmd) {
+            return Some(ruby_exec_sink_match(
+                code,
+                newline_positions,
+                m,
+                "backticks",
+                &hit,
+            ));
+        }
+    }
+
+    // 2) Quoted-arg sinks: `system`/`exec`/`spawn`, `IO.popen`, `Open3.*`. Scan
+    //    the full balanced argument region so a payload nested in a list arg
+    //    (`system("sh", "-c", "rm -rf /etc")`) is caught too.
+    for caps in RUBY_QUOTED_EXEC_SINK_LITERAL.captures_iter(code) {
+        let Some(m) = caps.get(0) else { continue };
+        let arg_region = exec_sink_arg_region(code, m.start());
+        if let Some(hit) = detect_destructive_in_args(arg_region) {
+            let sink = caps.name("sink").map_or("exec", |s| s.as_str());
+            return Some(ruby_exec_sink_match(code, newline_positions, m, sink, &hit));
+        }
+    }
+
+    None
+}
+
+fn ruby_exec_sink_match(
+    code: &str,
+    newline_positions: &[usize],
+    m: regex::Match<'_>,
+    sink: &str,
+    hit: &ShellPayloadHit,
+) -> PatternMatch {
+    // Escalate destructive exec-sink payloads to a blocking severity so even a
+    // non-catastrophic target still BLOCKS (the sink unambiguously executes).
+    let severity = match hit.severity {
+        Severity::Critical => Severity::Critical,
+        _ => Severity::High,
+    };
+    let line_number = newline_positions.partition_point(|&idx| idx < m.start()) + 1;
+    PatternMatch {
+        rule_id: format!("heredoc.ruby.exec_sink.{}", hit.rule_suffix),
+        reason: format!("{} via {sink} exec sink", hit.reason),
+        matched_text_preview: truncate_preview(code.get(m.start()..m.end()).unwrap_or(""), 60),
+        start: m.start(),
+        end: m.end(),
+        line_number,
+        severity,
+        suggestion: hit.suggestion.map(str::to_string),
+    }
+}
+
+static RUBY_PERCENT_X_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
+    // Ruby command-substitution literal: %x(...), %x{...}, %x[...], %x<...>.
+    // Capture the inner command text (single-line, no nesting of the same
+    // delimiter — sufficient for the heredoc-body destructive-token scan).
+    Regex::new(
+        r"(?m)%x(?:\((?P<cmd>[^)\n]*)\)|\{(?P<cmd2>[^}\n]*)\}|\[(?P<cmd3>[^\]\n]*)\]|<(?P<cmd4>[^>\n]*)>)",
+    )
+    .expect("ruby %x literal regex compiles")
+});
+
+static RUBY_QUOTED_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
+    // Quoted-arg Ruby exec sinks anchored on the sink NAME, with the destructive
+    // payload search running over the call's full balanced argument region:
+    //   system("rm -rf /etc") / Kernel.exec('…') / IO.popen("rm -rf /etc")
+    //   Open3.capture2("rm -rf /etc") / Open3.popen3("…") / spawn("…")
+    Regex::new(
+        r#"(?m)\b(?:(?:Kernel|Process|IO|Open3)\.)?(?P<sink>system|exec|spawn|popen|capture2e|capture2|capture3|popen2e|popen2|popen3|pipeline_r|pipeline_rw|pipeline)\b(?:\s*\(\s*|\s+)(?:"[^"\n]*"|'[^'\n]*')"#,
+    )
+    .expect("ruby quoted exec sink regex compiles")
+});
+
 static JS_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
     // Any aliased/inline shell-exec sink called with a string literal:
     //   cp.execSync("rm -rf /etc") / exec('git reset --hard') / spawnSync("rm", ...
+    //   execFile("sh", ["-c", "rm -rf /etc"]) / fork("rm -rf /etc")
     // Anchored on the sink method name, NOT the receiver, so aliasing is moot.
+    // The destructive-payload search runs over the call's full balanced argument
+    // region (`exec_sink_arg_region` + `detect_destructive_in_args`), so a payload
+    // nested in the LIST arg of execFile/execFileSync/fork is caught even when the
+    // first literal (`"sh"`) is inert (#136). Longer names precede their prefixes
+    // (`execFileSync` before `execFile` before `exec`; `spawnSync` before `spawn`)
+    // so the alternation picks the full sink.
     Regex::new(
-        r#"(?m)\b(?P<sink>execSync|exec|spawnSync|spawn)\s*\(\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
+        r#"(?m)\b(?P<sink>execFileSync|execFile|execSync|exec|spawnSync|spawn|fork)\s*\(\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
     )
     .expect("js exec sink literal regex compiles")
 });
@@ -1549,10 +1662,30 @@ fn exec_sink_arg_region(code: &str, match_start: usize) -> &str {
 /// Callers MUST only invoke this once the surrounding call is confirmed to be a
 /// real exec sink, so inert literals (`print("rm -rf x")`) never reach here.
 fn detect_destructive_in_args(call_text: &str) -> Option<ShellPayloadHit> {
-    ANY_STRING_LITERAL
+    let literals: Vec<String> = ANY_STRING_LITERAL
         .captures_iter(call_text)
         .filter_map(|caps| string_literal_from_caps(&caps).map(str::to_string))
-        .find_map(|lit| detect_shell_payload(&lit))
+        .collect();
+
+    // 1) Each literal on its own (catches `subprocess.run(["sh","-c","rm -rf /etc"])`
+    //    where the destructive command lives in a single literal).
+    if let Some(hit) = literals.iter().find_map(|lit| detect_shell_payload(lit)) {
+        return Some(hit);
+    }
+
+    // 2) Argv-style reconstruction: a destructive command split across separate
+    //    literals (`spawnSync("rm", ["-rf", "/etc/x"])`, `exec.Command("rm","-rf","/x")`)
+    //    has no single literal that flags, so join every literal as one command
+    //    line and re-scan (#136). Safe because this runs ONLY after the call is
+    //    confirmed to be a real exec sink, so inert literals never reach here.
+    if literals.len() > 1 {
+        let joined = literals.join(" ");
+        if let Some(hit) = detect_shell_payload(&joined) {
+            return Some(hit);
+        }
+    }
+
+    None
 }
 
 fn push_perl_shell_payload_match(
