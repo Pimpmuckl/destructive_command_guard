@@ -878,6 +878,17 @@ function Copy-OrDownloadToFile {
   }
 }
 
+function Convert-ContentToText {
+  param($Content)
+  if ($Content -is [byte[]]) {
+    return [System.Text.Encoding]::UTF8.GetString($Content)
+  }
+  if (($Content -is [System.Array]) -and ($Content.Count -gt 0) -and ($Content[0] -is [byte])) {
+    return [System.Text.Encoding]::UTF8.GetString([byte[]]$Content)
+  }
+  [string]$Content
+}
+
 function Read-OrDownloadText {
   # Return the text content of a local/`file://` source, or fetch it over HTTP(S).
   param([string]$Source)
@@ -886,7 +897,7 @@ function Read-OrDownloadText {
     if (-not (Test-Path -LiteralPath $local -PathType Leaf)) { throw "Local source not found: $local" }
     return (Get-Content -LiteralPath $local -Raw)
   }
-  return (Invoke-WebRequest -Uri $Source -UseBasicParsing).Content
+  return (Convert-ContentToText -Content (Invoke-WebRequest -Uri $Source -UseBasicParsing).Content)
 }
 
 function Test-Sha256Token {

@@ -11,6 +11,18 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [v0.6.2](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.2) -- 2026-06-25 [Release]
+
+Patch release for the native-Windows installer.
+
+### Fixed
+
+- **Fix checksum resolution on Windows PowerShell 5.1.** GitHub release
+  sidecars such as `dcg-x86_64-pc-windows-msvc.zip.sha256` can be returned by
+  `Invoke-WebRequest` as `byte[]` when uploaded as octet-stream assets. The
+  installer now decodes byte-array checksum content as UTF-8 before parsing,
+  so the pinned one-liner verifies and installs the Windows zip correctly.
+
 ## [v0.6.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.1) -- 2026-06-25 [Release]
 
 Patch release candidate for the native-Windows launch, superseding the

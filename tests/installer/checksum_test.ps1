@@ -22,7 +22,12 @@ Check (-not (Test-Sha256Token ($HASH + "0"))) "rejects too-long (65)"
 Check (-not (Test-Sha256Token ($HASH.Substring(0,63) + "g"))) "rejects non-hex char"
 Check (-not (Test-Sha256Token "")) "rejects empty"
 
-Write-Host "Test 2: Get-SiblingUrl (http + file:// + local path)"
+Write-Host "Test 2: Convert-ContentToText decodes byte-array sidecars"
+$bytes = [System.Text.Encoding]::UTF8.GetBytes("$HASH  dcg-x86_64-pc-windows-msvc.zip`n")
+$decoded = (Convert-ContentToText -Content $bytes).Trim().Split(' ')[0]
+Check ($decoded -eq $HASH) "decodes GitHub release .sha256 byte[] content"
+
+Write-Host "Test 3: Get-SiblingUrl (http + file:// + local path)"
 Check ((Get-SiblingUrl -Url "https://h/a/b/dcg.zip" -Leaf "SHA256SUMS.txt") -eq "https://h/a/b/SHA256SUMS.txt") "http sibling"
 Check ((Get-SiblingUrl -Url "file:///x/y/dcg.zip" -Leaf "SHA256SUMS") -eq "file:///x/y/SHA256SUMS") "file:// sibling"
 Check ((Get-SiblingUrl -Url "/x/y/dcg.zip" -Leaf "S") -eq "/x/y/S") "local-path sibling"
@@ -33,12 +38,12 @@ try {
     $zip = Join-Path $tmp "dcg-x86_64-pc-windows-msvc.zip"
     Set-Content -LiteralPath $zip -Value "ZIP" -NoNewline
 
-    Write-Host "Test 3: per-file .sha256 is the primary path"
+    Write-Host "Test 4: per-file .sha256 is the primary path"
     Set-Content -LiteralPath "$zip.sha256" -Value "$HASH  dcg-x86_64-pc-windows-msvc.zip" -NoNewline
     Check ((Resolve-ChecksumToken -ArtifactUrl $zip -PerFileUrl "$zip.sha256") -eq $HASH) "resolves from per-file .sha256"
     Remove-Item -LiteralPath "$zip.sha256" -Force
 
-    Write-Host "Test 4: fallback to SHA256SUMS.txt, selecting the matching filename row"
+    Write-Host "Test 5: fallback to SHA256SUMS.txt, selecting the matching filename row"
     $manifest = @(
         "$OTHER  some-other-file.tar.xz",
         "$HASH *dcg-x86_64-pc-windows-msvc.zip",   # coreutils binary marker '*'
@@ -49,12 +54,12 @@ try {
     Check ((Resolve-ChecksumToken -ArtifactUrl $zip -PerFileUrl "$zip.sha256") -eq $HASH) "picks the matching row from SHA256SUMS.txt"
     Remove-Item -LiteralPath (Join-Path $tmp "SHA256SUMS.txt") -Force
 
-    Write-Host "Test 5: fallback to bare SHA256SUMS"
+    Write-Host "Test 6: fallback to bare SHA256SUMS"
     Set-Content -LiteralPath (Join-Path $tmp "SHA256SUMS") -Value "$HASH  dcg-x86_64-pc-windows-msvc.zip"
     Check ((Resolve-ChecksumToken -ArtifactUrl $zip -PerFileUrl "$zip.sha256") -eq $HASH) "picks row from bare SHA256SUMS"
     Remove-Item -LiteralPath (Join-Path $tmp "SHA256SUMS") -Force
 
-    Write-Host "Test 6: junk per-file content is rejected (no valid token -> throws)"
+    Write-Host "Test 7: junk per-file content is rejected (no valid token -> throws)"
     Set-Content -LiteralPath "$zip.sha256" -Value "not-a-real-hash" -NoNewline
     $threw = $false
     try { Resolve-ChecksumToken -ArtifactUrl $zip -PerFileUrl "$zip.sha256" | Out-Null } catch { $threw = $true }
