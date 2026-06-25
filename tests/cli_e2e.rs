@@ -19,7 +19,7 @@ fn dcg_binary() -> std::path::PathBuf {
     let mut path = std::env::current_exe().unwrap();
     path.pop(); // Remove test binary name
     path.pop(); // Remove deps/
-    path.push("dcg");
+    path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
     path
 }
 
@@ -90,6 +90,7 @@ fn run_dcg_hook_with_env(command: &str, extra_env: &[(&str, &std::ffi::OsStr)]) 
     let mut cmd = Command::new(dcg_binary());
     cmd.env_clear()
         .env("HOME", &home_dir)
+        .env("USERPROFILE", &home_dir)
         .env("XDG_CONFIG_HOME", &xdg_config_dir)
         .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
         .env("DCG_PACKS", "core.git,core.filesystem")
@@ -294,6 +295,7 @@ mod allow_once_management_tests {
             Command::new(dcg_binary())
                 .env_clear()
                 .env("HOME", &self.home_dir)
+                .env("USERPROFILE", &self.home_dir)
                 .env("XDG_CONFIG_HOME", &self.xdg_config_dir)
                 .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
                 .env("DCG_PENDING_EXCEPTIONS_PATH", &self.pending_path)
@@ -516,6 +518,7 @@ mod allow_once_flow_tests {
             let mut cmd = Command::new(dcg_binary());
             cmd.env_clear()
                 .env("HOME", &self.home_dir)
+                .env("USERPROFILE", &self.home_dir)
                 .env("XDG_CONFIG_HOME", &self.xdg_config_dir)
                 .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
                 .env("DCG_PACKS", "core.git,core.filesystem")
@@ -546,6 +549,7 @@ mod allow_once_flow_tests {
             Command::new(dcg_binary())
                 .env_clear()
                 .env("HOME", &self.home_dir)
+                .env("USERPROFILE", &self.home_dir)
                 .env("XDG_CONFIG_HOME", &self.xdg_config_dir)
                 .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
                 .env("DCG_PENDING_EXCEPTIONS_PATH", &self.pending_path)
@@ -570,6 +574,7 @@ mod allow_once_flow_tests {
             let mut cmd = Command::new(dcg_binary());
             cmd.env_clear()
                 .env("HOME", &self.home_dir)
+                .env("USERPROFILE", &self.home_dir)
                 .env("XDG_CONFIG_HOME", &self.xdg_config_dir)
                 .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
                 .env("DCG_PACKS", "core.git,core.filesystem")
@@ -826,6 +831,7 @@ block = [
         let mut cmd = Command::new(dcg_binary());
         cmd.env_clear()
             .env("HOME", &env.home_dir)
+            .env("USERPROFILE", &env.home_dir)
             .env("XDG_CONFIG_HOME", &env.xdg_config_dir)
             .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
             .env("DCG_PACKS", "core.git,core.filesystem")
@@ -851,6 +857,7 @@ block = [
         let allow_no_force = Command::new(dcg_binary())
             .env_clear()
             .env("HOME", &env.home_dir)
+            .env("USERPROFILE", &env.home_dir)
             .env("XDG_CONFIG_HOME", &env.xdg_config_dir)
             .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
             .env("DCG_PENDING_EXCEPTIONS_PATH", &env.pending_path)
@@ -1287,6 +1294,7 @@ mod config_tests {
         let output = Command::new(dcg_binary())
             .env_clear()
             .env("HOME", &home_dir)
+            .env("USERPROFILE", &home_dir)
             .env("XDG_CONFIG_HOME", &xdg_config_dir)
             .env("DCG_CONFIG", &cfg_path)
             .current_dir(temp.path())
@@ -1321,6 +1329,7 @@ mod config_tests {
         let output = Command::new(dcg_binary())
             .env_clear()
             .env("HOME", &home_dir)
+            .env("USERPROFILE", &home_dir)
             .env("XDG_CONFIG_HOME", &xdg_config_dir)
             .env("DCG_CONFIG", &missing)
             .current_dir(temp.path())
@@ -1350,6 +1359,7 @@ mod config_tests {
         let output = Command::new(dcg_binary())
             .env_clear()
             .env("HOME", &home_dir)
+            .env("USERPROFILE", &home_dir)
             .env("XDG_CONFIG_HOME", &xdg_config_dir)
             .env("PATH", &bin_dir)
             .env("NO_COLOR", "1")
@@ -1394,6 +1404,7 @@ mod config_tests {
         let output = Command::new(dcg_binary())
             .env_clear()
             .env("HOME", &home_dir)
+            .env("USERPROFILE", &home_dir)
             .env("XDG_CONFIG_HOME", &xdg_config_dir)
             .env("PATH", &bin_dir)
             .env("NO_COLOR", "1")
@@ -1446,6 +1457,7 @@ mod config_tests {
         let output = Command::new(dcg_binary())
             .env_clear()
             .env("HOME", &home_dir)
+            .env("USERPROFILE", &home_dir)
             .env("XDG_CONFIG_HOME", &xdg_config_dir)
             .env("PATH", &bin_dir)
             .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
@@ -1599,6 +1611,7 @@ mod hook_mode_tests {
         let mut cmd = Command::new(dcg_binary());
         cmd.env_clear()
             .env("HOME", &home_dir)
+            .env("USERPROFILE", &home_dir)
             .env("XDG_CONFIG_HOME", &xdg_config_dir)
             .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
             .env("DCG_PACKS", "core.git,core.filesystem")
@@ -3502,6 +3515,7 @@ custom_paths = ["{}"]
         let mut cmd = Command::new(dcg_binary());
         cmd.env_clear()
             .env("HOME", &home_dir)
+            .env("USERPROFILE", &home_dir)
             .env("XDG_CONFIG_HOME", &xdg_config_dir)
             .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
             .current_dir(temp.path())

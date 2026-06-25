@@ -4,7 +4,7 @@ fn dcg_binary() -> std::path::PathBuf {
     let mut path = std::env::current_exe().unwrap();
     path.pop(); // deps
     path.pop(); // debug
-    path.push("dcg");
+    path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
     path
 }
 
@@ -31,6 +31,7 @@ fn run_hook_with_allowlist(command: &str, allowlist_content: &str) -> String {
 
     let mut child = Command::new(dcg_binary())
         .env("HOME", &home_dir)
+        .env("USERPROFILE", &home_dir)
         .env("XDG_CONFIG_HOME", &xdg_config_dir)
         // Ensure system allowlist doesn't interfere
         .env("DCG_ALLOWLIST_SYSTEM_PATH", "/nonexistent")

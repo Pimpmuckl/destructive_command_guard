@@ -11,10 +11,34 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
-## [Unreleased] -- v0.5.7
+## [v0.6.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.0) -- 2026-06-24 [Release]
 
-Heredoc data-sink masking for `git` stdin targets, plus a soundness fix to
-heredoc target resolution.
+Native Windows support, PowerShell installer automation, Windows release
+artifacts, heredoc data-sink masking for `git` stdin targets, plus a soundness
+fix to heredoc target resolution.
+
+### Added
+
+- **Native-Windows destructive-command protection.** New `windows.filesystem`
+  and `windows.system` packs are **on by default on Windows** — blocking cmd
+  `del /s`, `rd /s`, `format <drive>:`, PowerShell `Remove-Item -Recurse -Force`
+  (and aliases), `Clear-Content`/`Clear-RecycleBin`, plus `vssadmin delete
+  shadows` / `wmic shadowcopy delete` (Volume Shadow Copy destruction),
+  `diskpart`, `Format-Volume`, `Clear-Disk`, `cipher /w`, and `bcdedit /delete`.
+  Opt-in `windows.misc` (`reg delete`, `net user /delete`, `wsl --unregister`,
+  `robocopy /MIR`) and `windows.powershell` (registry/provider deletes,
+  `Remove-LocalUser`, `Disable-ComputerRestore`, `Remove-VM`, …) packs round out
+  coverage. All patterns are case-insensitive.
+- **Windows-aware engine + scan.** Command normalization handles drive-letter
+  paths (`C:\Windows\System32\del.exe`) and case-insensitive verbs; `dcg scan`
+  now extracts commands from PowerShell (`.ps1`/`.psm1`/`.psd1`) and batch
+  (`.cmd`/`.bat`) scripts.
+- **Windows install one-liner + docs.** README gains the PowerShell
+  `& ([scriptblock]::Create((irm ".../install.ps1"))) -EasyMode -Verify`
+  installer; new [`docs/windows.md`](docs/windows.md) documents Windows behavior,
+  paths (`%ProgramData%\dcg` system layer), and limitations.
+- **Windows CI.** A `check (windows)` job (clippy + full test suite on
+  `windows-latest`, nightly/MSVC) now guards against Windows regressions.
 
 ### Fixed
 

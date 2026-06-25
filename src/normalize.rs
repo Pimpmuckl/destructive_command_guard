@@ -925,10 +925,16 @@ pub static PATH_NORMALIZER: LazyLock<Regex> = LazyLock::new(|| {
         // Uses [^\s]* to match path segments (note: won't handle spaces in paths)
         r"[A-Za-z]:[/\\](?:[^\s/\\]*[/\\])*",
         r")",
-        // Capture the binary name
-        r"(rm|git|find|unlink|truncate|shred|tar|dd|mv)",
-        // Optional .exe extension for Windows
-        r"(?:\.exe)?",
+        // Capture the binary name. Unix verbs stay case-SENSITIVE; the Windows
+        // destructive system exes are matched case-INSENSITIVELY (Windows paths
+        // and executable names are case-insensitive), so e.g.
+        // `C:\Windows\System32\DiskPart.EXE` normalizes to `DiskPart`, which the
+        // windows.* pack patterns then match via their own inline `(?i)` flag.
+        // Only path-qualifiable real exes are listed here; cmd builtins
+        // (del/rd/rmdir/erase) and PowerShell cmdlets are never path-prefixed.
+        r"(rm|git|find|unlink|truncate|shred|tar|dd|mv|(?i:format|diskpart|vssadmin|reg|net|robocopy|cipher|takeown|icacls|fsutil|bcdedit|wmic|schtasks|sc|wsl))",
+        // Optional .exe/.com extension (case-insensitive for Windows)
+        r"(?i:\.exe|\.com)?",
         // Must be followed by whitespace or end
         r"(?=\s|$)"
     ))
@@ -951,7 +957,7 @@ pub static QUOTED_PATH_NORMALIZER: LazyLock<Regex> = LazyLock::new(|| {
     // Matches quoted paths like "C:/Program Files/Git/bin/git.exe" or "/usr/bin/git"
     // Note: Uses [^"]+ to match path content (may include spaces)
     Regex::new(
-        r#"^"(?:[^"]+/|[A-Za-z]:[^"]+[/\\])(rm|git|find|unlink|truncate|shred|tar|dd|mv)(?:\.exe)?""#,
+        r#"^"(?:[^"]+/|[A-Za-z]:[^"]+[/\\])(rm|git|find|unlink|truncate|shred|tar|dd|mv|(?i:format|diskpart|vssadmin|reg|net|robocopy|cipher|takeown|icacls|fsutil|bcdedit|wmic|schtasks|sc|wsl))(?i:\.exe|\.com)?""#,
     )
     .unwrap()
 });
@@ -1301,10 +1307,21 @@ pub fn normalize_command_word_token(token: &str) -> Option<String> {
         }
     }
 
+    // Windows drive-letter paths (e.g. `C:\Windows\System32\diskpart.exe`) use the
+    // backslash as a PATH SEPARATOR, not a bash escape. Stripping it would mangle
+    // the path (`C:\Windows` -> `CWindows`) and defeat path normalization, so skip
+    // the internal-backslash-escape removal for such tokens. The `X:\`/`X:/`
+    // drive-letter form is unambiguous and does not occur in legitimate Unix
+    // shell command words.
+    let is_windows_drive_path = {
+        let b = out.as_bytes();
+        b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/')
+    };
+
     // Strip internal backslash escapes before regular ASCII letters.
     // In bash, `g\it` is equivalent to `git` because backslash makes the next char literal.
     // We only strip backslashes before alphanumeric chars to avoid breaking special escapes.
-    if out.contains('\\') {
+    if !is_windows_drive_path && out.contains('\\') {
         let mut result = String::with_capacity(out.len());
         let mut chars = out.chars().peekable();
         let mut local_changed = false;
@@ -2107,6 +2124,42 @@ mod windows_exe_tests {
         let result = normalize_command(r"\git.exe reset --hard");
         eprintln!("Normalized result: {:?}", result.as_ref());
         assert_eq!(result.as_ref(), "git reset --hard");
+    }
+
+    #[test]
+    fn test_windows_destructive_exe_path_normalization() {
+        // Path-qualified Windows system exes normalize to the bare verb so the
+        // windows.* pack patterns (which match the bare verb) fire. The exe name
+        // and the `.exe`/`.com` suffix are matched case-insensitively; path-like
+        // ARGUMENTS must be preserved (only the leading binary path is stripped).
+        let cases = [
+            (r"C:\Windows\System32\diskpart.exe", "diskpart"),
+            (r"C:\Windows\System32\DiskPart.EXE", "DiskPart"),
+            (
+                r"C:/Windows/System32/vssadmin.exe delete shadows /all",
+                "vssadmin delete shadows /all",
+            ),
+            (
+                r"C:\Windows\System32\reg.exe delete HKLM\Foo /f",
+                r"reg delete HKLM\Foo /f",
+            ),
+            (
+                r"C:\Windows\System32\robocopy.EXE src dst /MIR",
+                "robocopy src dst /MIR",
+            ),
+        ];
+        for (input, expected) in cases {
+            let got = normalize_command(input);
+            assert_eq!(got.as_ref(), expected, "normalize({input:?})");
+        }
+
+        // A path-like ARGUMENT (not the leading binary) must NOT be stripped.
+        let arg = normalize_command(r"reg delete C:\Windows\System32\config");
+        assert_eq!(arg.as_ref(), r"reg delete C:\Windows\System32\config");
+
+        // Unix verbs are unaffected and stay case-sensitive.
+        let unix = normalize_command("/usr/bin/git status");
+        assert_eq!(unix.as_ref(), "git status");
     }
 }
 
