@@ -1,7 +1,7 @@
 //! Subprocess integration tests for Codex CLI hook protocol.
 //!
 //! Verifies that the real dcg binary, spawned as a child process, correctly
-//! handles current Codex payloads (exit 0 + minimal stdout JSON deny) and
+//! handles current Codex payloads (exit 0 + minimal stdout JSON ask) and
 //! Claude Code payloads (exit 0 + extended stdout JSON deny).
 //!
 //! Each test is hermetic: isolated HOME, isolated TMPDIR, no shared state.
@@ -42,7 +42,7 @@ impl HookOutcome {
         self.stderr_str().contains(needle)
     }
 
-    /// Codex block shape: exit 0, a minimal documented JSON deny, and stderr.
+    /// Codex ask shape: exit 0, a minimal JSON ask, and stderr.
     pub fn is_codex_block_shape(&self) -> bool {
         if self.exit_code != 0 || self.stdout.is_empty() || self.stderr.is_empty() {
             return false;
@@ -70,7 +70,7 @@ impl HookOutcome {
             && specific
                 .get("permissionDecision")
                 .and_then(serde_json::Value::as_str)
-                == Some("deny")
+                == Some("ask")
             && specific
                 .get("permissionDecisionReason")
                 .and_then(serde_json::Value::as_str)
@@ -390,7 +390,7 @@ fn smoke_codex_destructive_command_blocked() {
     let outcome = run_codex_hook("git reset --hard HEAD~1");
     assert!(
         outcome.is_codex_block_shape(),
-        "destructive command via Codex should produce exit 0 + minimal deny JSON + non-empty stderr\n{outcome}"
+        "destructive command via Codex should produce exit 0 + minimal ask JSON + non-empty stderr\n{outcome}"
     );
 }
 
@@ -418,7 +418,7 @@ fn codex_powershell_wrapped_destructive_command_blocked() {
     let outcome = run_codex_hook("powershell.exe -Command 'git reset --hard HEAD~1'");
     assert!(
         outcome.is_codex_block_shape(),
-        "PowerShell-wrapped destructive command via Codex must produce a minimal deny JSON\n{outcome}"
+        "PowerShell-wrapped destructive command via Codex must produce a minimal ask JSON\n{outcome}"
     );
 
     // Quoted full-path host (the literal Codex Windows command_execution shape).
@@ -1382,7 +1382,7 @@ fn cross_protocol_deny_structural_parity() {
     let codex = run_codex_hook(cmd);
     let claude = run_claude_hook(cmd);
 
-    // Both block the command
+    // Codex asks for approval while Claude blocks the command.
     assert!(
         codex.is_codex_block_shape(),
         "Codex block shape expected\n{codex}"
@@ -1397,7 +1397,7 @@ fn cross_protocol_deny_structural_parity() {
     let codex_json = codex.stdout_json();
     assert_eq!(
         codex_json["hookSpecificOutput"]["permissionDecision"],
-        "deny"
+        "ask"
     );
 
     // Claude: exit 0, JSON stdout
@@ -2332,7 +2332,7 @@ fn codex_deny_with_history_disabled_still_emits_json() {
     assert!(
         serde_json::from_slice::<serde_json::Value>(&output.stdout)
             .ok()
-            .is_some_and(|json| json["hookSpecificOutput"]["permissionDecision"] == "deny"),
+            .is_some_and(|json| json["hookSpecificOutput"]["permissionDecision"] == "ask"),
         "Codex deny must produce minimal JSON with history disabled"
     );
     assert!(
@@ -2403,7 +2403,7 @@ fn codex_rapid_fire_denies_all_persist_to_history() {
         assert!(
             serde_json::from_slice::<serde_json::Value>(&output.stdout)
                 .ok()
-                .is_some_and(|json| { json["hookSpecificOutput"]["permissionDecision"] == "deny" }),
+                .is_some_and(|json| { json["hookSpecificOutput"]["permissionDecision"] == "ask" }),
             "Codex deny must emit minimal JSON for '{cmd}'"
         );
     }
@@ -2482,7 +2482,7 @@ fn codex_deny_history_write_protected_dir_no_panic() {
     assert!(
         serde_json::from_slice::<serde_json::Value>(&output.stdout)
             .ok()
-            .is_some_and(|json| json["hookSpecificOutput"]["permissionDecision"] == "deny"),
+            .is_some_and(|json| json["hookSpecificOutput"]["permissionDecision"] == "ask"),
         "Codex deny JSON must survive history DB failure"
     );
     assert!(

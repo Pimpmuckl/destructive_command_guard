@@ -953,9 +953,9 @@ fn main() {
                 let _ = hook::log_blocked_command(log_file, &command, &info.reason, pack);
             }
 
-            // All deny protocols, including current Codex, return normally so
-            // buffered history is flushed by `HistoryWriter::Drop`. Codex gets
-            // a minimal stdout JSON denial from `output_denial_for_protocol`.
+            // All deny protocols, including Codex, return normally so buffered
+            // history is flushed by `HistoryWriter::Drop`. Codex gets a minimal
+            // stdout JSON ask from `output_denial_for_protocol`.
         }
         DecisionMode::Warn => {
             hook::output_warning_for_protocol(

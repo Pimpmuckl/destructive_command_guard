@@ -109,7 +109,7 @@ pub struct HookSpecificOutput<'a> {
     #[serde(rename = "hookEventName")]
     pub hook_event_name: &'static str,
 
-    /// The permission decision: "allow" or "deny".
+    /// The permission decision: "allow", "deny", or "ask".
     #[serde(rename = "permissionDecision")]
     pub permission_decision: &'static str,
 
@@ -1213,14 +1213,14 @@ pub fn write_denial_to(
             let _ = writeln!(stdout);
         }
         HookProtocol::Codex => {
-            // Codex 0.144.x: emit only the documented PreToolUse fields.
+            // Codex: emit only the documented PreToolUse fields.
             // Extra dcg metadata is intentionally omitted because Codex's
             // parser is stricter than Claude's.  Exit remains 0; some current
             // Codex builds classify exit 2 as hook failure and then fail open.
             let output = HookOutput {
                 hook_specific_output: HookSpecificOutput {
                     hook_event_name: "PreToolUse",
-                    permission_decision: "deny",
+                    permission_decision: "ask",
                     permission_decision_reason: Cow::Owned(message),
                     allow_once_code: None,
                     allow_once_full_hash: None,
@@ -2911,7 +2911,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_denial_codex_produces_minimal_json_stdout() {
+    fn test_write_denial_codex_produces_minimal_ask_json_stdout() {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let allow = test_allow_once();
@@ -2934,10 +2934,10 @@ mod tests {
         );
 
         let json: serde_json::Value = serde_json::from_slice(&stdout)
-            .unwrap_or_else(|error| panic!("Codex deny stdout must be JSON: {error}"));
+            .unwrap_or_else(|error| panic!("Codex ask stdout must be JSON: {error}"));
         let specific = &json["hookSpecificOutput"];
         assert_eq!(specific["hookEventName"], "PreToolUse");
-        assert_eq!(specific["permissionDecision"], "deny");
+        assert_eq!(specific["permissionDecision"], "ask");
         assert!(
             specific["permissionDecisionReason"]
                 .as_str()
@@ -2950,7 +2950,7 @@ mod tests {
         );
         assert!(
             !stderr.is_empty(),
-            "Codex deny must produce non-empty stderr"
+            "Codex ask must produce non-empty stderr"
         );
         let stderr_str = String::from_utf8_lossy(&stderr);
         assert!(
