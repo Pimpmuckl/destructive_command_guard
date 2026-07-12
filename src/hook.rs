@@ -63,6 +63,10 @@ pub struct HookInput {
     #[serde(alias = "turnId")]
     pub turn_id: Option<String>,
 
+    /// Codex++ capability marker for Guardian-backed `ask` decisions.
+    #[serde(default)]
+    pub permission_decision_ask_supported: bool,
+
     /// Antigravity CLI (`agy`) tool-call envelope. Unlike Claude/Gemini/Grok,
     /// `agy` nests the tool name and arguments under a `toolCall` object:
     /// `{"toolCall": {"name": "run_command", "args": {"CommandLine": "...",
@@ -338,6 +342,9 @@ pub enum HookProtocol {
     /// dcg-specific ergonomics fields while also avoiding the legacy exit-2
     /// path that Codex 0.144.x can classify as a failed hook and fail open.
     Codex,
+    /// Codex++ protocol with Guardian-backed `ask` support advertised by the
+    /// input payload.
+    CodexAsk,
     /// Hermes Agent (NousResearch) protocol. Wire shape: stdin carries
     /// snake_case `hook_event_name: "pre_tool_call"`, `tool_name: "terminal"`,
     /// `tool_input.command`. Block decision MUST be expressed via stdout JSON
@@ -582,7 +589,7 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
         .as_deref()
         .is_some_and(|s| !s.trim().is_empty());
     if is_claude_compatible_shell_tool && has_codex_turn_id {
-        return HookProtocol::Codex;
+        return codex_protocol(input);
     }
 
     // PowerShell tool names ("powershell"/"pwsh") are only ever emitted by
@@ -598,7 +605,7 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
     // legitimately uses those names.)
     let is_powershell_tool = matches!(tool_name.as_str(), "powershell" | "pwsh");
     if is_powershell_tool {
-        return HookProtocol::Codex;
+        return codex_protocol(input);
     }
 
     // --- Claude-compatible indicators ---
@@ -660,6 +667,14 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
 
     // --- Default: Claude Code compatible (safest default) ---
     HookProtocol::ClaudeCompatible
+}
+
+fn codex_protocol(input: &HookInput) -> HookProtocol {
+    if input.permission_decision_ask_supported {
+        HookProtocol::CodexAsk
+    } else {
+        HookProtocol::Codex
+    }
 }
 
 /// Return whether `tool_name` is a VS Code Copilot Chat terminal tool.
@@ -1157,7 +1172,7 @@ pub fn write_denial_to(
 ) {
     let allow_once_code = allow_once.map(|info| info.code.as_str());
     let warning_audience = match protocol {
-        HookProtocol::Codex => WarningAudience::CodexModel,
+        HookProtocol::Codex | HookProtocol::CodexAsk => WarningAudience::CodexModel,
         HookProtocol::ClaudeCompatible
         | HookProtocol::Copilot
         | HookProtocol::Gemini
@@ -1212,7 +1227,7 @@ pub fn write_denial_to(
             let _ = serde_json::to_writer(&mut *stdout, &output);
             let _ = writeln!(stdout);
         }
-        HookProtocol::Codex => {
+        protocol @ (HookProtocol::Codex | HookProtocol::CodexAsk) => {
             // Codex: emit only the documented PreToolUse fields.
             // Extra dcg metadata is intentionally omitted because Codex's
             // parser is stricter than Claude's.  Exit remains 0; some current
@@ -1220,7 +1235,11 @@ pub fn write_denial_to(
             let output = HookOutput {
                 hook_specific_output: HookSpecificOutput {
                     hook_event_name: "PreToolUse",
-                    permission_decision: "ask",
+                    permission_decision: if matches!(protocol, HookProtocol::CodexAsk) {
+                        "ask"
+                    } else {
+                        "deny"
+                    },
                     permission_decision_reason: Cow::Owned(message),
                     allow_once_code: None,
                     allow_once_full_hash: None,
@@ -1498,7 +1517,7 @@ pub(crate) fn write_warning_to(
             let _ = serde_json::to_writer(&mut *stdout, &output);
             let _ = writeln!(stdout);
         }
-        HookProtocol::Codex => {
+        HookProtocol::Codex | HookProtocol::CodexAsk => {
             // Codex: stderr warning already written above; no stdout JSON.
         }
         HookProtocol::Hermes => {
@@ -1774,6 +1793,21 @@ mod tests {
             extract_command(&input),
             Some("git reset --hard".to_string())
         );
+    }
+
+    #[test]
+    fn test_codex_ask_capability_is_explicit() {
+        let marked: HookInput = serde_json::from_str(
+            r#"{"tool_name":"Bash","tool_input":{"command":"git status"},"turn_id":"turn-1","permission_decision_ask_supported":true}"#,
+        )
+        .unwrap();
+        let false_marker: HookInput = serde_json::from_str(
+            r#"{"tool_name":"Bash","tool_input":{"command":"git status"},"turn_id":"turn-1","permission_decision_ask_supported":false}"#,
+        )
+        .unwrap();
+
+        assert_eq!(detect_protocol(&marked), HookProtocol::CodexAsk);
+        assert_eq!(detect_protocol(&false_marker), HookProtocol::Codex);
     }
 
     #[test]
@@ -2911,7 +2945,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_denial_codex_produces_minimal_ask_json_stdout() {
+    fn test_write_denial_codex_selects_minimal_decision_json_stdout() {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let allow = test_allow_once();
@@ -2919,7 +2953,7 @@ mod tests {
         write_denial_to(
             &mut stdout,
             &mut stderr,
-            HookProtocol::Codex,
+            HookProtocol::CodexAsk,
             "git reset --hard HEAD~1",
             "destroys uncommitted changes",
             Some("core.git"),

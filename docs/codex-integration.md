@@ -36,14 +36,14 @@ Coverage lives in two layers:
   allowlists, allow-once codes, pack enablement, history writes, and heredoc
   behavior.
 
-## Deny Contract
+## Decision Contract
 
 Claude-compatible hooks receive a structured JSON denial on stdout. That JSON
 contains fields dcg users and agents rely on, including `hookSpecificOutput`,
 `ruleId`, `packId`, `severity`, `confidence`, `allowOnceCode`, and
 `remediation`.
 
-Codex's hook output parser is stricter. The Codex deny parser can reject unknown
+Codex's hook output parser is stricter. The parser can reject unknown
 fields, so sending dcg's extended Claude-compatible payload can turn a policy
 decision into a `PreToolUse Failed` event instead of a blocked command. dcg
 therefore emits only Codex's documented fields:
@@ -57,6 +57,12 @@ therefore emits only Codex's documented fields:
   }
 }
 ```
+
+The same dcg binary supports both Codex variants. Codex++ adds
+`"permission_decision_ask_supported": true` to each `PreToolUse` input, so dcg
+returns `"ask"` and Guardian can review it. When the marker is absent or false,
+dcg returns the upstream-supported `"deny"` shown above. No version or executable
+sniffing is involved.
 
 The process exits 0. stderr still contains the human-readable warning for an
 operator, but Codex's blocking decision comes from the JSON on stdout. This is
@@ -78,7 +84,7 @@ The exit-code split is intentional:
 |------|--------|--------|------|
 | Allow under any protocol | empty | empty | 0 |
 | Claude-compatible deny | JSON denial | warning text | 0 |
-| Codex deny | minimal JSON denial | warning text | 0 |
+| Codex destructive command | minimal JSON `deny` or advertised `ask` | warning text | 0 |
 | Parse/config/runtime error | optional error output | error details | 1 or 2 |
 
 For Codex hook integrations, parse the minimal stdout JSON. Empty stdout with
@@ -103,6 +109,9 @@ Expected result:
 - exit code is 0;
 - stdout contains a three-field `hookSpecificOutput` denial;
 - stderr is non-empty and mentions the blocked command plus the matching rule.
+
+Add `"permission_decision_ask_supported":true` to the probe payload to verify
+the Codex++ path; the same minimal response then contains `"ask"`.
 
 For a Claude-compatible negative control, remove `turn_id` from the same payload.
 The denial should return exit code 0 with a JSON object on stdout.
