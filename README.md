@@ -15,8 +15,59 @@ A high-performance hook for AI coding agents that blocks destructive commands be
 
 **Supported:** [Claude Code](https://claude.ai/code), [Codex CLI 0.125.0+](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [GitHub Copilot CLI](https://docs.github.com/en/copilot/concepts/agents/coding-agent/about-hooks), [VS Code Copilot Chat](https://code.visualstudio.com/docs/agent-customization/hooks), [Cursor IDE](https://cursor.com), [Hermes Agent](https://github.com/NousResearch/hermes-agent), [Grok (xAI)](https://x.ai/news/grok-build-cli) (native `~/.grok/hooks/` plus Claude compatibility layer), [Antigravity CLI (`agy`)](https://antigravity.google) (native `~/.gemini/config/hooks.json` via `dcg install --agy`), [OpenCode](https://opencode.ai) (via [community plugin](https://github.com/aspiers/ai-config/blob/main/.config/opencode/plugins/dcg-guard.js)), [Pi](https://github.com/earendil-works/pi) (via [extension recipe](docs/pi-integration.md)), [Aider](https://aider.chat/) (limited—git hooks only), [Continue](https://continue.dev) (detection only)
 
+## This fork: ask before destructive Codex commands
+
+This fork changes only the Codex hook response: destructive commands return
+`permissionDecision: "ask"` instead of `"deny"`. Other agent protocols keep
+their upstream behavior.
+
+Build the fork with Rust nightly:
+
+```bash
+git clone https://github.com/Pimpmuckl/destructive_command_guard_ask.git
+cd destructive_command_guard_ask
+cargo build --release
+```
+
+Then merge this entry into `~/.codex/hooks.json`, preserving any existing hooks.
+Use the absolute path to the binary you just built; JSON paths on Windows need
+escaped backslashes.
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "C:\\Code\\destructive_command_guard_ask\\target\\release\\dcg.exe"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+On Linux or macOS, use the absolute path ending in
+`/destructive_command_guard_ask/target/release/dcg` instead. Restart Codex,
+open `/hooks`, and trust the hook once.
+
+To let the Codex fork's Guardian resolve `ask` decisions automatically, add this
+top-level setting to `~/.codex/config.toml`:
+
+```toml
+approvals_reviewer = "auto_review"
+```
+
+Without automatic review, Codex stops safely and reports that Guardian review
+is required. The upstream installers below download upstream release binaries,
+so they do not install this fork's `ask` behavior.
+
 <div align="center">
-<h3>Quick Install</h3>
+<h3>Upstream quick install (<code>deny</code> behavior)</h3>
 
 ```bash
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --easy-mode
@@ -52,7 +103,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_comm
 | **Smart Context Detection** | Won't block `grep "rm -rf"` (data) but will block `rm -rf /` (execution) |
 | **Rich Terminal Output** | Human-readable denial panels, rule context, and suggestions on stderr |
 | **Agent-Safe Streams** | Machine-readable hook output stays on stdout while rich UI stays on stderr |
-| **Native Codex Support** | Codex CLI 0.125.0+ receives a minimal stdout JSON denial that current clients enforce reliably |
+| **Native Codex Support** | Codex CLI 0.125.0+ receives a minimal stdout JSON decision; this fork requests Guardian review with `ask` |
 | **Graceful Degradation** | Plain output for CI, pipes, dumb terminals, and no-color environments |
 | **Scan Mode for CI** | Pre-commit hooks and CI integration to catch dangerous commands in code review |
 | **Fail-Open Design** | Never blocks your workflow due to timeouts or parse errors |
@@ -136,15 +187,15 @@ when it detects `codex` on `PATH` or an existing `~/.codex/` directory.
 | Codex behavior | dcg handling |
 |----------------|--------------|
 | Hook config | Merges a `PreToolUse` Bash hook into `~/.codex/hooks.json` |
-| Denied command | Exits 0 with a minimal `hookSpecificOutput` denial on stdout; human warning stays on stderr |
+| Destructive command | Exits 0 with a minimal `hookSpecificOutput` `ask` decision on stdout; human warning stays on stderr |
 | Allowed command | Exits 0 with empty stdout and stderr |
 | Existing hooks | Preserves coexisting hooks, keeps dcg first for Bash, and refuses to overwrite malformed JSON |
 | Validation | Covered by subprocess protocol tests plus an opt-in real Codex E2E harness |
 
 Codex's hook input is intentionally close to Claude Code's, but Codex rejects
 unknown fields in hook output. dcg detects Codex payloads from the non-empty
-`turn_id` field and emits only Codex's documented denial fields so a blocked
-command is reported as blocked rather than as a failed hook. See
+`turn_id` field and emits only Codex's documented decision fields so a
+destructive command is sent to Guardian rather than reported as a failed hook. See
 [docs/codex-integration.md](docs/codex-integration.md) for protocol details,
 manual probes, and troubleshooting.
 
@@ -819,7 +870,7 @@ no prebuilt is available and removes the legacy Python predecessor
 
 - **Aider:** No PreToolUse-style interception. The installer enables `git-commit-verify: true` in `~/.aider.conf.yml` so git hooks run. For full protection, install dcg as a [git pre-commit hook](docs/scan-precommit-guide.md).
 - **Continue:** No shell command interception hooks. The installer detects Continue but cannot auto-configure protection. Use a [git pre-commit hook](docs/scan-precommit-guide.md) instead.
-- **Codex CLI:** PreToolUse hooks via `~/.codex/hooks.json` (stable in Codex 0.125.0+; the `codex_hooks` feature is on by default). dcg detects Codex from the `turn_id` stdin field and emits the minimal documented `hookSpecificOutput` deny JSON with exit code 0; dcg-only metadata is omitted so Codex's strict parser accepts the decision. The Unix installer and `install.ps1` both merge dcg's hook into the existing hooks object, detect an already-current dcg hook exactly, leave invalid JSON or malformed hook shapes untouched, and surface the failure reason in the install summary. After installation, open Codex's `/hooks` UI once to trust the hook. `uninstall.sh` and `uninstall.ps1` remove only dcg-owned Codex hooks and preserve coexisting entries. See the [Codex integration notes](docs/codex-integration.md). Caveats: the model can still write scripts to disk to bypass hook-based blocking; and Codex's `PreToolUse` hooks [do not yet intercept every `unified_exec` shell path](docs/codex-integration.md#known-limitation-codex-unified_exec-path-windows-desktop--cli), so treat it as a guardrail rather than a complete enforcement boundary.
+- **Codex CLI:** PreToolUse hooks via `~/.codex/hooks.json` (stable in Codex 0.125.0+; the `codex_hooks` feature is on by default). dcg detects Codex from the `turn_id` stdin field and emits the minimal documented `hookSpecificOutput` JSON with exit code 0; this fork returns `ask` for destructive commands so the Codex fork can route them to Guardian. dcg-only metadata is omitted so Codex's strict parser accepts the decision. After installation, open Codex's `/hooks` UI once to trust the hook. Caveats: the model can still write scripts to disk to bypass hook-based blocking; and Codex's `PreToolUse` hooks [do not yet intercept every `unified_exec` shell path](docs/codex-integration.md#known-limitation-codex-unified_exec-path-windows-desktop--cli), so treat it as a guardrail rather than a complete enforcement boundary.
 - **GitHub Copilot CLI:** The installer writes a user-level hook to `${COPILOT_HOME:-~/.copilot}/hooks/dcg.json`, protecting every workspace. The generated `preToolUse` hook covers both Unix `bash` and Windows `powershell` payloads and emits Copilot's exact top-level permission-decision JSON.
 - **VS Code Copilot Chat:** Current VS Code releases load `~/.claude/settings.json` by default, so the Claude Code hook installed by dcg also protects Copilot Chat without a second bridge or duplicate hook. dcg recognizes VS Code's documented `runTerminalCommand` shell tool plus the observed compatibility names `run_in_terminal` and `runInTerminal`, reads `tool_input.command`, and returns VS Code's documented `hookSpecificOutput` deny. Agent hooks are still a VS Code preview feature and can be disabled by organization policy; use **Developer: Show Agent Debug Logs** or the **GitHub Copilot Chat Hooks** output channel to confirm that the hook loaded.
 - **Cursor IDE:** Hooks are configured through `~/.cursor/hooks.json` plus a generated bridge (`dcg-pre-shell.ps1` on Windows). The installer inserts dcg first in `beforeShellExecution`, collapses duplicate dcg entries, and preserves coexisting Cursor hooks.
@@ -978,9 +1029,10 @@ merges this automatically, but the manual configuration lives at
 }
 ```
 
-Codex denials intentionally omit dcg's extended Claude-only fields: dcg exits 0
-with the minimal documented `hookSpecificOutput` JSON on stdout. Allowed
-commands stay silent with exit code 0.
+Codex decisions intentionally omit dcg's extended Claude-only fields: dcg exits
+0 with the minimal documented `hookSpecificOutput` JSON on stdout. This fork
+returns `ask` for destructive commands; allowed commands stay silent with exit
+code 0.
 
 ## Gemini CLI Configuration
 
@@ -1579,9 +1631,9 @@ Your AI agent invokes dcg as a PreToolUse hook before executing each shell comma
 4. **Pattern Matching** -- Safe patterns checked first (match = allow). Destructive patterns checked second (match = deny with explanation). No match on either = allow.
 
 If blocked under a Claude-compatible JSON hook protocol, dcg outputs a JSON
-denial on stdout and a colorful human-readable warning on stderr. If blocked
-under Codex CLI, dcg follows Codex's strict hook contract with minimal stdout
-JSON and exit code 0. If
+denial on stdout and a colorful human-readable warning on stderr. For Codex
+CLI, this fork follows Codex's strict hook contract with a minimal `ask` JSON
+decision and exit code 0. If
 allowed, dcg exits silently. Rich formatting is automatically disabled for CI,
 non-TTY output, dumb terminals, and no-color environments.
 
@@ -1618,8 +1670,8 @@ non-TTY output, dumb terminals, and no-color environments.
 │                                                                  │
 └─────────────────────┬───────────────────────────────────────────┘
                       │
-                      ▼ stdout: JSON deny / empty allow
-                        stderr: rich human output / Codex deny reason
+                      ▼ stdout: JSON decision / empty allow
+                        stderr: rich human output / Codex decision reason
 ┌─────────────────────────────────────────────────────────────────┐
 │   Claude / Codex / Gemini / Copilot / Cursor / Hermes hooks      │
 │                                                                  │
@@ -2147,7 +2199,7 @@ high-signal formatting.
 | Hermes block | Hermes Agent shell hook (`pre_tool_call`) | `{"decision":"block","reason":...,"action":"block","message":...}` | Rich or plain warning |
 | Grok deny | Grok (xAI) PreToolUse hook (`pre_tool_use` event, `run_terminal_cmd` tool) | `{"decision":"deny","reason":...}` (exit 0) | Rich or plain warning |
 | Antigravity block | Antigravity CLI (`agy`) PreToolUse hook (`toolCall.name: "run_command"`) | `{"decision":"block","reason":...}` (exit 0) | Rich or plain warning |
-| Codex deny | Codex CLI 0.144.x hook input | Minimal `hookSpecificOutput` deny JSON | Deny reason with command, rule, and remediation |
+| Codex ask | Codex CLI 0.144.x hook input | Minimal `hookSpecificOutput` ask JSON | Decision reason with command, rule, and remediation |
 | Robot mode | `--robot` or `DCG_ROBOT=1` | JSON | Silent |
 | Plain fallback | `DCG_NO_RICH=1`, `NO_COLOR=1`, `DCG_NO_COLOR=1`, `TERM=dumb`, `CI=1`, non-TTY output, or `--legacy-output` | Mode-specific data | Plain text only |
 
