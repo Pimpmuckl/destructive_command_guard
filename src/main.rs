@@ -132,7 +132,7 @@ fn build_history_entry(
 
 fn history_agent_type_for_protocol(protocol: hook::HookProtocol, detected_agent: &Agent) -> &str {
     match protocol {
-        hook::HookProtocol::Codex => Agent::CodexCli.config_key(),
+        hook::HookProtocol::Codex | hook::HookProtocol::CodexAsk => Agent::CodexCli.config_key(),
         hook::HookProtocol::Gemini => Agent::GeminiCli.config_key(),
         hook::HookProtocol::Copilot => Agent::CopilotCli.config_key(),
         hook::HookProtocol::Hermes => Agent::Hermes.config_key(),
@@ -147,7 +147,7 @@ fn effective_agent_for_hook_protocol(
     detected_agent: &Agent,
 ) -> Agent {
     match protocol {
-        hook::HookProtocol::Codex => Agent::CodexCli,
+        hook::HookProtocol::Codex | hook::HookProtocol::CodexAsk => Agent::CodexCli,
         hook::HookProtocol::Gemini => Agent::GeminiCli,
         hook::HookProtocol::Copilot => Agent::CopilotCli,
         hook::HookProtocol::Hermes => Agent::Hermes,

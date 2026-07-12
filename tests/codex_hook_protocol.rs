@@ -1,7 +1,7 @@
 //! Subprocess integration tests for Codex CLI hook protocol.
 //!
 //! Verifies that the real dcg binary, spawned as a child process, correctly
-//! handles current Codex payloads (exit 0 + minimal stdout JSON ask) and
+//! handles Codex++ payloads (exit 0 + minimal stdout JSON ask) and
 //! Claude Code payloads (exit 0 + extended stdout JSON deny).
 //!
 //! Each test is hermetic: isolated HOME, isolated TMPDIR, no shared state.
@@ -42,7 +42,7 @@ impl HookOutcome {
         self.stderr_str().contains(needle)
     }
 
-    /// Codex ask shape: exit 0, a minimal JSON ask, and stderr.
+    /// Codex block shape: exit 0, a minimal JSON deny/ask, and stderr.
     pub fn is_codex_block_shape(&self) -> bool {
         if self.exit_code != 0 || self.stdout.is_empty() || self.stderr.is_empty() {
             return false;
@@ -67,10 +67,12 @@ impl HookOutcome {
                 .get("hookEventName")
                 .and_then(serde_json::Value::as_str)
                 == Some("PreToolUse")
-            && specific
-                .get("permissionDecision")
-                .and_then(serde_json::Value::as_str)
-                == Some("ask")
+            && matches!(
+                specific
+                    .get("permissionDecision")
+                    .and_then(serde_json::Value::as_str),
+                Some("deny" | "ask")
+            )
             && specific
                 .get("permissionDecisionReason")
                 .and_then(serde_json::Value::as_str)
@@ -145,13 +147,24 @@ fn dcg_binary() -> PathBuf {
 
 /// Build a complete Codex 0.125.0+ stdin payload.
 ///
-/// Includes ALL fields a real Codex client sends (session_id, turn_id,
+/// Includes all fields Codex++ sends, including its Guardian `ask` capability.
+/// Upstream Codex uses the same builder without that optional marker.
+///
+/// The common fields are session_id, turn_id,
 /// transcript_path, cwd, hook_event_name, model, permission_mode,
-/// tool_name, tool_input, tool_use_id) so tests mirror production payloads.
+/// tool_name, tool_input, and tool_use_id, so tests mirror production payloads.
 fn build_codex_payload(command: &str) -> String {
+    build_codex_payload_with_ask_support(command, Some(true))
+}
+
+fn build_codex_payload_with_ask_support(command: &str, ask_supported: Option<bool>) -> String {
     let escaped = command.replace('\\', "\\\\").replace('"', "\\\"");
+    let capability = ask_supported.map_or_else(String::new, |supported| {
+        format!("  \"permission_decision_ask_supported\": {supported},\n")
+    });
     format!(
         r#"{{
+{capability}
   "session_id": "019dd11d-b795-7261-a9cb-9b85a5dad632",
   "turn_id": "turn-test-1",
   "transcript_path": null,
@@ -392,6 +405,36 @@ fn smoke_codex_destructive_command_blocked() {
         outcome.is_codex_block_shape(),
         "destructive command via Codex should produce exit 0 + minimal ask JSON + non-empty stderr\n{outcome}"
     );
+}
+
+#[test]
+fn codex_true_ask_capability_selects_guardian_ask() {
+    let payload =
+        build_codex_payload_with_ask_support("git reset --hard capability-ask-test", Some(true));
+    let outcome = run_hook_raw(payload.as_bytes(), &[]);
+    let json = outcome.stdout_json();
+
+    assert_eq!(
+        json["hookSpecificOutput"]["permissionDecision"], "ask",
+        "{outcome}"
+    );
+}
+
+#[test]
+fn codex_without_true_ask_capability_uses_safe_deny() {
+    for (ask_supported, command) in [
+        (None, "git reset --hard capability-absent-test"),
+        (Some(false), "git reset --hard capability-false-test"),
+    ] {
+        let payload = build_codex_payload_with_ask_support(command, ask_supported);
+        let outcome = run_hook_raw(payload.as_bytes(), &[]);
+        let json = outcome.stdout_json();
+
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecision"], "deny",
+            "ask_supported={ask_supported:?}\n{outcome}"
+        );
+    }
 }
 
 #[test]
