@@ -1,3 +1,60 @@
+# dcg Codex `ask` Fork Rules
+
+These rules apply to fork-specific work in this repository. Within this
+repository's `AGENTS.md` guidance, they override conflicting instructions below.
+Nested instruction files may add local requirements but must not weaken these
+rules.
+
+## Maintain one fork capability
+
+- The only maintained product difference is capability-aware Codex hook
+  decisions: when Codex++ advertises
+  `permission_decision_ask_supported: true`, destructive commands return
+  `permissionDecision: "ask"`.
+- When that marker is absent or false, preserve upstream dcg's safe `"deny"`
+  behavior. Preserve every non-Codex protocol unchanged.
+- Build, installation, documentation, and release changes are fork-scoped only
+  when strictly required to ship this capability.
+- Review findings do not expand fork scope. Pre-existing upstream bugs,
+  refactors, cleanup, hardening, test expansion, and unrelated documentation
+  remain upstream-scoped and report-only.
+- If satisfying the fork contract would materially change another protocol or
+  expand the maintained product surface, stop and ask the user.
+
+## Minimize upstream divergence
+
+- Keep the maintained difference from `upstream/main` as small and isolated as
+  possible.
+- Treat upstream-owned files as integration seams. Keep only the minimum input
+  field, protocol selection, output decision, documentation, and test changes
+  required for the fork contract.
+- Keep the implementation in the existing owning modules while it remains
+  small. Do not add a fork namespace, crate, abstraction, dependency, config
+  surface, or compatibility layer solely to label fork code.
+- Reuse upstream's canonical tests, documentation, manifests, and workflows.
+  Do not mix unrelated cleanup, renames, or formatting churn into fork changes.
+
+## Integrate upstream verbatim
+
+- Preserve upstream commits and behavior verbatim except where an unavoidable
+  conflict requires a fork-compatible resolution.
+- Resolve conflicts with the smallest change that preserves the fork contract.
+  Do not include opportunistic fixes during an upstream integration.
+- Reviews of upstream integrations may fix only fork regressions and incorrect
+  conflict resolutions. Upstream defects are report-only.
+- If upstream gains equivalent capability-aware `ask` behavior, remove the fork
+  delta after verifying equivalence; do not preserve a parallel compatibility
+  path.
+
+## Validate the fork contract
+
+- When the Codex decision path changes, run `cargo test --lib hook::` and
+  `cargo test --test codex_hook_protocol`.
+- Follow the existing compiler, Clippy, and formatting requirements below for
+  substantive changes.
+- Do not add fork-specific validation workflows, caches, or test infrastructure
+  unless the user explicitly expands the release contract.
+
 # AGENTS.md — dcg (Destructive Command Guard)
 
 > Guidelines for AI coding agents working in this Rust codebase.
