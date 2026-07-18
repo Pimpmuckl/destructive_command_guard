@@ -32,15 +32,22 @@ outer command does not reveal.
 
 These limits keep runtime overhead small and false positives manageable.
 
-## Fail-Open Behavior
+## Bounded Failure Behavior
 
-In hook mode, heredoc scanning is **fail-open** by design:
+dcg distinguishes malformed outer hook input from an evaluation that started
+but could not finish:
 
-- Parse errors or timeouts result in ALLOW
-- Unknown languages result in ALLOW
+- Malformed or oversized raw hook JSON is allowed with an audit warning by
+  default; `general.fail_closed = true` (or `DCG_FAIL_CLOSED=1`) denies it.
+- Heredoc extraction, parsing, and AST failures run the bounded fallback scanner
+  when configured. Disabling the relevant fallback blocks instead.
+- An exhausted absolute hook deadline, oversized extracted command, or
+  incomplete nested evaluation is **indeterminate**, never a clean allow.
+  Review-capable clients receive `ask`; clients without that state block.
 
-This prevents the hook from breaking legitimate workflows. Diagnostic markers
-are emitted so that `dcg explain` or logs can surface the failure.
+This keeps raw transport failures configurable without treating elapsed
+analysis time as evidence that a command is safe. Audit logs and `dcg explain`
+surface the distinction.
 
 ## Performance Budgets
 
@@ -50,7 +57,8 @@ The heredoc pipeline is strictly bounded:
 - Tier 2 extraction: <1ms typical, 50ms max
 - Tier 3 AST match: <5ms typical, 20ms max
 
-When budgets are exceeded, the system fails open and records a diagnostic.
+When the absolute hook budget is exhausted, the system records a diagnostic
+and returns an explicit indeterminate decision.
 
 ## Bypass Considerations
 
@@ -72,8 +80,10 @@ Mitigations:
 ### If a safe command is blocked
 
 1. Run `dcg explain` on the command or use the printed rule ID.
-2. Add a scoped allowlist entry with a reason.
-3. Consider reducing scope (project allowlist vs user/system allowlist).
+2. Add a user-owned allowlist entry with a reason and repository-root `--path`
+   scopes when the exception is project-specific.
+3. Activate a checked-in project allowlist only after reviewing `.dcg.toml` and
+   explicitly selecting it through `DCG_CONFIG`.
 
 ### If a dangerous command is allowed
 
@@ -89,4 +99,3 @@ Security issues should be reported via GitHub issues with:
 - The language detected (if any)
 - The observed behavior (blocked or allowed)
 - Expected behavior and rationale
-

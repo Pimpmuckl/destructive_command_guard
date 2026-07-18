@@ -30,7 +30,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_comm
 & ([scriptblock]::Create((irm "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.ps1"))) -EasyMode -Verify
 ```
 
-<p><em>Installs native <code>dcg.exe</code>, verifies the mandatory SHA256 checksum, verifies the release's long-lived minisign signature when <code>minisign</code> is available, and verifies Sigstore/cosign provenance when both <code>cosign</code> and a trusted bundle are available. It adds dcg to your User <code>PATH</code> (<code>-EasyMode</code>), runs a self-test (<code>-Verify</code>), and configures detected agent hooks for Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, Cursor IDE, and Hermes Agent. Copilot is configured at the user level under <code>%COPILOT_HOME%\hooks</code> (or <code>%USERPROFILE%\.copilot\hooks</code>) so every workspace is protected. On Windows the <code>windows.filesystem</code> and <code>windows.system</code> packs are on by default, so <code>del /s</code>, <code>rd /s</code>, <code>Remove-Item -Recurse -Force</code>, <code>format</code>, and <code>vssadmin delete shadows</code> are blocked out of the box. Pin a version with <code>-Version vX.Y.Z</code>; use <code>-RequireMinisign</code> to fail closed if the sidecar or verifier is unavailable.</em></p>
+<p><em>Installs native <code>dcg.exe</code>, verifies the mandatory SHA256 checksum, verifies the release's long-lived minisign signature when <code>minisign</code> is available, and verifies Sigstore/cosign provenance when both <code>cosign</code> and a trusted bundle are available. It adds dcg to your User <code>PATH</code> (<code>-EasyMode</code>), runs a self-test (<code>-Verify</code>), and configures detected agent hooks for Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, Cursor IDE, and Hermes Agent. Copilot is configured at the user level under <code>%COPILOT_HOME%\hooks</code> (or <code>%USERPROFILE%\.copilot\hooks</code>) so every workspace is protected. On Windows the <code>windows.filesystem</code> and <code>windows.system</code> packs are on by default, so <code>del /s</code>, <code>rd /s</code>, <code>Remove-Item -Recurse</code> (with or without <code>-Force</code>), <code>format</code>, and <code>vssadmin delete shadows</code> are blocked out of the box. Pin a version with <code>-Version vX.Y.Z</code>; use <code>-RequireMinisign</code> to fail closed if the sidecar or verifier is unavailable.</em></p>
 </div>
 
 ---
@@ -55,7 +55,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_comm
 | **Native Codex Support** | Codex CLI 0.125.0+ receives a minimal stdout JSON denial that current clients enforce reliably |
 | **Graceful Degradation** | Plain output for CI, pipes, dumb terminals, and no-color environments |
 | **Scan Mode for CI** | Pre-commit hooks and CI integration to catch dangerous commands in code review |
-| **Fail-Open Design** | Never blocks your workflow due to timeouts or parse errors |
+| **Bounded Failure Policy** | Analysis timeouts become explicit review/block outcomes; malformed raw hook envelopes remain auditable and configurable |
 | **Explain Mode** | `dcg explain "command"` shows exactly why something is blocked |
 
 ### Quick Example
@@ -192,14 +192,14 @@ real pack or category IDs from `dcg packs` / `docs/packs/README.md` — a name l
 With **no config file present**, dcg enables only the packs that guard against the
 most catastrophic, unrecoverable mistakes:
 
-- `core.filesystem` - Dangerous `rm -rf` outside temp directories *(always on; cannot be disabled)*
+- `core.filesystem` - Dangerous recursive `rm` operations and equivalent filesystem destruction outside literal temp subdirectories *(always on; cannot be disabled)*
 - `core.git` - Destructive git commands that lose uncommitted work, rewrite history, or destroy stashes *(always on; cannot be disabled)*
 - `system.disk` - `mkfs`, `dd`-to-device, `fdisk`, `parted`, `mdadm`, `lvm` removal, `wipefs` *(on by default; opt out with `disabled = ["system.disk"]`)*
 
 On **Windows**, two additional packs are on by default so a fresh install blocks the
 catastrophic native-Windows operations with no config:
 
-- `windows.filesystem` - cmd `del /s`, `rd /s`, `format <drive>:` and PowerShell `Remove-Item -Recurse -Force` (and aliases), `Clear-Content`, `Clear-RecycleBin` *(default-on **on Windows only**; opt out with `disabled = ["windows.filesystem"]` or `["windows"]`)*
+- `windows.filesystem` - cmd `del /s`, `rd /s`, `format <drive>:` and PowerShell `Remove-Item -Recurse` (with or without `-Force`; aliases included), `Clear-Content`, `Clear-RecycleBin` *(default-on **on Windows only**; opt out with `disabled = ["windows.filesystem"]` or `["windows"]`)*
 - `windows.system` - `vssadmin delete shadows` / `wmic shadowcopy delete` (Volume Shadow Copy destruction), `diskpart`, `Format-Volume`, `Clear-Disk`, `Remove-Partition`, `cipher /w`, `bcdedit /delete` *(default-on **on Windows only**; opt out with `disabled = ["windows.system"]` or `["windows"]`)*
 
 The broader `windows.misc` (`reg delete`, `net user /delete`, `wsl --unregister`, `robocopy /MIR`) and
@@ -231,6 +231,7 @@ it to `[packs] enabled` — see [Enable More Protection](#enable-more-protection
 - `database.mongodb` - Protects against destructive MongoDB operations like dropDatabase, dropCollection, and remove without criteria.
 - `database.redis` - Protects against destructive Redis operations like FLUSHALL, FLUSHDB, and mass key deletion.
 - `database.sqlite` - Protects against destructive SQLite operations like DROP TABLE, DELETE without WHERE, and accidental data loss.
+- `database.snowflake` - Protects modern `snow sql` inline queries, files, stdin, nested sources, destructive data operations, pipelines, warehouses, and account privileges.
 - `database.supabase` - Protects against destructive Supabase CLI operations including database resets, migration rollbacks, function/secret/storage deletion, project removal, and infrastructure changes.
 
 ### Container Packs
@@ -345,7 +346,7 @@ it to `[packs] enabled` — see [Enable More Protection](#enable-more-protection
 Native-Windows (cmd.exe + PowerShell) destructive-command protection. `windows.filesystem` and
 `windows.system` are **default-on on Windows** (off/opt-in on Unix); `windows.misc` and
 `windows.powershell` are opt-in everywhere. All patterns are case-insensitive.
-- `windows.filesystem` - Recursive/forced filesystem destruction: cmd `del /s`, `rd /s`/`rmdir /s`, `format <drive>:`; PowerShell `Remove-Item -Recurse -Force` (and aliases `rm`/`del`/`rd`/`ri`), `Clear-Content`, `Clear-RecycleBin`. Whitelists PowerShell `-WhatIf` previews only on cmdlets/aliases that honor it, plus temp-dir deletes.
+- `windows.filesystem` - Recursive/forced filesystem destruction: cmd `del /s`, `rd /s`/`rmdir /s`, `format <drive>:`; PowerShell `Remove-Item -Recurse` (with or without `-Force`; `-Force` only broadens coverage to hidden/read-only items; aliases `rm`/`del`/`rd`/`ri` included), `Clear-Content`, `Clear-RecycleBin`. Whitelists PowerShell `-WhatIf` previews only on cmdlets/aliases that honor it, plus temp-dir deletes.
 - `windows.system` - Catastrophic disk/system operations: `vssadmin delete shadows` and `wmic shadowcopy delete` (Volume Shadow Copy destruction — a ransomware hallmark), `diskpart`, `Format-Volume`, `Clear-Disk`, `Remove-Partition`, `Initialize-Disk`/`Reset-PhysicalDisk`, `cipher /w`, `bcdedit /delete`.
 - `windows.misc` - Registry/account/service/WSL/copy destruction: `reg delete`, `net user|localgroup /delete`, `sc delete`, `schtasks /delete`, `wsl --unregister` (destroys a WSL distro), `robocopy /MIR` (mirror-delete).
 - `windows.powershell` - Destructive PowerShell cmdlets: registry/provider deletes (`Remove-Item HKLM:\`, `Remove-ItemProperty`, `Remove-PSDrive`), `Remove-LocalUser`/`Remove-LocalGroup`, `Unregister-ScheduledTask`, `Disable-ComputerRestore`, forced `Stop-Computer`/`Restart-Computer`, `Remove-VM`/`Remove-AppxPackage`.
@@ -437,7 +438,7 @@ max_heredocs = 10
 # Optional language filter (scan only these languages). Omit for "all".
 # languages = ["python", "bash", "javascript", "typescript", "ruby", "perl", "go"]
 
-# Graceful degradation (hook defaults are fail-open).
+# Bounded heredoc fallback (strict mode can block instead).
 fallback_on_parse_error = true
 fallback_on_timeout = true
 ```
@@ -469,7 +470,7 @@ Command Input
          │ Match
          ▼
 ┌─────────────────┐
-│ Tier 2: Extract │ ─── Error/Timeout ──► ALLOW + fallback check
+│ Tier 2: Extract │ ─── Error/Timeout ──► FALLBACK SCAN or BLOCK (strict)
 │   (<1ms)        │
 └────────┬────────┘
          │ Success
@@ -575,7 +576,7 @@ Environment variables override config files (highest priority):
 - `DCG_ROBOT=1`: enable robot mode for JSON stdout and quiet stderr
 - `DCG_HIGH_CONTRAST=1`: enable high-contrast output (ASCII borders + monochrome palette)
 - `DCG_FORMAT=text|json|sarif`: default output format (command-specific — see [Output Formats](#output-formats-and-dcg_format) for which values each subcommand actually accepts; real SARIF is `dcg scan`-only)
-- `DCG_FAIL_CLOSED=1`: block (deny) on hook input that cannot be parsed, instead of the default fail-open allow (opt-in; see [Fail-Open Philosophy](#fail-open-philosophy))
+- `DCG_FAIL_CLOSED=1`: block (deny) on hook input that cannot be parsed, instead of the default fail-open allow (opt-in; see [Bounded Failure Policy](#bounded-failure-policy))
 - `DCG_BYPASS=1`: bypass dcg entirely (escape hatch; use sparingly)
 - `DCG_CONFIG=/path/to/config.toml`: use explicit config file
 - `DCG_HEREDOC_ENABLED=true|false`: enable/disable heredoc scanning
@@ -613,14 +614,35 @@ non-scan command, prefer `--format json` (which is unambiguous); use `dcg scan
 
 ### Configuration Hierarchy
 
-dcg supports layered configuration from multiple sources, with higher-priority sources overriding lower ones:
+dcg supports layered configuration from multiple trusted sources, with
+higher-priority sources overriding lower ones:
 
 1. Environment Variables (DCG_* prefix)           [HIGHEST PRIORITY]
 2. Explicit Config File (DCG_CONFIG env var)
-3. Project Config (.dcg.toml in repo root)
-4. User Config (~/.config/dcg/config.toml)
-5. System Config (/etc/dcg/config.toml)
-6. Compiled Defaults                              [LOWEST PRIORITY]
+3. User Config (~/.config/dcg/config.toml)
+4. System Config (/etc/dcg/config.toml)
+5. Compiled Defaults                              [LOWEST PRIORITY]
+
+An automatically discovered `.dcg.toml` is intentionally **not** a normal
+precedence layer. A repository is untrusted when it is first cloned, so its
+config may only add enforcement: enable built-in packs, add `deny` policy
+entries, opt into `general.fail_closed`, enable
+heredoc scanning, or turn off heredoc fail-open fallbacks. Settings that grant
+trust or reduce coverage — including allow overrides, pack disables, custom
+pack paths, custom regex overrides (including block regexes), resource limits,
+language filters, agent profiles, and nested project overrides — are ignored
+during automatic discovery.
+
+Automatic project discovery currently runs only where dcg can bind a direct
+regular file to the descriptor it actually reads (Unix, including macOS).
+Native Windows ignores an automatically discovered `.dcg.toml` until equivalent
+reparse-point and file-identity validation is available; this avoids turning a
+workspace path race into a privileged file read. A reviewed Windows project
+file can still be selected explicitly with `DCG_CONFIG=.dcg.toml`.
+
+To deliberately trust the complete repository config for one invocation, select
+it explicitly: `DCG_CONFIG=.dcg.toml dcg ...`. An explicit file has the same
+full authority as any other user-selected config.
 
 ### Accessibility & Themes
 
@@ -643,8 +665,14 @@ use_color = true           # false for monochrome
 |-------|------|----------|
 | System | `/etc/dcg/config.toml` | Organization-wide defaults |
 | User | `~/.config/dcg/config.toml` | Personal preferences |
-| Project | `.dcg.toml` (repo root) | Project-specific settings |
+| Project | `.dcg.toml` (repo root) | Automatically discovered enforcement-only policy |
 | Explicit | `DCG_CONFIG=/path/to/file` | Testing or override |
+
+The machine-wide system-config layer is accepted on Unix only after the file
+and every directory in its direct path are root-owned and not group/world
+writable. Native Windows currently ignores that implicit layer until native
+ACL and reparse-point validation is implemented; use a user config or an
+explicit `DCG_CONFIG` file there.
 
 **Merging Behavior**:
 
@@ -661,7 +689,11 @@ fn merge_layer(&mut self, other: ConfigLayer) {
 }
 ```
 
-This means you can set organization defaults in `/etc/dcg/config.toml`, personal preferences in `~/.config/dcg/config.toml`, and project-specific overrides in `.dcg.toml`—each layer only needs to specify the settings that differ from defaults.
+This means you can set organization defaults in `/etc/dcg/config.toml`, personal
+preferences in `~/.config/dcg/config.toml`, and repository-owned hardening in
+`.dcg.toml` without letting a newly cloned repository weaken the user's guard.
+Use `DCG_CONFIG=.dcg.toml` only after reviewing a project file that needs full
+override authority.
 
 **Project-Specific Pack Configuration**:
 
@@ -675,30 +707,24 @@ packs = { enabled = ["database.postgresql", "cloud.aws"], disabled = [] }
 packs = { enabled = [], disabled = ["core.git"] }  # More permissive for experiments
 ```
 
-### Fail-Open Philosophy
+### Bounded Failure Policy
 
-dcg is designed with a **fail-open** philosophy: when the tool cannot safely analyze a command (due to timeouts, parse errors, or resource limits), it allows the command to proceed rather than blocking it and breaking the user's workflow.
+dcg distinguishes an unreadable hook envelope from a command whose safety
+evaluation began but could not finish. It never treats elapsed analysis time or
+an oversized extracted command as proof that execution is safe.
 
-**Why Fail-Open?**
-
-1. **Workflow Continuity**: A blocked legitimate command is more disruptive than a missed dangerous one
-2. **Performance Guarantees**: The hook must never become a bottleneck
-3. **Graceful Degradation**: Partial analysis is better than no analysis
-
-**Fail-Open Scenarios**:
-
-| Scenario | Behavior | Rationale |
-|----------|----------|-----------|
-| Parse error in heredoc | ALLOW + warn | Malformed input shouldn't block work |
-| Extraction timeout | ALLOW + warn | Slow inputs shouldn't hang terminal |
-| Size limit exceeded | ALLOW + fallback check | Large inputs get reduced analysis |
-| Regex engine timeout | ALLOW + warn | Pathological patterns shouldn't block |
-| AST matching error | Skip that heredoc | Continue evaluating other content |
-| Deadline exceeded | ALLOW immediately | Hard cap prevents runaway processing |
+| Scenario | Default behavior | Strict/configured behavior |
+|----------|------------------|----------------------------|
+| Malformed or oversized raw hook JSON | Allow with an audit warning | `general.fail_closed = true` denies |
+| Transient hook stdin I/O error | Allow with an audit warning | Always fail-open because the payload was not attacker-controlled |
+| Extracted command exceeds `max_command_bytes` | Explicit indeterminate result | Review-capable clients receive `ask`; other clients block |
+| Absolute evaluation deadline expires | Explicit indeterminate result | Review-capable clients receive `ask`; other clients block |
+| Heredoc extraction/parse/AST failure | Run the bounded fallback scanner | `fallback_on_parse_error = false` or `fallback_on_timeout = false` blocks |
 
 **Configurable Strictness**:
 
-For high-security environments, fail-open can be disabled.
+Raw hook-envelope fail-open behavior and embedded-code fallback behavior are
+configured independently.
 
 For **heredoc/inline-script** analysis specifically:
 
@@ -734,11 +760,9 @@ attacker-controlled malformed payloads.
 > paths, so a BOM-prefixed but otherwise-valid command is correctly evaluated
 > (and blocked if dangerous) rather than allowed through as "unparseable".
 
-With strict mode enabled, dcg will block commands when analysis fails, providing detailed error messages explaining why.
-
-**Fallback Pattern Checking**:
-
-Even when full analysis is skipped, dcg performs a lightweight fallback check for critical destructive patterns:
+With strict mode enabled, dcg blocks malformed attacker-controlled hook input
+and reports why. Separately, when heredoc parsing cannot complete and fallback
+is enabled, dcg runs a lightweight bounded check over the original command:
 
 ```rust
 static FALLBACK_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
@@ -753,11 +777,16 @@ static FALLBACK_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
 });
 ```
 
-This ensures that even oversized or malformed inputs are checked for the most dangerous operations before being allowed.
+This fallback is specific to embedded-code extraction. It is not used for a raw
+hook envelope that could not be parsed, and it does not turn a deadline or an
+oversized extracted command into an allow.
 
 **Absolute Timeout**:
 
-To prevent any single command from blocking indefinitely, dcg enforces an absolute maximum processing time of **200ms**. Any command exceeding this threshold is immediately allowed with a warning logged.
+To prevent any single command from blocking indefinitely, dcg enforces an
+absolute maximum processing time of **200ms**. Exhausting that budget produces
+an explicit indeterminate result, which requests operator review where the hook
+protocol supports it and otherwise blocks.
 
 ## Installation
 
@@ -782,7 +811,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_comm
 Install specific version:
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --version v0.6.8
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --version v0.6.9
 ```
 
 Install to /usr/local/bin (system-wide, requires sudo):
@@ -844,7 +873,7 @@ repository's known-good `nightly-2026-06-06` pin; the included
 rustup toolchain install nightly-2026-06-06
 
 # Install the tagged source reproducibly
-cargo +nightly-2026-06-06 install --locked --git https://github.com/Dicklesworthstone/destructive_command_guard --tag v0.6.8 destructive_command_guard
+cargo +nightly-2026-06-06 install --locked --git https://github.com/Dicklesworthstone/destructive_command_guard --tag v0.6.9 destructive_command_guard
 ```
 
 ### Manual build
@@ -868,7 +897,7 @@ dcg update
 Optional flags mirror the installer scripts (examples):
 
 ```bash
-dcg update --version v0.6.8
+dcg update --version v0.6.9
 dcg update --system
 dcg update --verify
 ```
@@ -1091,7 +1120,9 @@ Minimal GitHub Actions step:
 
 - Use `--format json` (or `DCG_FORMAT=json`) for machine parsing.
 - Add `--no-color` if logs or parsers choke on ANSI output.
-- If results differ between environments, check config precedence (`DCG_CONFIG`, project `.dcg.toml`, user/system config).
+- If results differ between environments, check trusted config precedence
+  (`DCG_CONFIG`, user/system config) plus the enforcement-only settings accepted
+  from an automatically discovered project `.dcg.toml`.
 - If a command is unexpectedly allowed, inspect active allowlists (`dcg allowlist list`) and enabled packs (`dcg packs --verbose`).
 - For full decision traces, run `dcg test --explain "<command>"` (or `dcg explain "<command>"`).
 
@@ -1449,11 +1480,14 @@ dcg explain "git reset --hard HEAD"
 If the command is genuinely needed:
 
 ```bash
-# Project-level allowlist (committed, code-reviewed)
-dcg allowlist add core.git:reset-hard --reason "Required for CI cleanup" --project
+# User-owned exception scoped to this checkout
+repo_root=$(git rev-parse --show-toplevel)
+dcg allowlist add core.git:reset-hard --reason "Required for CI cleanup" \
+  --user --path "$repo_root" --path "$repo_root/**"
 
 # Or for a specific command
-dcg allowlist add-command "rm -rf ./build" --reason "Build cleanup" --project
+dcg allowlist add-command "rm -rf ./build" --reason "Build cleanup" \
+  --user --path "$repo_root" --path "$repo_root/**"
 ```
 
 The finding output includes a copy-paste allowlist command for convenience.
@@ -1749,9 +1783,9 @@ The destructive pattern list covers:
 | Worktree restore | `restore` (without --staged) | Discards uncommitted changes |
 | Untracked deletion | `clean -f` | Permanently removes untracked files |
 | History rewrite | `push --force`, `push -f` | Can destroy remote commits |
-| Unsafe branch delete | `branch -D` | Force-deletes without merge check |
+| Branch ref deletion/update | `branch -d`, `branch --delete`, `branch -D`, `branch -f`, `branch -M`, `branch -C` | Removes or force-overwrites a user-owned branch ref |
 | Stash destruction | `stash drop`, `stash clear` | Permanently deletes stashed work |
-| Filesystem nuke | `rm -rf` (non-temp paths) | Recursive deletion outside temp |
+| Filesystem nuke | `rm -r`, `rm -R`, `rm --recursive` (non-temp paths) | Recursive deletion outside temp, with or without `--force` |
 
 ### Pattern Syntax
 
@@ -1898,7 +1932,7 @@ r"rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f"     // Complex but no lookahead
 
 ### Performance Budget System
 
-dcg operates under strict latency constraints - every Bash command passes through the hook, so even small delays compound into noticeable sluggishness. `src/perf.rs` is the source of truth for performance budgets, CI benchmark expectations, and hook-mode fail-open deadlines.
+dcg operates under strict latency constraints - every shell command passes through the hook, so even small delays compound into noticeable sluggishness. `src/perf.rs` is the source of truth for performance budgets, CI benchmark expectations, and hook-mode deadlines.
 
 **Latency Tiers**:
 
@@ -1912,29 +1946,33 @@ dcg operates under strict latency constraints - every Bash command passes throug
 | 5 | Language detect | < 20μs | > 50μs | > 200μs |
 | 6 | Full heredoc pipeline | < 5ms | > 15ms | > 20ms |
 
-Hook mode also has an absolute 200ms deadline. If that deadline is exhausted, expensive analysis fails open so dcg does not hang an interactive workflow.
+Hook mode also has an absolute 200ms deadline. If that deadline is exhausted,
+dcg returns an explicit indeterminate decision: clients that support operator
+review receive `ask`, and clients without that state receive a blocking
+decision. A timeout never becomes a silent allow.
 
-**Fail-Open Behavior**:
+**Bounded Evaluation Behavior**:
 
-If any stage exceeds its panic threshold, dcg logs a warning and **allows the command**:
+If the absolute hook deadline is exhausted, dcg logs the event and marks the
+command **indeterminate**:
 
 ```
 [WARN] Performance budget exceeded: Tier 2 (safe patterns) took 1.2ms (panic threshold: 500μs)
-[WARN] Failing open to avoid blocking workflow
+[WARN] Safety evaluation incomplete; requesting review or blocking
 ```
 
 This design ensures that:
 1. A pathological input cannot hang the user's terminal
 2. Performance regressions are visible in logs
-3. The tool never becomes a productivity bottleneck
+3. The tool never mistakes elapsed time for a safety proof
 
 **Budget Enforcement**:
 
 ```rust
-let deadline = Deadline::fail_open_default();
+let deadline = Deadline::hook_default();
 
 if deadline.is_exceeded() || !deadline.has_budget_for(&PATTERN_MATCH) {
-    return EvaluationResult::allowed_due_to_budget();
+    return EvaluationResult::indeterminate_due_to_budget();
 }
 ```
 
@@ -2327,11 +2365,18 @@ This check:
 
 ### Resolving False Positives with Allowlists
 
-If dcg blocks a command that is safe in your specific context, you can add it to an allowlist. Allowlists support three layers (checked in order):
+If dcg blocks a command that is safe in your specific context, you can add it
+to an allowlist. Effective allowlists are checked in this order:
 
-1. **Project** (`.dcg/allowlist.toml`): Applies only to the current project
+1. **Explicitly trusted project** (`.dcg/allowlist.toml`): Active only when
+   `DCG_CONFIG` selects the canonical repo-root `.dcg.toml` for that invocation
 2. **User** (`~/.config/dcg/allowlist.toml`): Applies to all your projects
 3. **System** (`/etc/dcg/allowlist.toml`): Applies system-wide
+
+A checked-in project allowlist is inert by default. This prevents a newly
+cloned repository from granting itself permission to run destructive commands.
+All mutation commands default to the user layer; use repeatable `--path` flags
+to constrain an exception to a repository root and its descendants.
 
 **Adding a rule to the allowlist:**
 
@@ -2339,11 +2384,17 @@ If dcg blocks a command that is safe in your specific context, you can add it to
 # Allow a specific rule by ID (recommended)
 dcg allowlist add core.git:reset-hard -r "Used for CI cleanup"
 
-# Allow at project level (default if in a git repo)
-dcg allowlist add core.git:reset-hard -r "CI cleanup" --project
+# Scope a user-owned exception to one repository
+repo_root=$(git rev-parse --show-toplevel)
+dcg allowlist add core.git:reset-hard -r "CI cleanup" --user \
+  --path "$repo_root" --path "$repo_root/**"
 
-# Add to user-level allowlist instead
+# Add to the user allowlist globally
 dcg allowlist add core.git:reset-hard -r "Personal workflow" --user
+
+# After reviewing .dcg.toml, explicitly activate and edit project policy
+DCG_CONFIG="$repo_root/.dcg.toml" dcg allowlist add \
+  core.git:reset-hard -r "Reviewed project policy" --project
 
 # Allow with expiration (ISO 8601 format)
 dcg allowlist add core.git:clean-force -r "Migration" --expires "2026-02-01T00:00:00Z"
@@ -2355,10 +2406,10 @@ dcg allowlist add-command "rm -rf ./build" -r "Build cleanup"
 **Listing allowlist entries:**
 
 ```bash
-# List all entries from all layers
+# List entries from effective layers only
 dcg allowlist list
 
-# List project allowlist only
+# Inspect the raw project file (marked INACTIVE when it is untrusted)
 dcg allowlist list --project
 
 # List user allowlist only
@@ -2374,8 +2425,9 @@ dcg allowlist list --format json
 # Remove a rule by ID
 dcg allowlist remove core.git:reset-hard
 
-# Remove from project allowlist specifically
-dcg allowlist remove core.git:reset-hard --project
+# Remove from explicitly trusted project policy
+DCG_CONFIG="$repo_root/.dcg.toml" dcg allowlist remove \
+  core.git:reset-hard --project
 ```
 
 **Validating allowlist files:**
@@ -2394,7 +2446,7 @@ dcg allowlist validate --strict
 # Preview expired entries without changing files
 dcg allowlist prune --dry-run
 
-# Remove expired entries from project/user allowlists
+# Remove expired entries from effective layers (user, plus trusted project)
 dcg allowlist prune
 ```
 
@@ -2499,7 +2551,7 @@ unauthenticated, quota-limited, or temporarily unable to reach the API.
 
 The E2E suite covers:
 - All destructive git commands (reset, checkout, restore, clean, push, branch, stash)
-- All safe git commands (status, log, diff, add, commit, push, branch -d)
+- Safe git commands (status, log, diff, add, commit, push, read-only branch listings)
 - Filesystem commands (rm -rf with various paths and flag orderings)
 - Absolute path handling (`/usr/bin/git`, `/bin/rm`)
 - Non-Bash tools (Read, Write, Edit, Grep, Glob)
@@ -2544,17 +2596,21 @@ git push origin v0.1.0
 
 ## FAQ
 
-**Q: Why block `git branch -D` but allow `git branch -d`?**
+**Q: Why block both `git branch -d` and `git branch -D`?**
 
-The lowercase `-d` only deletes branches that have been fully merged. The uppercase `-D` force-deletes regardless of merge status, potentially losing commits that exist only on that branch.
+Lowercase `-d` verifies that Git considers a branch merged, but it still removes the branch name, upstream-tracking configuration, and convenient reflog reference. Those are user-owned state and may still matter after a merge. DCG therefore treats every branch deletion as an approval boundary; use `git branch -vv`, `git branch --merged`, and `git branch --no-merged` to review state without changing refs.
 
 **Q: Why is `git push --force-with-lease` allowed?**
 
 Force-with-lease is a safer alternative that refuses to push if the remote has commits you haven't seen. It prevents accidentally overwriting someone else's work.
 
-**Q: Why block all `rm -rf` outside temp directories?**
+**Q: Why block recursive `rm` outside temp directories?**
 
-Recursive forced deletion is one of the most dangerous filesystem operations. Even with good intentions, a typo or wrong variable expansion can delete critical files. Temp directories are designed to be ephemeral.
+Recursive deletion can silently remove an ordinary writable directory tree even
+without `-f`. A typo, unexpected working directory, or wrong variable expansion
+can therefore destroy critical files with `rm -r`, `rm -R`, or their forced
+variants. DCG treats all of those forms as an approval boundary, while retaining
+the narrowly bounded policy for literal `/tmp` and `/var/tmp` subdirectories.
 
 **Q: Can I add custom patterns?**
 

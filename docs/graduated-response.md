@@ -127,7 +127,7 @@ This command has been blocked 6 times in the last 24h (threshold: 5).
 Direct confirmation is not available for this command.
 
 Options:
-  1. Add to allowlist: dcg allowlist add core.git:reset-hard --project
+  1. Add to user allowlist: dcg allowlist add core.git:reset-hard --user
   2. Allow once:       dcg allow-once <code>
   3. Review history:   dcg history core.git:reset-hard
 
@@ -148,7 +148,7 @@ Code: 9b2e
     "ruleId": "core.git:reset-hard",
     "remediation": {
       "allowOnceCommand": "dcg allow-once 9b2e",
-      "allowlistCommand": "dcg allowlist add core.git:reset-hard --project"
+      "allowlistCommand": "dcg allowlist add core.git:reset-hard --user"
     }
   }
 }
@@ -238,7 +238,10 @@ fn select_response_level(
 
 ### 4.1 Configuration File
 
-Location: `~/.config/dcg/config.toml` (user) or `.dcg/config.toml` (project)
+Location: `~/.config/dcg/config.toml` (user) or another reviewed file selected
+explicitly with `DCG_CONFIG=/path/to/config.toml`. Automatically discovered
+repository config does not accept response-graduation settings because those
+settings can turn denials into warnings.
 
 ```toml
 [response]
@@ -284,7 +287,7 @@ dcg --session-threshold=1      # Override for this invocation
 Priority (highest to lowest):
 1. CLI flags
 2. Environment variables
-3. Project config (`.dcg/config.toml`)
+3. Explicit config (`DCG_CONFIG=/path/to/config.toml`)
 4. User config (`~/.config/dcg/config.toml`)
 5. System config (`/etc/dcg/config.toml`)
 6. Built-in defaults

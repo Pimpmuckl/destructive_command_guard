@@ -760,7 +760,7 @@ jobs:
           # - Pattern match: 1ms panic
           # - Heredoc extract: 2ms panic
           # - Full heredoc pipeline: 20ms panic
-          # - Hook fail-open deadline: 200ms
+          # - Hook evaluation deadline: 200ms (exhaustion is indeterminate, never a silent allow)
           echo "## Performance Budget Check" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 

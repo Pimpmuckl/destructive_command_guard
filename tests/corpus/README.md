@@ -164,12 +164,15 @@ These invariants must never change without an explicit design review:
 - Allowlist matches are logged with `allowlist_override` field.
 - Allowlist lookup happens **after** pattern matching, not before.
 
-### 4. Fail-Open Semantics
-- On **budget exhaustion**: allow (return early with `skipped_due_to_budget`).
+### 4. Bounded Failure Semantics
+- On **budget exhaustion**: return `Indeterminate` with
+  `skipped_due_to_budget`; hook protocols ask for review or block and never
+  silently allow.
 - On **heredoc parse error**: allow (with warning log).
 - On **heredoc timeout**: allow (with warning log).
 - On **JSON parse error** (hook mode): allow (with warning log).
-- **Never block due to internal errors.**
+- Parse/error policies remain explicit per subsystem; a safety deadline is not
+  proof that a command is safe.
 
 ### 5. Word-Boundary Keyword Gating
 - Keywords are matched at **word boundaries**, not substrings.

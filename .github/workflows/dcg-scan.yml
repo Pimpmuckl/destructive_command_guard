@@ -13,7 +13,7 @@
 #
 #   - Set DCG_VERSION to pin a specific version:
 #     - "latest" (default): Use latest release
-#     - "v0.6.8": Use specific version tag
+#     - "v0.6.9": Use specific version tag
 
 name: dcg-scan
 
@@ -25,7 +25,7 @@ env:
   CARGO_TERM_COLOR: always
   # Fail policy: "error" | "warning" | "none"
   DCG_FAIL_ON: error
-  # Version to use: "latest" or specific tag like "v0.6.8"
+  # Version to use: "latest" or specific tag like "v0.6.9"
   DCG_VERSION: latest
 
 jobs:

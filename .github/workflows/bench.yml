@@ -72,13 +72,15 @@ jobs:
           cargo bench --bench codex_deny -- --noplot 2>&1 | tee -a bench-output.txt
 
           # Extract timing summary for CI
-          echo "## Benchmark Results" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Performance budgets are defined in \`src/perf.rs\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          grep -E '(time:|change:|Performance)' bench-output.txt | head -50 >> $GITHUB_STEP_SUMMARY || true
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Benchmark Results"
+            echo ""
+            echo "Performance budgets are defined in \`src/perf.rs\`"
+            echo ""
+            echo '```'
+            grep -E '(time:|change:|Performance)' bench-output.txt | head -50 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Check for regressions
         run: |
@@ -133,12 +135,14 @@ jobs:
 
       - name: Generate comparison summary
         run: |
-          echo "## PR Benchmark Comparison" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Benchmarks ran successfully. Check the benchmark job for detailed results." >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Key performance budgets:" >> $GITHUB_STEP_SUMMARY
-          echo "- Quick reject: < 50μs (panic threshold)" >> $GITHUB_STEP_SUMMARY
-          echo "- Fast path: < 500μs (panic threshold)" >> $GITHUB_STEP_SUMMARY
-          echo "- Full heredoc pipeline: < 20ms (panic threshold)" >> $GITHUB_STEP_SUMMARY
-          echo "- Hook fail-open deadline: 200ms" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## PR Benchmark Comparison"
+            echo ""
+            echo "Benchmarks ran successfully. Check the benchmark job for detailed results."
+            echo ""
+            echo "Key performance budgets:"
+            echo "- Quick reject: < 50μs (panic threshold)"
+            echo "- Fast path: < 500μs (panic threshold)"
+            echo "- Full heredoc pipeline: < 20ms (panic threshold)"
+            echo "- Hook deadline: 200ms; exhaustion is indeterminate/blocking, never allow"
+          } >> "$GITHUB_STEP_SUMMARY"

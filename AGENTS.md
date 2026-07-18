@@ -357,7 +357,9 @@ Every Bash command passes through this hook. Performance is critical:
 ### Heredoc Detection Notes
 
 - **Rule IDs**: Heredoc patterns use stable IDs like `heredoc.python.shutil_rmtree` for allowlisting.
-- **Fail-open**: In hook mode, heredoc parse errors/timeouts must allow (do not block).
+- **Bounded failure**: Heredoc parse/AST failures use the configured bounded
+  fallback; disabling fallback blocks. Absolute hook-deadline exhaustion and
+  incomplete nested evaluation return `Indeterminate`, never `Allow`.
 - **Tests**: Prefer targeted tests in `src/ast_matcher.rs` and `src/heredoc.rs`.
   - `cargo test ast_matcher`
   - `cargo test heredoc`
@@ -557,7 +559,7 @@ DCG_BYPASS=1 <command>
 | `core.git:restore-discard` | `git restore <file>` (without `--staged`) | High |
 | `core.git:clean-force` | `git clean -f`, `git clean -fd` | High |
 | `core.git:force-push` | `git push --force`, `git push -f` | High |
-| `core.git:branch-force-delete` | `git branch -D` | High |
+| `core.git:branch-force-delete` | `git branch -d`, `--delete`, `-D`, `-f`, `-M`, `-C` | High |
 | `core.git:stash-drop` | `git stash drop`, `git stash clear` | High |
 
 ### Core Filesystem Patterns (Always Enabled)
@@ -698,7 +700,7 @@ Runs on push to main only (benchmarks are noisy on PRs). Checks performance budg
 - Pattern match: < 1ms panic
 - Heredoc extract: < 2ms panic
 - Full heredoc pipeline: < 20ms panic
-- Hook fail-open deadline: 200ms
+- Hook evaluation deadline: 200ms (exhaustion is indeterminate, never a silent allow)
 
 ### UBS Static Analysis
 

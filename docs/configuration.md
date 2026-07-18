@@ -8,9 +8,50 @@ allowlists, and hooks.
 1. **CLI flags**
 2. **Environment variables**
 3. **Explicit config path**: `DCG_CONFIG=/path/to/config.toml`
-4. **Project config**: `.dcg.toml` at repo root
-5. **User config**: `~/.config/dcg/config.toml`
-6. **System config**: `/etc/dcg/config.toml`
+4. **User config**: `~/.config/dcg/config.toml`
+5. **System config**: `/etc/dcg/config.toml`
+
+### Repository config trust boundary
+
+The automatically discovered `.dcg.toml` at a repository root is not a normal
+precedence layer. Opening a newly cloned repository must not give that
+repository authority over the user's security policy. Automatic discovery
+therefore accepts only settings that monotonically add enforcement:
+
+- `[packs].enabled`
+- `[policy].default_mode = "deny"` and per-pack/per-rule entries equal to `"deny"`
+- `[general].fail_closed = true`
+- `[heredoc].enabled = true`
+- `[heredoc].fallback_on_parse_error = false`
+- `[heredoc].fallback_on_timeout = false`
+
+Every other project setting is ignored by automatic discovery. In particular,
+a repository cannot add allow rules, disable packs, load repository-controlled
+custom pack files, inject custom regex overrides (including block regexes),
+reduce resource limits, restrict scanned languages, relax agent profiles, or
+alter global logging/history/output paths.
+
+After reviewing a repository's config, a user can deliberately give the whole
+file normal config authority for an invocation:
+
+```bash
+DCG_CONFIG=.dcg.toml dcg test "git reset --hard"
+```
+
+Because `DCG_CONFIG` is an explicit user-controlled selection, that file is
+loaded in full rather than through the enforcement-only project filter.
+
+On Unix, automatic discovery additionally requires `.dcg.toml` to be a direct
+regular file and binds the pathname to the same descriptor used for the
+bounded read. Native Windows currently ignores automatic project config until
+dcg has equivalent reparse-point-safe open and file-identity checks. A reviewed
+file remains available there through explicit `DCG_CONFIG` selection.
+
+Implicit system config is likewise accepted only on Unix, from a direct
+root-owned path whose file and ancestor directories are not group/world
+writable (`/private/etc/dcg` is used on macOS to avoid the `/etc` symlink).
+Native Windows should use user or explicitly selected config until native ACL
+validation is available.
 
 ## Pack Configuration
 
@@ -185,14 +226,20 @@ pub struct ExternalSafePattern {
 
 ## Allowlists
 
-Allowlists are layered in this order:
+Effective allowlists are layered in this order:
 
-1. **Project**: `.dcg/allowlist.toml`
+1. **Explicitly trusted project**: `.dcg/allowlist.toml`
 2. **User**: `~/.config/dcg/allowlist.toml`
 3. **System**: `/etc/dcg/allowlist.toml`
 
-Use project allowlists for repo-specific exceptions and user allowlists for
-personal workflows.
+Repository contents are not a trust grant. The project layer is inactive unless
+`DCG_CONFIG` canonically selects the regular repo-root `.dcg.toml` for that
+invocation. `dcg allowlist add`, `add-command`, `remove`, and `prune` therefore
+default to the user layer and reject `--project` while repository policy is
+untrusted. For a repository-scoped user exception, pass both the repository root
+and `<repo-root>/**` with repeatable `--path` flags. `list --project`, `validate
+--project`, and `prune --project --dry-run` may inspect the raw inactive file and
+label it `INACTIVE`; default reads operate on effective layers only.
 
 ## Hook Configuration
 

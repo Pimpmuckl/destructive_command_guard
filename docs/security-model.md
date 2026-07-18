@@ -328,7 +328,7 @@ Allowlist scope for this command:
   [o] Once (this execution only)
   [s] Session (until you close this terminal)
   [t] Temporary (24 hours)
-  [p] Permanent (add to project allowlist)
+  [p] Permanent (add to user allowlist)
 
 Choice: _
 ```

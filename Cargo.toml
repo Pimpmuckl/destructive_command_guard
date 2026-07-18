@@ -1,6 +1,6 @@
 [package]
 name = "destructive_command_guard"
-version = "0.6.8"
+version = "0.6.9"
 edition = "2024"
 resolver = "2"
 authors = [
@@ -78,9 +78,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha2 = "0.11"
 hmac = "0.13"  # HMAC for optional short-code hardening (ksk.1.10)
 fs2 = "0.4"
-fsqlite = { version = "0.1.16", features = ["fts5"] }  # FrankenSQLite (atomic commit-marker recovery hardening in 0.1.16)
-fsqlite-types = "0.1.16"  # SqliteValue type
-fsqlite-error = "0.1.16"  # FrankenError type
+fsqlite = { version = "0.1.17", features = ["fts5"] }  # FrankenSQLite (corruption-recovery hardening in 0.1.17)
+fsqlite-types = "0.1.17"  # SqliteValue type
+fsqlite-error = "0.1.17"  # FrankenError type
 ctrlc = "3.5.1"
 flate2 = "1.0"  # Gzip compression for history export
 
