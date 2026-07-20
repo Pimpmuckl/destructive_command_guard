@@ -141,7 +141,7 @@ jobs:
   Severity: critical
   Reason:   git reset --hard destroys uncommitted changes
 
-  → dcg allow core.git:reset-hard -r "CI cleanup" --project
+  → dcg allow core.git:reset-hard -r "CI cleanup" --user
 ```
 
 ### Field meanings
@@ -193,33 +193,41 @@ This shows the full decision trace: which pack matched, what pattern triggered, 
 If the command is safe in your context (e.g., a CI cleanup step), allowlist it:
 
 ```bash
+repo_root=$(git rev-parse --show-toplevel)
+
 # Allowlist by rule ID (recommended - most stable)
-dcg allow core.git:reset-hard -r "Used for CI cleanup after tests" --project
+dcg allow core.git:reset-hard -r "Used for CI cleanup after tests" \
+  --user --path "$repo_root" --path "$repo_root/**"
 
 # Or allowlist a specific command (exact match)
-dcg allowlist add-command "git reset --hard HEAD" -r "CI cleanup" --project
+dcg allowlist add-command "git reset --hard HEAD" -r "CI cleanup" \
+  --user --path "$repo_root" --path "$repo_root/**"
 ```
 
 **Important safety notes:**
 
 1. **Always provide a reason** (`-r "..."`) - document why this is safe
-2. **Prefer `--project`** for project-specific overrides (stored in `.dcg/allowlist.toml`)
+2. **Use user-owned path scopes** for project-specific exceptions. A checked-in
+   `.dcg/allowlist.toml` is inactive until the user reviews and explicitly
+   selects the repo-root `.dcg.toml` through `DCG_CONFIG`.
 3. **Use expiration** for temporary overrides:
    ```bash
-   dcg allow core.git:reset-hard -r "Migration" --expires "2026-02-01T00:00:00Z" --project
+   dcg allow core.git:reset-hard -r "Migration" \
+     --expires "2026-02-01T00:00:00Z" --user \
+     --path "$repo_root" --path "$repo_root/**"
    ```
 
 ### Viewing and managing allowlists
 
 ```bash
-# List all allowlist entries
+# List effective allowlist entries
 dcg allowlist list
 
-# List project-level only
+# Inspect raw project policy (marked INACTIVE unless explicitly trusted)
 dcg allowlist list --project
 
-# Remove an entry
-dcg allowlist remove core.git:reset-hard --project
+# Remove the user-owned entry
+dcg allowlist remove core.git:reset-hard --user
 
 # Validate allowlist files
 dcg allowlist validate
@@ -375,7 +383,8 @@ You already have a pre-commit hook not installed by dcg. Options:
 If dcg flags a command that's safe:
 
 1. **Investigate**: `dcg explain "the-command"` to understand why
-2. **Allowlist if needed**: `dcg allow <rule_id> -r "reason" --project`
+2. **Allowlist if needed**: add a user-owned entry with repository-root and
+   descendant `--path` scopes.
 3. **Report**: If it's a pattern bug, file an issue
 
 ### Hook is too slow
@@ -394,5 +403,5 @@ Scan performance depends on:
 2. **Configure**: Create `.dcg/hooks.toml` with your settings
 3. **Start conservative**: `fail_on = "error"` initially
 4. **Expand gradually**: Add more file types, consider warning-as-fail
-5. **Allowlist false positives**: `dcg allow <rule_id> -r "reason" --project`
+5. **Allowlist false positives**: use a user-owned, repository-path-scoped entry
 6. **Add CI enforcement**: Scan PR diffs in GitHub Actions/GitLab CI

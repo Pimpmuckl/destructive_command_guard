@@ -20,7 +20,7 @@ fn run_hook(command: &str) -> String {
         .env("DCG_PACKS", "system.disk")
         // Classification is the subject of these E2Es. Keep scheduler stalls
         // on a saturated test host from exercising the separately unit-tested
-        // 200 ms production fail-open policy instead.
+        // 200 ms fail-closed deadline policy instead.
         .env("DCG_HOOK_TIMEOUT_MS", "5000")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())

@@ -36,7 +36,7 @@ git checkout main
 git checkout master
 git checkout -b feature
 git checkout --orphan gh-pages
-git branch -d feature
+git branch --merged
 git branch feature
 git switch main
 git switch -c feature

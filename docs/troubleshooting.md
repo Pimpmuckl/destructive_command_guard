@@ -6,17 +6,23 @@ Common issues and how to resolve them.
 
 1. Confirm the hook is installed correctly.
 2. Ensure the dcg binary is on PATH.
-3. Verify config loading (project/user/system) and pack enablement.
+3. Verify trusted config loading (explicit/user/system) and pack enablement.
+   Automatically discovered `.dcg.toml` files may enable packs and add other
+   enforcement, but cannot disable protection or add allow rules.
 
 If available, run:
 - `dcg doctor` for a structured diagnostics report.
 
 ## Packs are not enabled
 
-Check your config files in order:
-- `.dcg.toml` (project)
+Check your config sources in order:
+- `DCG_CONFIG=/path/to/config.toml` (explicit, fully trusted)
 - `~/.config/dcg/config.toml` (user)
 - `/etc/dcg/config.toml` (system)
+
+An automatically discovered project `.dcg.toml` may add `[packs].enabled`, but
+its `[packs].disabled` and `custom_paths` entries are ignored. Select a reviewed
+project file explicitly with `DCG_CONFIG=.dcg.toml` if it needs full authority.
 
 Also verify environment overrides:
 - `DCG_PACKS`
@@ -38,8 +44,21 @@ Also verify environment overrides:
 
 For heredoc or large script parsing:
 - Lower `max_body_bytes` or `max_body_lines`.
-- Increase `timeout_ms` if needed.
+- Increase `[heredoc].timeout_ms` if heredoc extraction itself is timing out.
 - Ensure `fallback_on_parse_error` is true for hook mode.
+
+For ordinary full evaluation on a slower workstation or modest VPS, tune the
+separate absolute hook budget. For example:
+
+```toml
+[general]
+hook_timeout_ms = 1500
+```
+
+The equivalent one-process override is `DCG_HOOK_TIMEOUT_MS=1500`. Confirm the
+slow path with `dcg explain "<command>"`; deadline exhaustion must appear as
+`INDETERMINATE`, never `ALLOW` or `quick-rejected`. Do not reduce the budget
+below the measured full-evaluation latency for the host.
 
 ## Performance concerns
 

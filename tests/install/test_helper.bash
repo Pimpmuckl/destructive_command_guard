@@ -30,7 +30,7 @@ extract_install_functions() {
             s/^umask 022/umask 022; set +e/
             # Drop the top-level install/download execution block. Later hook
             # configuration functions still need to be sourced.
-            /^resolve_version$/,/^# Claude Code \/ Gemini CLI \/ Cursor Auto-Configuration$/ {
+            /^set_artifact_url$/,/^# Claude Code \/ Gemini CLI \/ Cursor Auto-Configuration$/ {
                 /^# Claude Code \/ Gemini CLI \/ Cursor Auto-Configuration$/!d
             }
             # Return before the final auto-configuration execution block.

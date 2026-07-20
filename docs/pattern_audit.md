@@ -133,9 +133,9 @@ Generated: 2026-04-30T22:58:33.693996
 | Kind | Name | Reason | Regex Preview |
 |------|------|--------|---------------|
 | safe | `wrangler-whoami` | Found '(?=' | `wrangler(?:\s+--?\S+(?:\s+\S+)?)*\s+whoami(?=\s\|$)` |
-| safe | `wrangler-kv-get` | Found '(?=' | `wrangler(?:\s+--?\S+(?:\s+\S+)?)*\s+kv:key\s+get(?=\s\|$)` |
-| safe | `wrangler-kv-list` | Found '(?=' | `wrangler(?:\s+--?\S+(?:\s+\S+)?)*\s+kv:key\s+list(?=\s\|$)` |
-| safe | `wrangler-kv-namespace-list` | Found '(?=' | `wrangler(?:\s+--?\S+(?:\s+\S+)?)*\s+kv:namespace\s+list(?...` |
+| safe | `wrangler-kv-get` | Found '(?=' | `wrangler(?:\s+--?\S+(?:\s+\S+)?)*\s+kv(?::\|\s+)key\s+get(?=\s\|$)` |
+| safe | `wrangler-kv-list` | Found '(?=' | `wrangler(?:\s+--?\S+(?:\s+\S+)?)*\s+kv(?::\|\s+)key\s+list(?=\s\|$)` |
+| safe | `wrangler-kv-namespace-list` | Found '(?=' | `wrangler(?:\s+--?\S+(?:\s+\S+)?)*\s+kv(?::\|\s+)namespace\s+list(?...` |
 | safe | `wrangler-r2-object-get` | Found '(?=' | `wrangler(?:\s+--?\S+(?:\s+\S+)?)*\s+r2\s+object\s+get(?=\...` |
 | safe | `wrangler-r2-bucket-list` | Found '(?=' | `wrangler(?:\s+--?\S+(?:\s+\S+)?)*\s+r2\s+bucket\s+list(?=...` |
 | safe | `wrangler-d1-list` | Found '(?=' | `wrangler(?:\s+--?\S+(?:\s+\S+)?)*\s+d1\s+list(?=\s\|$)` |

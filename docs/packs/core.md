@@ -40,6 +40,7 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
+| `git-alias-semantic-unverified` | The invoked Git alias depends on shell expansion, contains a cycle, or exceeds dcg's bounded semantic analysis. | high |
 | `checkout-discard` | git checkout -- discards uncommitted changes permanently. Use 'git stash' first. | high |
 | `checkout-ref-discard` | git checkout <ref> -- <path> overwrites working tree. Use 'git stash' first. | high |
 | `restore-worktree` | git restore discards uncommitted changes. Use 'git stash' or 'git diff' first. | high |
@@ -49,7 +50,7 @@ These patterns match potentially destructive commands:
 | `clean-force` | git clean -f/--force removes untracked files permanently. Review with 'git clean -n' first. | critical |
 | `push-force-long` | Force push can destroy remote history. Use --force-with-lease if necessary. | critical |
 | `push-force-short` | Force push (-f) can destroy remote history. Use --force-with-lease if necessary. | critical |
-| `branch-force-delete` | git branch -D/--force deletes branches without checks. Recoverable via 'git reflog'. | medium |
+| `branch-force-delete` | git branch deletion or forced ref updates require explicit user approval. | high |
 | `stash-drop` | git stash drop deletes a single stash. Recoverable via `git fsck` (unreachable objects). | medium |
 | `stash-clear` | git stash clear permanently deletes ALL stashed changes. | critical |
 
@@ -78,7 +79,7 @@ risk_acknowledged = true
 
 **Pack ID:** `core.filesystem`
 
-Protects against dangerous rm -rf commands and equivalent destruction (find -delete, unlink) outside temp directories
+Protects against recursive rm commands and equivalent filesystem destruction outside literal temp subdirectories
 
 ### Keywords
 
@@ -110,6 +111,12 @@ Commands containing these keywords are checked against this pack:
 - `>|`
 - `1>`
 - `2>`
+- `>%`
+- `> %`
+- `>!`
+- `> !`
+- `>^`
+- `> ^`
 
 ### Safe Patterns (Allowed)
 
@@ -180,7 +187,7 @@ These patterns match potentially destructive commands:
 | `dd-overwrite-general` | dd with of=<file> overwrites file contents and requires human approval. | high |
 | `mv-sensitive-source-root-home` | mv touching a sensitive system or home path is the cross-segment recursive-force-delete bypass. EXTREMELY DANGEROUS. | critical |
 | `mv-dynamic-path` | mv with a shell-expanded or escaped path cannot be verified before execution. | high |
-| `redirect-truncate-root-home` | shell redirect (>, >\|, &>, >&, 1>, 2>) to a sensitive system or home path truncates the file to zero bytes. EXTREMELY DANGEROUS. | critical |
+| `redirect-truncate-root-home` | shell truncating redirect (including arbitrary numeric, named, and PowerShell all-stream forms) to a sensitive system or home path destroys the previous file contents. EXTREMELY DANGEROUS. | critical |
 | `redirect-truncate-dynamic-path` | shell redirect to a dynamic or escaped path may truncate a sensitive file and requires human approval. | high |
 
 ### Allowlist Guidance

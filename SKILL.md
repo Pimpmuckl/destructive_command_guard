@@ -57,7 +57,7 @@ The pattern set prioritizes **never allowing dangerous commands** over avoiding 
 | Command | Reason |
 |---------|--------|
 | `git push --force` / `-f` | Overwrites remote commits |
-| `git branch -D` | Force-deletes without merge check |
+| `git branch -d`, `--delete`, `-D`, `-f`, `-M`, `-C` | Deletes or force-overwrites a user-owned branch ref |
 
 ### Git Commands That Destroy Stashed Work
 
@@ -78,7 +78,7 @@ Safe operations pass through silently:
 
 ### Always Safe Git Operations
 
-`git status`, `git log`, `git diff`, `git add`, `git commit`, `git push`, `git pull`, `git fetch`, `git branch -d` (safe delete with merge check), `git stash`, `git stash pop`, `git stash list`
+`git status`, `git log`, `git diff`, `git add`, `git commit`, `git push`, `git pull`, `git fetch`, read-only branch listings, `git stash`, `git stash pop`, `git stash list`
 
 ### Explicitly Safe Patterns
 
@@ -427,9 +427,9 @@ DCG assumes the AI agent is **well-intentioned but fallible**. It catches honest
 
 ## FAQ
 
-**Q: Why block `git branch -D` but allow `git branch -d`?**
+**Q: Why block both `git branch -d` and `git branch -D`?**
 
-Lowercase `-d` only deletes branches fully merged. Uppercase `-D` force-deletes regardless of merge status, potentially losing commits.
+Lowercase `-d` checks merge state, but still removes the branch name, upstream-tracking configuration, and convenient reflog reference. Those are user-owned state, so every delete form requires explicit approval. Review first with `git branch -vv`, `git branch --merged`, and `git branch --no-merged`.
 
 **Q: Why is `git push --force-with-lease` allowed?**
 

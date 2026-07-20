@@ -1,6 +1,8 @@
 name: release-automation
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -8,7 +10,6 @@ permissions:
 
 jobs:
   tag-release:
-    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -25,21 +26,16 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Check release tag
-        id: tag
+      - name: Read latest tag
+        id: latest
         run: |
-          tag="v${{ steps.version.outputs.version }}"
-          echo "name=$tag" >> "$GITHUB_OUTPUT"
-          if git show-ref --verify --quiet "refs/tags/$tag"; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
+          latest=$(git tag --list 'v*' --sort=-v:refname | head -1)
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
 
       - name: Create tag
-        if: steps.tag.outputs.exists != 'true'
+        if: steps.latest.outputs.latest != format('v{0}', steps.version.outputs.version)
         run: |
-          tag="${{ steps.tag.outputs.name }}"
+          tag="v${{ steps.version.outputs.version }}"
           echo "Creating release tag $tag"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -47,6 +43,6 @@ jobs:
           git push origin "$tag"
 
       - name: Skip (already tagged)
-        if: steps.tag.outputs.exists == 'true'
+        if: steps.latest.outputs.latest == format('v{0}', steps.version.outputs.version)
         run: |
-          echo "Tag ${{ steps.tag.outputs.name }} already exists; nothing to do."
+          echo "Latest tag matches Cargo.toml version; nothing to do."

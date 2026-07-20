@@ -13,7 +13,7 @@
 #
 #   - Set DCG_VERSION to pin a specific version:
 #     - "latest" (default): Use latest release
-#     - "v0.6.8-codexpp.1": Use a specific fork version tag
+#     - "v0.6.9": Use specific version tag
 
 name: dcg-scan
 
@@ -25,7 +25,7 @@ env:
   CARGO_TERM_COLOR: always
   # Fail policy: "error" | "warning" | "none"
   DCG_FAIL_ON: error
-  # Version to use: "latest" or a specific tag like "v0.6.8-codexpp.1"
+  # Version to use: "latest" or specific tag like "v0.6.9"
   DCG_VERSION: latest
 
 jobs:
@@ -48,14 +48,7 @@ jobs:
           set -euo pipefail
 
           if [ "$DCG_VERSION" = "latest" ]; then
-            if ! VERSION=$(curl -fsSL https://api.github.com/repos/Pimpmuckl/destructive_command_guard/releases/latest | jq -er '.tag_name | select(type == "string" and length > 0)'); then
-              echo "::warning::No fork release is published yet; building Pimpmuckl/main for this scan"
-              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-              source "$HOME/.cargo/env"
-              cargo install --locked --git https://github.com/Pimpmuckl/destructive_command_guard --branch main destructive_command_guard
-              echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-              exit 0
-            fi
+            VERSION=$(curl -fsSL https://api.github.com/repos/Dicklesworthstone/destructive_command_guard/releases/latest | jq -er '.tag_name | select(type == "string" and length > 0)')
           else
             VERSION="$DCG_VERSION"
           fi
@@ -65,7 +58,7 @@ jobs:
           fi
 
           ARCHIVE="dcg-x86_64-unknown-linux-musl.tar.xz"
-          DOWNLOAD_URL="https://github.com/Pimpmuckl/destructive_command_guard/releases/download/${VERSION}/${ARCHIVE}"
+          DOWNLOAD_URL="https://github.com/Dicklesworthstone/destructive_command_guard/releases/download/${VERSION}/${ARCHIVE}"
           CHECKSUM_URL="${DOWNLOAD_URL}.sha256"
 
           WORK_DIR=$(mktemp -d "${RUNNER_TEMP}/dcg-scan.XXXXXX")
@@ -77,7 +70,7 @@ jobs:
             # Fallback: build from source
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
             source "$HOME/.cargo/env"
-            cargo install --locked --git https://github.com/Pimpmuckl/destructive_command_guard --tag "$VERSION" destructive_command_guard
+            cargo install destructive_command_guard --locked --version "=${VERSION#v}"
             echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           else
             curl -fsSL "$CHECKSUM_URL" -o "${ARCHIVE}.sha256"
@@ -134,12 +127,6 @@ jobs:
           # Run the scan (stdout=JSON, stderr=debug messages)
           dcg scan \
             --git-diff "$DIFF_RANGE" \
-            --exclude install.sh \
-            --exclude install.ps1 \
-            --exclude uninstall.sh \
-            --exclude uninstall.ps1 \
-            --exclude .github/workflows/dist.yml \
-            --exclude tests/install/test_helper.bash \
             --format json \
             --fail-on "$DCG_FAIL_ON" \
             > scan-results.json
@@ -198,7 +185,7 @@ jobs:
   #   steps:
   #     - uses: dtolnay/rust-toolchain@nightly
   #     - name: Build dcg
-  #       run: cargo install --locked --git https://github.com/Pimpmuckl/destructive_command_guard --tag v0.6.8-codexpp.1 destructive_command_guard
+  #       run: cargo install destructive_command_guard --locked
   #     - name: Upload binary
   #       uses: actions/upload-artifact@v7
   #       with:

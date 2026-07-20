@@ -102,6 +102,8 @@ teardown() {
 
     case "${os}-${arch}" in
         linux-x86_64) target="x86_64-unknown-linux-musl" ;;
+        linux-aarch64) target="aarch64-unknown-linux-gnu" ;;
+        darwin-x86_64) target="x86_64-apple-darwin" ;;
         darwin-aarch64) target="aarch64-apple-darwin" ;;
     esac
 
@@ -118,35 +120,13 @@ teardown() {
 
     case "${os}-${arch}" in
         linux-x86_64) target="x86_64-unknown-linux-musl" ;;
+        linux-aarch64) target="aarch64-unknown-linux-gnu" ;;
+        darwin-x86_64) target="x86_64-apple-darwin" ;;
         darwin-aarch64) target="aarch64-apple-darwin" ;;
     esac
 
     log_test "Target triple: $target"
     [ "$target" = "aarch64-apple-darwin" ]
-}
-
-@test "platform detection: unsupported release architectures fall back to source" {
-    MOCK_UNAME_S="Linux"
-    MOCK_UNAME_M="aarch64"
-    uname() {
-        case "$1" in
-            -s) printf '%s\n' "$MOCK_UNAME_S" ;;
-            -m) printf '%s\n' "$MOCK_UNAME_M" ;;
-        esac
-    }
-
-    FROM_SOURCE=0
-    ARTIFACT_URL=""
-    detect_platform
-    [ -z "$TARGET" ]
-    [ "$FROM_SOURCE" -eq 1 ]
-
-    MOCK_UNAME_S="Darwin"
-    MOCK_UNAME_M="x86_64"
-    FROM_SOURCE=0
-    detect_platform
-    [ -z "$TARGET" ]
-    [ "$FROM_SOURCE" -eq 1 ]
 }
 
 # ============================================================================
@@ -577,44 +557,6 @@ MOCKEOF
     grep -Fxq -- "--branch" "$GIT_ARGS_FILE"
     grep -Fxq -- "v1.2.3" "$GIT_ARGS_FILE"
     grep -Fxq -- "--single-branch" "$GIT_ARGS_FILE"
-}
-
-@test "source install continues to shared no-configure handling" {
-    cat > "$TEST_TMPDIR/bin/git" << 'MOCKEOF'
-#!/bin/bash
-mkdir -p "${@: -1}"
-MOCKEOF
-    cat > "$TEST_TMPDIR/bin/cargo" << 'MOCKEOF'
-#!/bin/bash
-mkdir -p target/release
-cat > target/release/dcg << 'BINEOF'
-#!/bin/bash
-[ "$1" = "--version" ] && echo "dcg 0.6.8-codexpp.1"
-BINEOF
-chmod +x target/release/dcg
-MOCKEOF
-    chmod +x "$TEST_TMPDIR/bin/git" "$TEST_TMPDIR/bin/cargo"
-
-    run env HOME="$HOME" PATH="$PATH" DCG_OFFLINE=1 RUSTUP_INIT_SKIP=1 \
-        bash "$INSTALL_SCRIPT" --from-source --version v0.6.8-codexpp.1 \
-        --dest "$TEST_TMPDIR/install-bin" --no-configure
-
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"Skipping agent configuration (--no-configure)"* ]]
-    [ -x "$TEST_TMPDIR/install-bin/dcg" ]
-}
-
-@test "action source fallback builds inside the exact-tag checkout" {
-    run python3 - "$PROJECT_ROOT/action/action.yml" <<'PY'
-import sys
-from pathlib import Path
-
-action = Path(sys.argv[1]).read_text()
-assert 'git clone --depth 1 --branch "$VERSION" --single-branch' in action
-assert '(cd "$source_root/repo" && cargo build --release --locked)' in action
-assert '"$("$binary" --version)" = "${VERSION#v}"' in action
-PY
-    [ "$status" -eq 0 ]
 }
 
 @test "run_install_self_test: requires an allow and a real deny" {

@@ -311,7 +311,6 @@ fn test_audit_backtracking_requirements() {
                 "redirect-truncate-dynamic-path",
                 "redirect-truncate-root-home",
                 "rsync-sensitive-then-delete",
-                "sed-exec-unverified",
                 "shred-root-home",
                 "shred-tmp",
                 "shred-tmpdir",
@@ -353,17 +352,10 @@ fn test_audit_backtracking_requirements() {
                 "mongo-explain",
                 "mongo-find",
                 "mongodump-no-drop",
-                "stdin-unverified",
             ]),
         ),
-        (
-            "database.mysql",
-            HashSet::from(["mysqldump-no-drop", "stdin-unverified"]),
-        ),
-        (
-            "database.postgresql",
-            HashSet::from(["pg-dump-no-clean", "stdin-unverified"]),
-        ),
+        ("database.mysql", HashSet::from(["mysqldump-no-drop"])),
+        ("database.postgresql", HashSet::from(["pg-dump-no-clean"])),
         (
             "database.redis",
             HashSet::from([
@@ -373,10 +365,9 @@ fn test_audit_backtracking_requirements() {
                 "redis-info",
                 "redis-keys",
                 "redis-scan",
-                "stdin-unverified",
             ]),
         ),
-        ("database.sqlite", HashSet::from(["stdin-unverified"])),
+        ("database.sqlite", HashSet::new()),
         ("dns.generic", HashSet::from(["dns-dig-safe"])),
         (
             "dns.cloudflare",
@@ -1056,7 +1047,11 @@ fn test_audit_backtracking_requirements() {
         ),
         (
             "windows.filesystem",
-            HashSet::from(["whatif-preview", "remove-item-recurse-force"]),
+            HashSet::from([
+                "whatif-preview",
+                "remove-item-recurse",
+                "remove-item-recurse-force",
+            ]),
         ),
         ("windows.misc", HashSet::from(["robocopy-mirror"])),
         (

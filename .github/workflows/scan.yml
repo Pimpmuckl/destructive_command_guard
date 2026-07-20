@@ -74,12 +74,6 @@ jobs:
           # Note: stdout goes to JSON file, stderr logged separately to avoid corrupting JSON
           ./target/release/dcg scan \
             --git-diff "${{ steps.base.outputs.ref }}...HEAD" \
-            --exclude install.sh \
-            --exclude install.ps1 \
-            --exclude uninstall.sh \
-            --exclude uninstall.ps1 \
-            --exclude .github/workflows/dist.yml \
-            --exclude tests/install/test_helper.bash \
             --format json \
             --fail-on error \
             --max-findings 50 \

@@ -188,7 +188,8 @@ function Invoke-Dcg { param([string]$Json, [hashtable]$EnvOverrides = @{})
         $stderr = (Get-Content -Raw -LiteralPath $errFile -ErrorAction SilentlyContinue)
         if ($null -eq $stderr) { $stderr = "" }
     } finally {
-        Remove-Item -LiteralPath $errFile -Force -ErrorAction SilentlyContinue
+        # Retain the isolated stderr capture: repository policy forbids
+        # destructive cleanup of generated test artifacts.
         foreach ($k in $EnvOverrides.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k]) }
     }
     [pscustomobject]@{ StdOut = $stdout; StdErr = $stderr }
@@ -260,8 +261,8 @@ function Test-MalformedInput { param([string]$Raw, [string]$Desc)
     else { Log-Fail "Should ALLOW malformed: $Desc" "<empty>" $r.StdOut.Trim() }
 }
 
-# Project-allowlist scenario: write .dcg/allowlist.toml in a temp git repo and run
-# the binary from that directory so the project allowlist is discovered.
+# Explicitly trusted project-allowlist scenario: repository contents alone are
+# not a trust grant, so select an otherwise-empty .dcg.toml through DCG_CONFIG.
 function Test-Allowlist {
     param([string]$Cmd, [string]$Verdict, [string]$Desc, [string]$AllowlistToml, [hashtable]$ExtraEnv = @{})
     Log-TestStart $Desc
@@ -275,8 +276,11 @@ function Test-Allowlist {
             Set-Content -Path (Join-Path $dcgDir "allowlist.toml") -Value $AllowlistToml -Encoding utf8
         }
         & git -C $proj init --quiet 2>$null | Out-Null
+        $projectConfig = Join-Path $proj ".dcg.toml"
+        [System.IO.File]::WriteAllText($projectConfig, "")
         Set-Location $proj
         $env = Get-BaseEnv
+        $env["DCG_CONFIG"] = $projectConfig
         foreach ($k in $ExtraEnv.Keys) { $env[$k] = $ExtraEnv[$k] }
         $r = Invoke-Dcg -Json (New-HookJson $Cmd) -EnvOverrides $env
         $out = $r.StdOut
@@ -289,7 +293,8 @@ function Test-Allowlist {
         }
     } finally {
         Set-Location $prevCwd
-        Remove-Item -Recurse -Force $proj -ErrorAction SilentlyContinue
+        # Deliberately retain the isolated fixture: repository policy forbids
+        # destructive cleanup, and each GUID path is collision-free.
     }
 }
 
@@ -317,6 +322,10 @@ try {
         "git restore file.txt", "git restore --worktree file.txt", "git restore -W file.txt",
         "git clean -f", "git clean -df", "git clean -fd",
         "git push --force", "git push -f", "git push origin main --force", "git push --force origin main",
+        "git branch -d feature", "git branch -D feature", "git branch --delete feature",
+        "git branch --del feature", "git branch -M old existing", "git branch -C old existing",
+        "git branch --no-format -d feature", "FOO=bar git branch --del feature",
+        "gIt.ExE branch -d feature",
         "git stash clear", '"git" reset --hard', '"/usr/bin/git" reset --hard'
     )
     foreach ($c in $destructiveGit) { Test-Verdict $c "block" $c }
@@ -327,7 +336,12 @@ try {
     Log-Section "Safe Git (should ALLOW)"
     $safeGit = @(
         "git status", "git log", "git diff", "git add .", "git commit -m 'test'", "git push",
-        "git push --force-with-lease", "git branch -d feature", "git checkout main", "git checkout -b feature",
+        "git push --force-with-lease", "git branch --merged", "git checkout main", "git checkout -b feature",
+        "git branch --format -d", "git branch --form -d", "git branch --merged -d feature",
+        "git branch -d --no-delete feature", "git branch --force --no-force feature",
+        "git branch --end-of-options -d", "git branch -dh feature", "git --exec-path branch -d feature",
+        "git branch -tdirect", "git branch --show-current && ls -d",
+        "git branch --show-current; printf '%s' --delete",
         "git restore --staged file.txt", "git clean -n", "git clean --dry-run", "git merge feature",
         "git rebase main", "git reset --soft HEAD~1", "git reset --mixed HEAD", "git reset HEAD"
     )
@@ -344,6 +358,8 @@ try {
         'rm -rf "$TMPDIR/../etc"', "rm -r -f /tmp/../etc", "rm --recursive --force /tmp/../etc",
         "rm -fr /etc", "rm -Rf /home", "rm -r -f /etc", "rm -f -r /etc",
         "rm --recursive --force /etc", "rm --force --recursive /etc",
+        "rm -r ./build", "rm -R Desktop", "rm --recursive /etc",
+        "rm -r -i -f ./build", "rm -r --interactive=never ./build",
         '"rm" -rf /etc', '"/bin/rm" -rf /etc', 'echo hi; "rm" -rf /etc', 'sudo -u root "rm" -rf /etc'
     )
     foreach ($c in $destructiveRm) { Test-Verdict $c "block" $c }
@@ -356,8 +372,10 @@ try {
         "rm -rf /tmp/build", "rm -rf /tmp/test-dir", "rm -rf /tmp/foo..bar", "rm -rf /var/tmp/cache",
         "rm -fr /tmp/stuff", "rm -Rf /tmp/more", "rm -r -f /tmp/test", "rm -f -r /tmp/test",
         "rm --recursive --force /tmp/test", "rm --force --recursive /tmp/test",
+        "rm -r /tmp/test", "rm --recursive /var/tmp/cache",
+        "rm -rf -i ./build", "rm -r --force --interactive=once ./build",
         'rm -rf $TMPDIR/test', 'rm -rf ${TMPDIR}/test', 'rm -rf "$TMPDIR/test"',
-        "rm file.txt", "rm -f file.txt", "rm -r directory", "rm -i file.txt"
+        "rm file.txt", "rm -f file.txt", "rm -i file.txt"
     )
     foreach ($c in $safeRm) { Test-Verdict $c "allow" $c }
 
@@ -418,7 +436,6 @@ try {
     # Default severity (Medium -> WARN by default; no policy override)
     # -----------------------------------------------------------------------
     Log-Section "Default severity (Medium -> WARN)"
-    Test-Verdict "git branch -D feature" "warn" "git branch -D (default warn)"
     Test-Verdict "git stash drop" "warn" "git stash drop (default warn)"
     Test-Verdict "git stash drop stash@{0}" "warn" "git stash drop <ref> (default warn)"
 
@@ -426,7 +443,7 @@ try {
     # Policy override (deny/warn/log); Critical always blocks
     # -----------------------------------------------------------------------
     Log-Section "Policy override modes"
-    Test-Verdict "git branch -D feature" "warn"   "branch -D respects policy=warn" $null "warn"
+    Test-Verdict "git branch -D feature" "warn"   "High branch delete respects explicit policy=warn" $null "warn"
     Test-Verdict "git branch -D feature" "silent" "branch -D respects policy=log (silent)" $null "log"
     Test-Verdict "git reset --hard" "block" "Critical blocks even under policy=warn" $null "warn"
     Test-Verdict "rm -rf -- /" "block" "Critical rm blocks even under policy=warn" $null "warn"
@@ -471,6 +488,12 @@ try {
         @{ p = "storage.s3"; c = "aws s3 rm s3://bucket --recursive"; v = "block" },
         @{ p = "storage.s3"; c = "aws s3 rm s3://bucket --recursive --dryrun"; v = "allow" },
         @{ p = "storage.s3"; c = "aws s3 ls s3://bucket"; v = "allow" },
+        @{ p = "cdn.cloudflare_workers"; c = "npx wrangler kv namespace delete --binding=CACHE"; v = "block" },
+        @{ p = "cdn.cloudflare_workers"; c = "wrangler kv key delete TOKEN --namespace-id=abc"; v = "warn" },
+        @{ p = "cdn.cloudflare_workers"; c = "wrangler kv bulk delete keys.json --namespace-id=abc"; v = "block" },
+        @{ p = "cdn.cloudflare_workers"; c = "wrangler kv:namespace delete --namespace-id=abc"; v = "block" },
+        @{ p = "cdn.cloudflare_workers"; c = "wrangler kv namespace list"; v = "allow" },
+        @{ p = "cdn.cloudflare_workers"; c = "wrangler kv key get TOKEN --namespace-id=abc"; v = "allow" },
         @{ p = "cloud.aws"; c = "aws ec2 terminate-instances --instance-ids i-123 --dry-run"; v = "allow" },
         @{ p = "cloud.aws"; c = "aws ec2 terminate-instances --instance-ids i-123 --dry-run=false"; v = "block" },
         @{ p = "cloud.aws"; c = "aws cloudformation delete-stack --stack-name prod --dry-run"; v = "block" },
@@ -626,7 +649,8 @@ conditions = { CI = "true" }
 
 } finally {
     Set-Location $RepoRoot 2>$null
-    Remove-Item -Recurse -Force $script:SandboxRoot -ErrorAction SilentlyContinue
+    # Retain the GUID-scoped sandbox: repository policy forbids destructive
+    # cleanup of generated test artifacts.
 }
 
 # ===========================================================================

@@ -134,10 +134,10 @@ trust_level = "medium"
 | `additional_allowlist` | array | `[]` | Command patterns to allowlist for this agent (added on top of the base allowlist). |
 | `disabled_allowlist` | bool | `false` | If `true`, ignore all allowlist entries for this agent (more restrictive). |
 
-### Example: Restrictive Config for CI
+### Example: Agent Profiles for a Trusted Config
 
 ```toml
-# In .dcg.toml (project-level)
+# In ~/.config/dcg/config.toml, or in a reviewed file selected with DCG_CONFIG
 [agents.unknown]
 trust_level = "low"
 disabled_allowlist = true
@@ -147,6 +147,12 @@ extra_packs = ["strict_git", "database", "system"]
 trust_level = "medium"
 additional_allowlist = ["npm test", "npm run lint"]
 ```
+
+Automatically discovered repository `.dcg.toml` files cannot define agent
+profiles. Profiles can disable packs or add allowlist entries, so accepting
+them from a newly cloned repository would cross dcg's security boundary. To
+use a reviewed repository-owned profile deliberately, invoke dcg with
+`DCG_CONFIG=.dcg.toml` (or copy the profile into the user config).
 
 ## Custom Agents
 
@@ -390,8 +396,9 @@ Available formats:
 2. **Grant trust incrementally**: Only increase trust for agents after
    observing their behavior.
 
-3. **Use project-level configs**: Put agent profiles in `.dcg.toml` so they're
-   version-controlled with your project.
+3. **Version reviewed profiles carefully**: A repository can keep a reviewed
+   profile in `.dcg.toml`, but it only takes effect when explicitly selected
+   with `DCG_CONFIG=.dcg.toml`; automatic discovery ignores agent profiles.
 
 4. **Restrict unknown agents**: Always configure `agents.unknown` with lower
    trust in production environments.

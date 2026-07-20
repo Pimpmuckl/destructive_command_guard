@@ -255,10 +255,10 @@ Result: Valid
 
 ### Configuration
 
-Add pack paths in your config file:
+Add pack paths in a trusted config file:
 
 ```toml
-# ~/.config/dcg/config.toml or .dcg.toml
+# ~/.config/dcg/config.toml (or a file selected explicitly with DCG_CONFIG)
 [packs]
 custom_paths = [
   "~/.config/dcg/packs/*.yaml",
@@ -266,6 +266,11 @@ custom_paths = [
   "/etc/dcg/packs/*.yaml"
 ]
 ```
+
+An automatically discovered repository `.dcg.toml` may enable built-in packs,
+but its `custom_paths` are ignored because those paths resolve to
+repository-controlled data. After reviewing a repository's config and pack
+files, opt in deliberately with `DCG_CONFIG=.dcg.toml`.
 
 ### Load Order and Precedence
 

@@ -11,7 +11,170 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
-## [v0.6.8](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.8) -- 2026-07-15 [Release]
+## [v0.6.9](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.9) -- 2026-07-18 [Release]
+
+Security and correctness release that supersedes the unpublished v0.6.8 source
+tag. It resolves nine newly reported issues across command analysis, pack
+coverage, reliability, and configuration security; adds the Snowflake CLI pack;
+makes hook deadline exhaustion explicitly fail closed; and completes the
+Windows installer work begun in v0.6.7.
+
+### Compatibility
+
+- This pre-1.0 release intentionally changes the public Rust library surface:
+  fail-open helpers and constants are removed, `Indeterminate` decisions are
+  explicit, and evaluator/simulation results carry new provenance and shell
+  dialect fields. Embedders must update exhaustive matches and struct literals.
+  No compatibility shim is retained because preserving fail-open semantics
+  would undermine the security correction in this release.
+
+### Security
+
+- **Treat every local branch ref deletion or force-update as an approval
+  boundary (#209).** Semantic Git parsing now covers `branch -d`, `--delete`,
+  `-D`, `-f`, `-M`, and `-C`, including aliases, shell wrappers, PowerShell and
+  Cmd syntax, and configuration-defined shell functions. Quoted alias
+  arguments and unresolved forwarded parameters fail closed without
+  misclassifying `--format -d` as a deletion.
+- **Protect every recursive `rm`, not only forced forms (#211).** `rm -r`,
+  `rm -R`, and `rm --recursive` now receive the same bounded target analysis as
+  `rm -rf`; interactive `-i`/`-I`, literal temp subdirectories, option ordering,
+  multiple targets, redirections, relocations, and shell-specific decoding are
+  handled semantically. Contributor PR #219 was mined for its report and
+  regression ideas; the broader semantic implementation was developed
+  independently.
+- Recursive-rm option ordering is evaluated under both GNU permutation and
+  Apple/BSD stop-at-first-operand semantics. A trailing `-i`, `--help`, or
+  `--version` can no longer appear to cancel deletion on Linux while remaining
+  a plain path operand after an already-recursive target on macOS.
+- **Decode executable ANSI-C, hex, and shell-specific command spellings before
+  keyword gating (#217).** Caller-proven Bash, PowerShell, and Cmd syntax can no
+  longer hide protected executables from the fast path, while quoted data stays
+  inert. Contributor PR #220 was mined for its bypass example and tests; the
+  role-aware multi-shell implementation was developed independently.
+- **Make automatically discovered project configuration enforcement-only
+  (#218).** An untrusted checkout may add packs, denies, fail-closed behavior,
+  or stricter heredoc policy, but cannot disable protection, add allow rules,
+  load repository code/config paths, raise resource limits, or override the
+  user's agent profiles. `DCG_CONFIG=.dcg.toml` remains the explicit reviewed
+  opt-in to full project configuration. Unix discovery now performs a bounded
+  same-descriptor read of a direct regular file and rejects symlinks, FIFOs,
+  devices, and path-identity races; native Windows discovery fails closed until
+  equivalent reparse-point and file-identity validation is available. Untrusted
+  parse diagnostics never echo repository-controlled source lines.
+- Harden PowerShell/Cmd semantic boundaries: visible aliases preserve target
+  spelling, ScriptBlock consumers and control-flow bodies are recursively
+  evaluated, static call expressions retain executable/data roles, indexed or
+  dynamic call targets fail closed where necessary, and a proven non-filesystem
+  command is never reinterpreted by context-free deletion regexes.
+- Parse PowerShell here-strings as atomic values without letting interior quote
+  characters hide later statements; honor the binder's exact ASCII/en-dash,
+  em-dash, and horizontal-bar parameter prefixes, unambiguous abbreviations,
+  switch aliases, and explicit Boolean switch values.
+- **Block recursive PowerShell deletion even without `-Force`.** `Remove-Item
+  -Recurse` and its aliases now map to the critical `remove-item-recurse` rule;
+  `-Force` only broadens which items are removed. Proven `-WhatIf` previews
+  remain allowed, while dynamic binding fails closed and statically invalid or
+  ambiguous parameters preserve PowerShell's pre-execution error behavior.
+- Close adjacent embedded-code bypasses in quoted heredocs, indentation-stripped
+  heredocs, executable-text sinks, dynamically rebound stdin data sinks, and
+  dynamically selected Wrangler scripts.
+- Precompile the bounded Perl fallback patterns when constructing the AST
+  matcher. Their one-time regex compilation can no longer consume the
+  per-match budget and make the first Perl heredoc scan time out before any
+  safety analysis runs.
+- **Keep data-only arguments masked after shell control-flow words (#221).**
+  Unquoted `if`, `then`, `elif`, `else`, `while`, `until`, `do`, `{`, and `!`
+  now introduce the following executable instead of occupying its command slot,
+  preventing quoted `printf` arrows from being misread as redirects. Real
+  redirect operators and explicitly selected executables named like reserved
+  words remain visible.
+
+### Packs
+
+- **Add complete modern Snowflake CLI protection (#212).** `snow sql` inline
+  queries, stdin, local files, nested `!source` graphs, templating, comments,
+  directives, DDL, unbounded and bounded DML, stages, tasks, pipes, warehouses,
+  shares, and privilege changes are parsed with explicit byte/token/depth/file
+  bounds. Dynamic or ambiguous sources fail closed.
+- Snowflake evaluation retains every guarded statement in deterministic source
+  order with exact payload spans and bounded previews. Denials summarize all
+  findings; allowlisting the highest-severity statement cannot hide another
+  guarded statement later in the same payload, and reports over 512 findings
+  fail closed rather than truncate.
+- Snowflake CLI commands larger than the semantic parser's 64 KiB defensive
+  bound now fail closed even when an operator raises the hook's outer command
+  limit; bounded analysis can no longer become an implicit no-match decision.
+- A proven database client now owns its embedded payload's rule attribution.
+  In particular, generic PostgreSQL patterns can no longer preempt Snowflake's
+  statement spans and recovery guidance, or re-block a Snowflake rule that was
+  explicitly reviewed and allowlisted.
+- **Recognize current Wrangler v4 KV deletion syntax (#210).** Both
+  `wrangler kv namespace delete` and legacy colon syntax are covered, including
+  Bun/npm/npx wrappers and dynamically selected scripts that cannot be proven
+  safe.
+
+### Reliability and diagnostics
+
+- **Deadline exhaustion is never a silent allow (#213).** Evaluation now
+  returns an explicit indeterminate decision; review-capable protocols receive
+  `ask`, while protocols without that state receive their documented blocking
+  response. The timeout is configurable with `general.hook_timeout_ms` or
+  `DCG_HOOK_TIMEOUT_MS` and retains a defensive minimum.
+- Indeterminate hook responses are written and flushed before best-effort
+  history is queued; the history worker is then detached, and deadline paths
+  avoid synchronous file diagnostics. A slow audit sink can no longer delay
+  process exit after the safety budget is exhausted.
+- Explain, trace, corpus, batch, and hook output now carry exact quick-reject
+  provenance from the evaluator instead of inferring it from an empty match.
+  A slow full evaluation or deadline stop can no longer be mislabeled
+  `quick-rejected`.
+- Quick-reject word boundaries no longer treat filenames such as `.gitignore`
+  as Git commands. Heredoc masking, trace schemas, suggestion registration,
+  performance-contract documentation, and cross-platform launcher tests are
+  synchronized with the implementation.
+- Caller-proven shell decoding no longer rebuilds Git regex input from the raw
+  command after role-aware sanitization. Commit messages and other inert argv
+  data remain masked even when the Git executable uses Bash, PowerShell, or Cmd
+  obfuscation, while the raw source still drives semantic executable analysis.
+- Heredoc raw-shell masking conservatively leaves an unknown future body form
+  unmasked instead of panicking inside the hook.
+
+### Windows installer
+
+- **Complete the WDAC/AppLocker ConstrainedLanguage path (#194).** Native
+  version and verification probes now capture stdout/stderr under Windows
+  PowerShell 5.1 without promoting DCG's intentional diagnostics into a
+  terminating `NativeCommandError`, while retaining exit-code and strict-error
+  checks. Release acceptance requires the public installer to succeed from a
+  separately downloaded unsigned script in a forced Windows PowerShell 5.1
+  ConstrainedLanguage session on a real Windows host. This validates the
+  restricted-language behavior without claiming that the host enforces UMCI.
+
+### Dependencies
+
+- Update `fsqlite`, `fsqlite-types`, and `fsqlite-error` from 0.1.16 to
+  0.1.17 so DCG's optional history store inherits FrankenSQLite's latest
+  corruption-recovery and transaction-cleanup hardening.
+- Incorporate Dependabot PR #214, merged directly on `main` before this
+  release: update `clap` and `clap_builder` from 4.6.1/4.6.0 to 4.6.2 in both
+  the root and fuzz lockfiles, with independent locked-build and regression
+  verification.
+
+### Release integrity
+
+- Release all six target archives manually outside GitHub Actions, including
+  Windows ARM64. Publish the exact 52-asset contract with SHA-256 manifests,
+  minisign signatures, DSR SLSA provenance, and an SPDX SBOM; verify the public
+  installers on Linux x86_64, macOS ARM64 and Intel/Rosetta, and Windows x64,
+  with Linux ARM64 exercised under QEMU and Windows ARM64 machine type checked.
+  Publish the independently packaged and smoke-tested crate to crates.io so the
+  composite action's documented Cargo fallback resolves the same release.
+
+## [v0.6.8](https://github.com/Dicklesworthstone/destructive_command_guard/tree/v0.6.8) -- 2026-07-15 [Tag]
+
+Annotated source tag only. No GitHub Release or binary assets were published;
+v0.6.9 supersedes it.
 
 Windows installer correctness hotfix that completes the real-host
 ConstrainedLanguage path begun in v0.6.7.
@@ -62,10 +225,9 @@ ConstrainedLanguage path begun in v0.6.7.
 
 ### Release integrity
 
-- Rebuild and test all six binaries manually outside GitHub Actions, with
-  SHA-256 checksums, minisign signatures, signed DSR SLSA provenance, a
-  source-tree SPDX SBOM, and real installer verification on Linux, macOS, and
-  Windows PowerShell 5.1.
+- The planned six-platform binary build and manual artifact publication were
+  superseded before execution. No v0.6.8 GitHub Release or binary assets were
+  published; the source fixes and release-integrity plan first ship in v0.6.9.
 
 ## [v0.6.7](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.7) -- 2026-07-14 [Release]
 
@@ -75,7 +237,7 @@ pushes, repairs project allowlists outside Git repositories, fixes two
 command-line false positives, and adds the checksum, signature, archive, and
 encoding primitives needed by the Windows installer under WDAC/AppLocker
 ConstrainedLanguage. Its final PowerShell 5.1 native-output captures are
-corrected in v0.6.8.
+corrected in the unpublished v0.6.8 source tag and first shipped in v0.6.9.
 
 ### Security
 
@@ -146,7 +308,7 @@ corrected in v0.6.8.
   helpers for URL, PATH, architecture, and configuration handling. Real-host
   release validation subsequently found that the final `dcg --version` capture
   and optional `-Verify` self-test still tripped PowerShell 5.1's native-stderr
-  promotion under `$ErrorActionPreference = 'Stop'`; v0.6.8 fixes both native
+  promotion under `$ErrorActionPreference = 'Stop'`; v0.6.9 fixes both native
   capture paths.
 
 ### Release integrity

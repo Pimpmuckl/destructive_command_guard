@@ -602,6 +602,8 @@ detect_platform() {
     # The previous gnu mapping linked against the build runner's glibc
     # and rejected any older host with `GLIBC_2.39 not found`. See #114.
     linux-x86_64) TARGET="x86_64-unknown-linux-musl" ;;
+    linux-aarch64) TARGET="aarch64-unknown-linux-gnu" ;;
+    darwin-x86_64) TARGET="x86_64-apple-darwin" ;;
     darwin-aarch64) TARGET="aarch64-apple-darwin" ;;
     *) :;;
   esac
@@ -1328,7 +1330,9 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
   fi
   ok "Done. Binary at: $DEST/dcg"
   maybe_install_completions
-else # Archive path; source builds rejoin shared agent configuration below.
+  exit 0
+fi
+
 # Checksum verification (can be skipped with --no-verify for testing)
 if [ "$NO_CHECKSUM" -eq 1 ]; then
   warn "Verification skipped (--no-verify)"
@@ -1389,7 +1393,6 @@ fi
 ok "Done. Binary at: $DEST/dcg"
 maybe_install_completions
 echo ""
-fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Predecessor Detection & Removal

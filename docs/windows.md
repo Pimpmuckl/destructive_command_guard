@@ -56,9 +56,10 @@ dcg resolves its own config/state via the `dirs` crate (never hardcoded Unix pat
 |-------|----------|
 | User config | `%APPDATA%\dcg\config.toml` (and `~/.config/dcg/` is also honored) |
 | User allowlist | `%APPDATA%\dcg\allowlist.toml` |
-| **System config / allowlist** | `%ProgramData%\dcg\config.toml` / `allowlist.toml` (the Windows equivalent of `/etc/dcg`) |
+| **System config / allowlist** | The implicit `%ProgramData%\dcg\` layer is ignored on native Windows until dcg can validate ACLs, reparse points, and opened-file identity. An explicitly selected `DCG_CONFIG` or `DCG_ALLOWLIST_SYSTEM_PATH` remains user-trusted. |
 | History DB / pending exceptions | under `%APPDATA%` / `%LOCALAPPDATA%` |
-| Project config | `.dcg.toml` / `.dcg\allowlist.toml` in the repo root |
+| Project config | Automatic `.dcg.toml` discovery is ignored on native Windows until equivalent path validation exists; use `DCG_CONFIG=.dcg.toml` after review for explicit full authority. |
+| Project allowlist | `.dcg\allowlist.toml` is inactive unless `DCG_CONFIG` explicitly selects the reviewed repo-root `.dcg.toml`. |
 
 `~`-prefixed paths in config expand from `%USERPROFILE%` (Windows has no `HOME`),
 and both `~/` and `~\` are accepted.
@@ -70,7 +71,7 @@ to the always-on `core.filesystem` / `core.git` and default-on `system.disk`):
 
 - **`windows.filesystem`** (default-on, opt-out with `disabled = ["windows.filesystem"]` or `["windows"]`):
   cmd `del /s`, `rd /s` / `rmdir /s`, `format <drive>:`; PowerShell `Remove-Item
-  -Recurse -Force` and its aliases (`rm`/`del`/`rd`/`ri`/`erase`), `Clear-Content`,
+  -Recurse` (with or without `-Force`) and its aliases (`rm`/`del`/`rd`/`ri`/`erase`), `Clear-Content`,
   `Clear-RecycleBin`. Whitelists PowerShell `-WhatIf` previews only on
   cmdlets/aliases that honor it, plus deletes scoped to temp dirs.
 - **`windows.system`** (default-on, opt-out as above): `vssadmin delete shadows`
@@ -165,8 +166,8 @@ PowerShell ports of the shell E2E suites run on `windows-latest` CI (and locally
 - **`scripts/e2e_test.ps1`** — the full hook suite (`-Verbose`/`-Json`/`-Artifacts`):
   destructive/safe git + `rm` with every flag-ordering / quoting / variable-path /
   `sudo` / absolute-path variant, non-core packs, the **Windows-native pack group**
-  (cmd `del`/`rd`/`format`/`reg delete`/`vssadmin`/…, PowerShell `Remove-Item -Recurse
-  -Force`/`Format-Volume`/…, wrapped `cmd /c`/`iex`/`-EncodedCommand`), and project
+  (cmd `del`/`rd`/`format`/`reg delete`/`vssadmin`/…, PowerShell `Remove-Item -Recurse`
+  with or without `-Force`/`Format-Volume`/…, wrapped `cmd /c`/`iex`/`-EncodedCommand`), and project
   allowlists.
 - **`scripts/scan_precommit_e2e.ps1`** / **`scripts/scan_gitdiff_e2e.ps1`** — the
   `dcg scan --staged` and `dcg scan --git-diff <range>` subcommands (exit codes +

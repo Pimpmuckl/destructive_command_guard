@@ -1640,7 +1640,7 @@ name: DCG Security Scan
 
 on:
   pull_request:
-    branches: [main, master]
+    branches: [main]
 
 jobs:
   scan:
