@@ -23,7 +23,9 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Run tests
-        run: cargo test --lib
+        run: |
+          cargo test --lib
+          cargo test --test codex_hook_protocol
 
   build:
     needs: test
