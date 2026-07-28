@@ -15,7 +15,7 @@ This document describes packs in the `windows` category.
 
 **Pack ID:** `windows.filesystem`
 
-Protects against recursive/forced filesystem destruction on Windows: cmd `del /s`, `rd /s`, `format <drive>:`, and PowerShell `Remove-Item -Recurse (with or without `-Force`; aliases included), `Clear-Content`, and `Clear-RecycleBin`.
+Protects against recursive/forced filesystem destruction on Windows: cmd `del /s`, `rd /s`, `format <drive>:`, PowerShell `Remove-Item -Recurse (with or without `-Force`; aliases included), `Clear-Content`, `Clear-RecycleBin`, and the .NET recursive-delete APIs `[System.IO.Directory]::Delete($path, $true)` and `<DirectoryInfo>.Delete($true)`.
 
 ### Keywords
 
@@ -46,6 +46,13 @@ Commands containing these keywords are checked against this pack:
 - `Clear-RecycleBin`
 - `clear-recyclebin`
 - `CLEAR-RECYCLEBIN`
+- `IO.Directory`
+- `io.directory`
+- `Io.Directory`
+- `IO.DIRECTORY`
+- `.Delete(`
+- `.delete(`
+- `.DELETE(`
 
 ### Safe Patterns (Allowed)
 
@@ -70,6 +77,9 @@ These patterns match potentially destructive commands:
 | `format-drive` | format <drive>: erases an entire volume. | critical |
 | `clear-content` | Clear-Content empties a file's contents in place with no undo. | high |
 | `clear-recyclebin` | Clear-RecycleBin permanently purges the Recycle Bin. | medium |
+| `dotnet-directory-delete-recursive` | [System.IO.Directory]::Delete with a true recursive flag deletes an entire directory tree. | critical |
+| `dotnet-directory-delete` | [System.IO.Directory]::Delete removes a directory outside the Recycle Bin. | high |
+| `directoryinfo-delete-recursive` | .Delete($true) on a DirectoryInfo object recursively deletes the directory tree. | critical |
 
 ### Allowlist Guidance
 

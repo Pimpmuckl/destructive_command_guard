@@ -62,8 +62,8 @@ pub fn create_pack() -> Pack {
                       `vssadmin delete shadows` / `wmic shadowcopy delete` (Volume Shadow Copy \
                       destruction), `diskpart`, `Format-Volume`, `Clear-Disk`, `Remove-Partition`, \
                       `Initialize-Disk`, `Reset-PhysicalDisk`, `cipher /w`, and `bcdedit /delete`.",
-        // Realistic keyword casings (case-sensitive quick-reject); see
-        // packs::windows module docs.
+        // Conventional keyword casings retained for readable metadata; the
+        // quick-reject itself is ASCII case-insensitive. See packs::windows.
         keywords: &[
             "vssadmin",
             "VSSADMIN",

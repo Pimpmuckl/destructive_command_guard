@@ -42,8 +42,8 @@ rule_id = "pack.id:pattern-name"  # optional, for validation
 # These are ignored by the current regression_corpus test, but are part
 # of the canonical schema for future harnesses.
 [case.log]
-decision = "deny"          # allow|deny|warn|log
-mode = "deny"              # deny|warn|log
+decision = "deny"          # allow|deny|ask|warn|log
+mode = "deny"              # deny|ask|warn|log
 pack_id = "core.git"
 pattern_name = "reset-hard"
 rule_id = "core.git:reset-hard"

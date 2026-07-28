@@ -17,7 +17,26 @@ function Test-NoBom([string]$p) {
     $b = [System.IO.File]::ReadAllBytes($p)
     -not ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF)
 }
-$dcg = 'C:\Users\me\.local\bin\dcg.exe'
+$dcg = "C:\Users\O'Brien\.local\bin\dcg.exe"
+$escapedDcg = $dcg.Replace("'", "''")
+
+Write-Host "Test 0: Claude (Bash|PowerShell wrapper) - remove dcg, keep Bash-only hook"
+$h0 = New-Tmp; New-Item -ItemType Directory -Path $h0 -Force | Out-Null
+try {
+    $f = Join-Path $h0 'settings.json'
+    @{ hooks = @{ PreToolUse = @(
+        @{ matcher = 'Bash|PowerShell'; hooks = @(
+            @{ type = 'command'; command = "& '$escapedDcg'"; shell = 'powershell' }) },
+        @{ matcher = 'Bash'; hooks = @(
+            @{ type = 'command'; command = 'keep-bash-only' }) })
+    } } | ConvertTo-Json -Depth 20 | Set-Content $f
+    Check ((Remove-DcgHooksFromJsonFile -Path $f) -eq $true) "Claude: returns true (removed)"
+    $cfg = Get-Content -Raw $f | ConvertFrom-Json
+    $entries = @($cfg.hooks.PreToolUse)
+    Check ($entries.Count -eq 1) "Claude: emptied combined matcher pruned"
+    Check ($entries[0].matcher -eq 'Bash') "Claude: Bash-only matcher preserved"
+    Check ($entries[0].hooks[0].command -eq 'keep-bash-only') "Claude: coexisting command preserved"
+} finally { Remove-Item -Recurse -Force $h0 -ErrorAction SilentlyContinue }
 
 Write-Host "Test 1: Gemini (BeforeTool/run_shell_command) - remove dcg, keep coexisting"
 $h1 = New-Tmp; New-Item -ItemType Directory -Path (Join-Path $h1 '.gemini') -Force | Out-Null
@@ -26,7 +45,7 @@ try {
     @{ hooks = @{ BeforeTool = @(@{ matcher = 'run_shell_command'; hooks = @(
         @{ command = $dcg; name = 'dcg'; timeout = 5000 }, @{ command = 'other-tool'; name = 'other' }) }) } } |
         ConvertTo-Json -Depth 20 | Set-Content $f
-    Check ((Remove-DcgHooksFromJsonFile -Path $f -EventName 'BeforeTool' -Matcher 'run_shell_command' -DeleteEmptyFile) -eq $true) "returns true (removed)"
+    Check ((Remove-DcgHooksFromJsonFile -Path $f -EventName 'BeforeTool' -DeleteEmptyFile) -eq $true) "returns true (removed)"
     Check (Test-NoBom $f) "rewritten without BOM"
     $cmds = @((Get-Content -Raw $f | ConvertFrom-Json).hooks.BeforeTool[0].hooks | ForEach-Object { $_.command })
     Check (-not ($cmds -contains $dcg)) "dcg removed"
@@ -111,6 +130,48 @@ try {
     Check ((Remove-DcgHooksFromJsonFile -Path $f) -eq $false) "invalid JSON -> false (untouched)"
     Check ((Get-Content -Raw $f) -eq '{ not json') "invalid file content unchanged"
 } finally { Remove-Item -Recurse -Force $h7 -ErrorAction SilentlyContinue }
+
+Write-Host "Test 8: wrong-matcher dcg hook is removed, sibling survives"
+$h8 = New-Tmp; New-Item -ItemType Directory -Path $h8 -Force | Out-Null
+try {
+    $f = Join-Path $h8 'settings.json'
+    @{ hooks = @{ PreToolUse = @(@{ matcher = 'Write'; hooks = @(
+        @{ type = 'command'; command = $dcg },
+        @{ type = 'command'; command = 'keep-write-hook' }) }) } } |
+        ConvertTo-Json -Depth 20 | Set-Content $f
+    Check ((Remove-DcgHooksFromJsonFile -Path $f) -eq $true) "wrong-matcher hook: returns true"
+    $hooks = @((Get-Content -Raw $f | ConvertFrom-Json).hooks.PreToolUse[0].hooks)
+    Check ($hooks.Count -eq 1 -and $hooks[0].command -eq 'keep-write-hook') "wrong-matcher sibling preserved"
+} finally { Remove-Item -Recurse -Force $h8 -ErrorAction SilentlyContinue }
+
+Write-Host "Test 9: keep-config and keep-history are independent"
+$h9 = New-Tmp
+try {
+    $config = Join-Path $h9 '.config/dcg'
+    $data = Join-Path $h9 '.local/share/dcg'
+    New-Item -ItemType Directory -Path $config -Force | Out-Null
+    New-Item -ItemType Directory -Path $data -Force | Out-Null
+    Set-Content (Join-Path $config 'config.toml') 'mode = "deny"'
+    Set-Content (Join-Path $config 'history.db') 'history'
+    Set-Content (Join-Path $config 'history.db-wal') 'wal'
+    New-Item -ItemType Directory -Path (Join-Path $config 'backups') -Force | Out-Null
+    Set-Content (Join-Path $config 'backups/dcg.exe') 'backup'
+    Set-Content (Join-Path $data 'blocked.log') 'log'
+    Remove-DcgStateDirectories -ConfigDir $config -DataDir $data -KeepHistory
+    Check (-not (Test-Path (Join-Path $config 'config.toml'))) "KeepHistory removes config"
+    Check (Test-Path (Join-Path $config 'history.db')) "KeepHistory preserves history database"
+    Check (Test-Path (Join-Path $config 'history.db-wal')) "KeepHistory preserves SQLite sidecar"
+    Check (Test-Path (Join-Path $config 'backups/dcg.exe')) "KeepHistory preserves release backups"
+    Check (Test-Path $data) "KeepHistory preserves data directory"
+
+    Set-Content (Join-Path $config 'config.toml') 'mode = "deny"'
+    Remove-DcgStateDirectories -ConfigDir $config -DataDir $data -KeepConfig
+    Check (Test-Path (Join-Path $config 'config.toml')) "KeepConfig preserves config"
+    Check (-not (Test-Path (Join-Path $config 'history.db'))) "KeepConfig removes history database"
+    Check (-not (Test-Path (Join-Path $config 'history.db-wal'))) "KeepConfig removes SQLite sidecar"
+    Check (-not (Test-Path (Join-Path $config 'backups'))) "KeepConfig removes release backups"
+    Check (-not (Test-Path $data)) "KeepConfig removes data directory"
+} finally { Remove-Item -Recurse -Force $h9 -ErrorAction SilentlyContinue }
 
 if ($script:failures -gt 0) { Write-Host "$script:failures FAILURE(S)" -ForegroundColor Red; exit 1 }
 Write-Host "All uninstall parity tests passed." -ForegroundColor Green

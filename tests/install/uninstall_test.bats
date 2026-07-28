@@ -106,6 +106,36 @@ EOF
     grep -q "theme" "$HOME/.claude/settings.json"
 }
 
+@test "unconfigure_claude_code: removes wrong-matcher dcg hook" {
+    log_test "Testing Claude Code wrong-matcher hook cleanup..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+    extract_uninstall_functions
+
+    mkdir -p "$HOME/.claude"
+    cat > "$HOME/.claude/settings.json" << 'EOF'
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write",
+        "hooks": [
+          {"type": "command", "command": "/path/to/dcg"},
+          {"type": "command", "command": "/path/to/keep-write-hook"}
+        ]
+      }
+    ]
+  }
+}
+EOF
+
+    run unconfigure_claude_code
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"removed"* ]]
+    ! grep -q '"/path/to/dcg"' "$HOME/.claude/settings.json"
+    grep -q 'keep-write-hook' "$HOME/.claude/settings.json"
+}
+
 @test "unconfigure_claude_code: ignores commands that only contain dcg as a substring" {
     log_test "Testing Claude Code substring-only hook preservation..."
     command -v python3 &>/dev/null || skip "python3 not available"
@@ -672,8 +702,8 @@ EOF
     [[ "$output" != *"Cursor IDE hook"* ]]
 }
 
-@test "uninstall.ps1: preserves non-Bash PreToolUse dcg hooks" {
-    log_test "Testing PowerShell Codex uninstall only removes Bash-owned dcg hooks..."
+@test "uninstall.ps1: removes dcg hooks from every PreToolUse matcher" {
+    log_test "Testing PowerShell uninstall repairs wrong-matcher dcg hooks..."
     local pwsh_bin
     pwsh_bin="$(PATH="${ORIGINAL_PATH:-$PATH}" command -v pwsh || true)"
     [ -n "$pwsh_bin" ] || skip "pwsh not available"
@@ -723,9 +753,9 @@ if (-not $result) {
 
 $config = Get-Content -Raw -Path $HooksPath | ConvertFrom-Json
 $entries = @($config.hooks.PreToolUse)
-$readEntry = @($entries | Where-Object { $_.matcher -eq "Read" })[0]
-if ($readEntry.hooks[0].command -ne "C:\tools\dcg.exe") {
-  Write-Error "Read dcg hook was not preserved"
+$readEntry = @($entries | Where-Object { $_.matcher -eq "Read" })
+if ($readEntry.Count -ne 0) {
+  Write-Error "wrong-matcher Read dcg hook was not removed"
   exit 3
 }
 
@@ -977,6 +1007,44 @@ EOF
 
     # Data directory should still exist
     [ -d "$HOME/.local/share/dcg" ]
+}
+
+@test "uninstall: --keep-history preserves colocated database but removes config" {
+    log_test "Testing colocated history preservation..."
+
+    mkdir -p "$HOME/.config/dcg/backups" "$HOME/.local/share/dcg"
+    echo "config" > "$HOME/.config/dcg/config.toml"
+    echo "history" > "$HOME/.config/dcg/history.db"
+    echo "wal" > "$HOME/.config/dcg/history.db-wal"
+    echo "backup" > "$HOME/.config/dcg/backups/dcg"
+    echo "log" > "$HOME/.local/share/dcg/blocked.log"
+
+    "$UNINSTALL_SCRIPT" --yes --quiet --keep-history
+
+    [ ! -f "$HOME/.config/dcg/config.toml" ]
+    [ -f "$HOME/.config/dcg/history.db" ]
+    [ -f "$HOME/.config/dcg/history.db-wal" ]
+    [ -f "$HOME/.config/dcg/backups/dcg" ]
+    [ -f "$HOME/.local/share/dcg/blocked.log" ]
+}
+
+@test "uninstall: --keep-config removes colocated history but preserves config" {
+    log_test "Testing colocated history removal..."
+
+    mkdir -p "$HOME/.config/dcg/backups" "$HOME/.local/share/dcg"
+    echo "config" > "$HOME/.config/dcg/config.toml"
+    echo "history" > "$HOME/.config/dcg/history.db"
+    echo "shm" > "$HOME/.config/dcg/history.db-shm"
+    echo "backup" > "$HOME/.config/dcg/backups/dcg"
+    echo "log" > "$HOME/.local/share/dcg/blocked.log"
+
+    "$UNINSTALL_SCRIPT" --yes --quiet --keep-config
+
+    [ -f "$HOME/.config/dcg/config.toml" ]
+    [ ! -f "$HOME/.config/dcg/history.db" ]
+    [ ! -f "$HOME/.config/dcg/history.db-shm" ]
+    [ ! -d "$HOME/.config/dcg/backups" ]
+    [ ! -d "$HOME/.local/share/dcg" ]
 }
 
 # ============================================================================

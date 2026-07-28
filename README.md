@@ -358,6 +358,82 @@ Native-Windows (cmd.exe + PowerShell) destructive-command protection. `windows.f
 - `windows.misc` - Registry/account/service/WSL/copy destruction: `reg delete`, `net user|localgroup /delete`, `sc delete`, `schtasks /delete`, `wsl --unregister` (destroys a WSL distro), `robocopy /MIR` (mirror-delete).
 - `windows.powershell` - Destructive PowerShell cmdlets: registry/provider deletes (`Remove-Item HKLM:\`, `Remove-ItemProperty`, `Remove-PSDrive`), `Remove-LocalUser`/`Remove-LocalGroup`, `Unregister-ScheduledTask`, `Disable-ComputerRestore`, forced `Stop-Computer`/`Restart-Computer`, `Remove-VM`/`Remove-AppxPackage`.
 
+### Careful Company (Windows) Preset
+
+Every other pack answers "will this command destroy something?". This preset also
+answers "is this command **sending our data somewhere**, or switching off the
+controls that watch it?" — the question that matters once an agent runs on a
+Windows workstation with tool-permission prompts disabled. The same policy is
+applied to statically inspectable commands submitted through either
+**PowerShell or `cmd.exe`**, including Cmd's caret escaping, control prefixes,
+nested `cmd /c` / `call`, and command chaining. It is **opt-in on every
+platform**, and one line enables the whole posture:
+
+```toml
+[packs]
+enabled = ["careful_company_running_windows"]
+```
+
+That turns on the six sub-packs below **and** the existing destruction coverage
+the same posture needs: the current `windows.*`, `database.*` (including
+Snowflake), `storage.*`, `remote.*`, `backup.*`, `secrets.*`, and `cloud.*`
+packs. Membership is an explicit pinned list rather than a prefix rule, so a
+future pack added to one of those reused categories does not silently join this
+security posture — it has to be added deliberately. (A future
+`careful_company_running_windows.*` sub-pack *does* join, through ordinary
+category expansion.) Any member can be dropped individually with
+`disabled = ["remote.rsync"]`.
+
+- `careful_company_running_windows.email` - Sending mail from the workstation: `Send-MailMessage`, `System.Net.Mail.SmtpClient`, Outlook COM automation, Microsoft Graph `sendMail`, transactional mail-API send endpoints, `aws ses send-email`, SMTP CLI tools (`blat`, `swaks`, `msmtp`, `git send-email`, `curl --mail-rcpt`), and persistent forwarding rules (`New-InboxRule -ForwardTo`, `Set-Mailbox -ForwardingSmtpAddress`).
+- `careful_company_running_windows.chat` - Chat and webhook destinations: Slack incoming webhooks and Web API writes, Teams connectors and Power Automate triggers, Discord, Telegram, Google Chat, Twilio, Zapier/IFTTT, PagerDuty, and request catchers such as `webhook.site` and `interact.sh`.
+- `careful_company_running_windows.upload` - HTTP file-upload primitives (`-InFile`, `-Form`, `curl -T`, `-F field=@file`, `--data-binary @file`, `--post-file`, `WebClient.UploadFile`, `GetRequestStream`, `MultipartFormDataContent`, BITS uploads), file-drop/paste services, `gh gist create`, `certreq -Post`, and request bodies built from file or clipboard contents.
+- `careful_company_running_windows.transfer` - Outbound file transfer: scp/sftp/WinSCP to a remote destination, scripted FTP, `tftp put`, rsync and rclone to a remote, cloud-storage uploads (`aws s3 cp` local→`s3://`, `az storage blob upload`, azcopy, `gsutil cp`→`gs://`, b2/s3cmd/mc/wrangler r2), peer-to-peer senders, WebDAV mounts, and copy LOLBins (`esentutl /y`, `print /D:`).
+- `careful_company_running_windows.tunnel` - Channels that expose the workstation or bypass inspection: ngrok, cloudflared, devtunnel/`code tunnel`, localtunnel, `tailscale funnel`, `ssh -R`/`-D`, chisel/frp, ncat/netcat/socat, PowerShell raw sockets, `netsh interface portproxy`, DNS tunnels, and out-of-band callback domains.
+- `careful_company_running_windows.guardrails` - Turning off the safety net: Defender (`Set-MpPreference -Disable*`/`-ExclusionPath`), the firewall, EDR and event-log services, BitLocker, `Set-ExecutionPolicy Bypass`, script-block logging, event-log clearing, **dcg's own `DCG_BYPASS`, `dcg uninstall`, allowlist grants (`dcg allowlist add`, `dcg allow-once`), runtime config overrides (`DCG_DISABLE`/`DCG_PACKS`/`DCG_CONFIG`), and the agent's hook config**, plus unreviewed remote code (`iwr | iex`, `powershell -EncodedCommand`, mshta/regsvr32 remote payloads). Diagnosis stays open: `dcg explain`, `dcg allowlist list`, and `dcg allowlist validate` are whitelisted.
+
+**False positives are the design constraint.** Rules require positive evidence of
+egress — an attached file, a known egress host, a mutating method — so ordinary
+`GET`s, `-OutFile`/`curl -o` downloads, and every package-manager install pass
+through untouched (fetching from a known file-drop or paste host is the one
+exception, and it warns rather than blocks). Requests whose destinations are all internal (loopback,
+RFC1918, `*.internal`/`*.corp`/`*.local`, bare intranet hostnames) are
+whitelisted, with the cloud metadata endpoints (`169.254.169.254`,
+`metadata.google.internal`) deliberately excluded from that allowance. Searching
+for a token (`Select-String "Send-MailMessage" *.ps1`) and `dcg explain
+"<command>"` are never blocked. `git push` to a named remote is untouched, and
+SMB copies to a corporate share are out of scope.
+
+Genuinely ambiguous cases **warn instead of blocking** (`Medium` severity: the
+command runs and the decision is recorded) — a `POST` with an inline body is a
+GraphQL query as often as an exfiltration. Promote them when your posture calls
+for it:
+
+```toml
+[policy.rules]
+"careful_company_running_windows.upload:cli-http-mutating-request" = "deny"
+"careful_company_running_windows.upload:ps-http-mutating-request" = "deny"
+```
+
+> **This preset carries one built-in trust boundary you should know about.**
+> While any `careful_company_running_windows.*` pack is enabled, a command whose
+> executable is `hfdt` (optionally path-qualified) is allowed **without
+> evaluating any pack at all** — not just this preset's. `hfdt rm -rf /data` is
+> permitted with the preset on and denied with it off. The exemption is
+> structural rather than textual: it requires `hfdt` to be the actual executable
+> of the whole command and refuses chains, redirection, and process
+> substitution, so `hfdt …; Invoke-RestMethod …` and `hfdt $(…)` are evaluated
+> normally. If you do not run that tool, this never fires; if you do, treat it
+> as an explicit decision to trust it completely. See
+> [`docs/careful-company-windows.md`](docs/careful-company-windows.md).
+
+Other first-party internal tooling gets no such exemption and should be
+allowlisted, which keeps the grant narrow and recorded:
+
+```bash
+dcg allowlist add-command "mytool publish --to https://artifacts.corp.internal" \
+  -r "First-party internal publisher" --user
+```
+
 ### Other Packs
 - `package_managers` - Protects against dangerous package manager operations like publishing packages and removing critical system packages.
 - `strict_git` - Stricter git protections: blocks all force pushes, rebases, and history rewriting operations.
@@ -590,7 +666,7 @@ Environment variables override config files (highest priority):
 - `DCG_HEREDOC_TIMEOUT=50`: heredoc extraction timeout (milliseconds)
 - `DCG_HEREDOC_TIMEOUT_MS=50`: heredoc extraction timeout (milliseconds)
 - `DCG_HEREDOC_LANGUAGES=python,bash`: filter heredoc languages
-- `DCG_POLICY_DEFAULT_MODE=deny|warn|log`: global default decision mode
+- `DCG_POLICY_DEFAULT_MODE=deny|ask|warn|log`: global default decision mode (`ask` requires native operator review and fails closed on unsupported clients)
 - `DCG_HOOK_TIMEOUT_MS=200`: hook evaluation timeout budget (milliseconds)
 
 ### Output Formats and `DCG_FORMAT`
@@ -807,6 +883,29 @@ curl -fsSL "https://raw.githubusercontent.com/Pimpmuckl/destructive_command_guar
 
 Easy mode auto-detects your platform, downloads the right binary, verifies SHA256 checksums, configures all supported AI agent hooks (Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, Cursor IDE, Hermes Agent, Aider), and updates your PATH. For Codex CLI 0.125.0+, the installer merges a `PreToolUse` Bash hook into `~/.codex/hooks.json`; invalid JSON or malformed existing Codex hook shapes are left unchanged and reported instead of being overwritten.
 
+### Homebrew
+
+The upstream tap supports Apple Silicon and Intel macOS plus ARM64 and x86_64
+Linux:
+
+```bash
+brew install dicklesworthstone/tap/dcg
+dcg install
+```
+
+Homebrew installs only the `dcg` binary. The explicit `dcg install` step
+configures hooks for the coding agents detected on your machine; the formula
+does not mutate hook or configuration files during package installation.
+
+If your Homebrew installation enforces tap trust, trust this formula before
+installing it:
+
+```bash
+brew trust --formula dicklesworthstone/tap/dcg
+brew install dicklesworthstone/tap/dcg
+dcg install
+```
+
 **Other options:**
 
 Interactive mode (prompts for each step):
@@ -818,7 +917,7 @@ curl -fsSL "https://raw.githubusercontent.com/Pimpmuckl/destructive_command_guar
 Install specific version:
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Pimpmuckl/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --version v0.6.9-codexpp.1
+curl -fsSL "https://raw.githubusercontent.com/Pimpmuckl/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --version v0.7.1-codexpp.1
 ```
 
 Install to /usr/local/bin (system-wide, requires sudo):
@@ -880,7 +979,7 @@ repository's known-good `nightly-2026-06-06` pin; the included
 rustup toolchain install nightly-2026-06-06
 
 # Install the tagged source reproducibly
-cargo +nightly-2026-06-06 install --locked --git https://github.com/Pimpmuckl/destructive_command_guard --tag v0.6.9-codexpp.1 destructive_command_guard
+cargo +nightly-2026-06-06 install --locked --git https://github.com/Pimpmuckl/destructive_command_guard --tag v0.7.1-codexpp.1 destructive_command_guard
 ```
 
 ### Manual build
@@ -904,7 +1003,7 @@ dcg update
 Optional flags mirror the installer scripts (examples):
 
 ```bash
-dcg update --version v0.6.9-codexpp.1
+dcg update --version v0.7.1-codexpp.1
 dcg update --system
 dcg update --verify
 ```
@@ -946,10 +1045,11 @@ irm https://raw.githubusercontent.com/Pimpmuckl/destructive_command_guard/main/u
 The Unix uninstaller:
 - Removes dcg hooks from Claude Code, Codex CLI, Cursor IDE, Gemini CLI, GitHub Copilot CLI (user-level plus legacy repo-local), Hermes Agent, and Aider
 - Removes the dcg binary
-- Removes configuration (`~/.config/dcg/`) and history (`~/.local/share/dcg/`)
+- Removes configuration (`~/.config/dcg/`) and history (the
+  `~/.config/dcg/history.db` SQLite files plus `~/.local/share/dcg/`)
 - Prompts for confirmation before making changes
 
-The PowerShell uninstaller removes the Windows `dcg.exe` binary, the exact User PATH entry added by `install.ps1`, dcg hooks from Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, Cursor IDE, Hermes Agent, Grok, and Antigravity (`agy`), plus dcg configuration/history directories.
+The PowerShell uninstaller removes the Windows `dcg.exe` binary, the exact User PATH entry added by `install.ps1`, dcg hooks from Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, Cursor IDE, Hermes Agent, Grok, and Antigravity (`agy`), plus dcg configuration/history from native `%APPDATA%` / `%LOCALAPPDATA%` and any legacy `~/.config` / `~/.local/share` locations.
 
 Options:
 - `--yes` - Skip confirmation prompt
@@ -966,7 +1066,7 @@ Add to `~/.claude/settings.json`:
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "Bash|PowerShell",
         "hooks": [
           {
             "type": "command",
@@ -978,6 +1078,13 @@ Add to `~/.claude/settings.json`:
   }
 }
 ```
+
+Claude Code exposes separate `Bash` and `PowerShell` shell tools on Windows, so
+the combined matcher is required for complete shell coverage. The native
+PowerShell installer also runs dcg through an explicitly selected PowerShell
+hook shell; this prevents Git Bash from stripping backslashes out of an
+absolute `C:\...\dcg.exe` path. Re-running the installer migrates a legacy
+dcg-only `Bash` entry while preserving unrelated Bash-only hooks.
 
 **Important:** Restart Claude Code after adding the hook configuration.
 

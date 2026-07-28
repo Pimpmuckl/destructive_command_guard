@@ -8,7 +8,7 @@
 # Options:
 #   --yes            Skip confirmation prompt
 #   --keep-config    Keep configuration files (~/.config/dcg/)
-#   --keep-history   Keep history database (~/.local/share/dcg/)
+#   --keep-history   Keep history.db, backups, and ~/.local/share/dcg/
 #   --purge          Remove everything (overrides keep flags)
 #   --quiet          Suppress non-error output
 #
@@ -342,7 +342,7 @@ unconfigure_claude_code() {
     fi
 
     # Check if dcg is configured
-    if ! json_settings_has_dcg_command_hook "$settings" "PreToolUse" "Bash"; then
+    if ! json_settings_has_dcg_command_hook "$settings" "PreToolUse"; then
         return 0
     fi
 
@@ -401,21 +401,21 @@ if not isinstance(pre_tool_use, list):
 new_hooks = []
 removed = False
 for entry in pre_tool_use:
-    if isinstance(entry, dict) and entry.get('matcher') == 'Bash':
-        hooks = entry.get('hooks', [])
-        if not isinstance(hooks, list):
-            new_hooks.append(entry)
-            continue
-        filtered = [
-            h for h in hooks
-            if not (isinstance(h, dict) and is_dcg_command(h.get('command', '')))
-        ]
-        if len(filtered) != len(hooks):
-            removed = True
-        if filtered:
-            entry['hooks'] = filtered
-            new_hooks.append(entry)
-    else:
+    if not isinstance(entry, dict):
+        new_hooks.append(entry)
+        continue
+    hooks = entry.get('hooks', [])
+    if not isinstance(hooks, list):
+        new_hooks.append(entry)
+        continue
+    filtered = [
+        h for h in hooks
+        if not (isinstance(h, dict) and is_dcg_command(h.get('command', '')))
+    ]
+    if len(filtered) != len(hooks):
+        removed = True
+    if filtered:
+        entry['hooks'] = filtered
         new_hooks.append(entry)
 
 if not removed:
@@ -702,7 +702,7 @@ unconfigure_codex() {
         return 0
     fi
 
-    if ! json_settings_has_dcg_command_hook "$hooks_json" "PreToolUse" "Bash"; then
+    if ! json_settings_has_dcg_command_hook "$hooks_json" "PreToolUse"; then
         return 0
     fi
 
@@ -747,9 +747,6 @@ new_pre_tool_use = []
 removed = False
 for entry in pre_tool_use:
     if not isinstance(entry, dict):
-        new_pre_tool_use.append(entry)
-        continue
-    if entry.get('matcher') != 'Bash':
         new_pre_tool_use.append(entry)
         continue
     inner = entry.get('hooks', [])
@@ -986,6 +983,53 @@ PYEOF
     return $?
 }
 
+remove_state_directories() {
+    local config_dir="$1"
+    local data_dir="$2"
+
+    # history.db and release backups share ~/.config/dcg with config.toml.
+    # KeepConfig and KeepHistory therefore need field-level removal rather than
+    # treating the whole directory as one category.
+    if [ -d "$config_dir" ]; then
+        if [ "$KEEP_CONFIG" -eq 0 ] && [ "$KEEP_HISTORY" -eq 0 ]; then
+            if rm -rf "$config_dir" 2>/dev/null; then
+                ok "Removed configuration and history database"
+            else
+                warn "Failed to remove configuration directory"
+            fi
+        elif [ "$KEEP_CONFIG" -eq 0 ]; then
+            if find "$config_dir" -mindepth 1 -maxdepth 1 \
+                ! -name 'history.db' \
+                ! -name 'history.db-wal' \
+                ! -name 'history.db-shm' \
+                ! -name 'backups' \
+                -exec rm -rf -- {} + 2>/dev/null; then
+                ok "Removed configuration (preserved history)"
+            else
+                warn "Failed to remove some configuration files"
+            fi
+        elif [ "$KEEP_HISTORY" -eq 0 ]; then
+            if rm -f -- \
+                "$config_dir/history.db" \
+                "$config_dir/history.db-wal" \
+                "$config_dir/history.db-shm" 2>/dev/null &&
+                rm -rf -- "$config_dir/backups" 2>/dev/null; then
+                ok "Removed history database and release backups"
+            else
+                warn "Failed to remove some history files"
+            fi
+        fi
+    fi
+
+    if [ "$KEEP_HISTORY" -eq 0 ] && [ -d "$data_dir" ]; then
+        if rm -rf "$data_dir" 2>/dev/null; then
+            ok "Removed history data"
+        else
+            warn "Failed to remove history data"
+        fi
+    fi
+}
+
 # Main uninstall function
 main() {
     log "${BOLD}dcg uninstaller${NC}"
@@ -1047,8 +1091,9 @@ main() {
     fi
 
     # Config
-    if [ "$KEEP_CONFIG" -eq 0 ] && [ -d "$config_dir" ]; then
-        log "  • Configuration directory ($config_dir)"
+    if { [ "$KEEP_CONFIG" -eq 0 ] || [ "$KEEP_HISTORY" -eq 0 ]; } &&
+        [ -d "$config_dir" ]; then
+        log "  • Configuration/history state ($config_dir)"
         found_anything=1
     fi
 
@@ -1143,23 +1188,7 @@ main() {
         fi
     fi
 
-    # Remove config directory
-    if [ "$KEEP_CONFIG" -eq 0 ] && [ -d "$config_dir" ]; then
-        if rm -rf "$config_dir" 2>/dev/null; then
-            ok "Removed configuration directory"
-        else
-            warn "Failed to remove configuration directory"
-        fi
-    fi
-
-    # Remove data directory
-    if [ "$KEEP_HISTORY" -eq 0 ] && [ -d "$data_dir" ]; then
-        if rm -rf "$data_dir" 2>/dev/null; then
-            ok "Removed history data"
-        else
-            warn "Failed to remove history data"
-        fi
-    fi
+    remove_state_directories "$config_dir" "$data_dir"
 
     # Remove binary
     if [ -n "$binary" ] && [ -f "$binary" ]; then

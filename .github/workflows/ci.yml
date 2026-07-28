@@ -319,12 +319,12 @@ jobs:
           ./scripts/e2e_test.ps1 -Verbose -Artifacts "$env:RUNNER_TEMP/e2e-artifacts"
           if ($LASTEXITCODE -ne 0) { throw "e2e_test.ps1 reported failures (exit $LASTEXITCODE)" }
 
-      - name: History DB concurrency / stale-lock stress (real-Windows fsqlite)
+      - name: History DB concurrency / stale-lock stress (real Windows SQLite)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          # Validates the fsqlite history DB on a REAL Windows runtime (the
-          # cfg(not(unix)) WAL/lock fallback path): N concurrent writer PROCESSES
+          # Validates the bundled SQLite history DB on a REAL Windows runtime:
+          # N concurrent writer PROCESSES
           # must not corrupt the DB and a killed writer must not wedge later runs.
           # (History itself is best-effort telemetry — a few records may drop under
           # extreme contention by design; the test asserts no-corruption + no-wedge

@@ -27,7 +27,7 @@ use destructive_command_guard::config::Config;
 #[cfg(test)]
 use destructive_command_guard::evaluator::evaluate_command_with_pack_order_deadline_at_path;
 use destructive_command_guard::evaluator::{
-    EvaluationDecision, MatchSource, evaluate_command_with_pack_order_deadline_at_path_in_dialect,
+    EvaluationDecision, evaluate_command_with_pack_order_deadline_at_path_in_dialect,
 };
 #[allow(unused_imports)]
 use destructive_command_guard::exit_codes::{EXIT_DENIED, EXIT_PARSE_ERROR, EXIT_SUCCESS};
@@ -36,6 +36,7 @@ use destructive_command_guard::history::{
 };
 use destructive_command_guard::hook;
 use destructive_command_guard::load_default_allowlists;
+#[cfg(test)]
 use destructive_command_guard::normalize::normalize_command;
 use destructive_command_guard::packs::load_external_packs;
 #[cfg(test)]
@@ -43,7 +44,6 @@ use destructive_command_guard::packs::pack_aware_quick_reject;
 use destructive_command_guard::packs::{DecisionMode, REGISTRY};
 use destructive_command_guard::pending_exceptions::{PendingExceptionStore, log_maintenance};
 use destructive_command_guard::perf::{Deadline, HOOK_EVALUATION_BUDGET};
-use destructive_command_guard::sanitize_for_pattern_matching;
 // Import HookInput for parsing stdin JSON in hook mode
 #[cfg(test)]
 use destructive_command_guard::hook::HookInput;
@@ -177,9 +177,8 @@ fn format_indeterminate_reason(stage: &str, budget: Duration) -> String {
 /// response. The protocol response is flushed before best-effort history is
 /// queued, and the history worker is detached before return: once the
 /// evaluation budget is exhausted, no audit sink may delay hook-process exit.
-/// History uses `Warn` as the closest existing non-Allow audit outcome and an
-/// internal synthetic rule identity so deadline events remain independently
-/// queryable without a schema migration.
+/// History records deadline decisions as denied because no supported protocol
+/// lets the command execute without a subsequent human approval.
 fn handle_indeterminate_evaluation(
     protocol: hook::HookProtocol,
     history_writer: Option<&mut HistoryWriter>,
@@ -200,7 +199,7 @@ fn handle_indeterminate_evaluation(
             history_agent_type,
             command,
             working_dir,
-            HistoryOutcome::Warn,
+            HistoryOutcome::Deny,
             elapsed,
             Some(INDETERMINATE_HISTORY_PACK),
             Some(INDETERMINATE_HISTORY_PATTERN),
@@ -267,7 +266,8 @@ fn handle_unparseable_hook_input(
         } else {
             HistoryOutcome::Allow
         };
-        let writer = HistoryWriter::new(history_db_path(&config.history), &config.history);
+        let mut writer = HistoryWriter::new(history_db_path(&config.history), &config.history);
+        writer.limit_drop_wait_to(HOOK_EVALUATION_BUDGET);
         let entry = build_history_entry(
             detected_agent.config_key(),
             "<unparseable hook input>",
@@ -440,6 +440,13 @@ fn remove_disabled_packs_for_agent(
 ) {
     let profile = config.agents.profile_for_agent(agent);
     for disabled in &profile.disabled_packs {
+        // `Config::enabled_pack_ids_for_agent` preserves the mandatory core
+        // category after profile expansion. This second pass exists so
+        // profile exclusions also apply to auto-enabled external packs; it
+        // must not undo the core invariant while doing so.
+        if disabled == "core" || disabled.starts_with("core.") {
+            continue;
+        }
         enabled_packs.remove(disabled);
         enabled_packs.retain(|pack| !pack.starts_with(&format!("{disabled}.")));
     }
@@ -730,10 +737,9 @@ fn main() {
     );
 
     let mut history_writer = if config.history.enabled {
-        Some(HistoryWriter::new(
-            history_db_path(&config.history),
-            &config.history,
-        ))
+        let mut writer = HistoryWriter::new(history_db_path(&config.history), &config.history);
+        writer.limit_drop_wait_to(deadline.remaining().unwrap_or_default());
+        Some(writer)
     } else {
         None
     };
@@ -837,42 +843,9 @@ fn main() {
     };
 
     let pack = info.pack_id.as_deref();
-    let mut mode = match info.source {
-        MatchSource::Pack | MatchSource::HeredocAst => {
-            config
-                .policy()
-                .resolve_mode(pack, info.pattern_name.as_deref(), info.severity)
-        }
-        // Never downgrade explicit blocks.
-        MatchSource::ConfigOverride | MatchSource::LegacyPattern => DecisionMode::Deny,
-    };
-
-    // Apply confidence scoring (if enabled) to potentially downgrade Deny to Warn.
-    // Only applies to pack/heredoc matches, not config overrides.
-    if matches!(info.source, MatchSource::Pack | MatchSource::HeredocAst) {
-        let sanitized = sanitize_for_pattern_matching(&command);
-        let normalized_command = normalize_command(&command);
-        let normalized_sanitized = normalize_command(sanitized.as_ref());
-
-        let mut confidence_command = command.as_str();
-        let mut confidence_sanitized: Option<&str> = None;
-
-        if normalized_command.len() == normalized_sanitized.len() {
-            confidence_command = normalized_command.as_ref();
-            if sanitized.as_ref() != command {
-                confidence_sanitized = Some(normalized_sanitized.as_ref());
-            }
-        }
-
-        let confidence_result = destructive_command_guard::apply_confidence_scoring(
-            confidence_command,
-            confidence_sanitized,
-            &result,
-            mode,
-            &config.confidence,
-        );
-        mode = confidence_result.mode;
-    }
+    let mode =
+        destructive_command_guard::evaluator::resolve_effective_mode(&config, &command, &result)
+            .unwrap_or(DecisionMode::Deny);
 
     let pattern = info.pattern_name.as_deref();
     let explanation = info.explanation.as_deref();
@@ -930,7 +903,7 @@ fn main() {
 
     if let Some(writer) = history_writer.as_ref() {
         let outcome = match mode {
-            DecisionMode::Deny => HistoryOutcome::Deny,
+            DecisionMode::Deny | DecisionMode::Ask => HistoryOutcome::Deny,
             DecisionMode::Warn => HistoryOutcome::Warn,
             DecisionMode::Log => HistoryOutcome::Allow,
         };
@@ -948,7 +921,7 @@ fn main() {
     }
 
     match mode {
-        DecisionMode::Deny => {
+        DecisionMode::Deny | DecisionMode::Ask => {
             let store_path = PendingExceptionStore::default_path(cwd_path.as_deref());
             let store = PendingExceptionStore::new(store_path);
             let reason = match (pack, pattern) {
@@ -982,29 +955,46 @@ fn main() {
             } else {
                 None
             };
-            hook::output_denial_for_protocol(
-                hook_protocol,
-                &command,
-                &info.reason,
-                pack,
-                pattern,
-                explanation,
-                allow_once_info.as_ref(),
-                info.matched_span.as_ref(),
-                info.severity,
-                None, // confidence not yet available in PatternMatch
-                info.suggestions,
-                branch_ctx,
-            );
+            if mode == DecisionMode::Ask {
+                hook::output_review_request_for_protocol(
+                    hook_protocol,
+                    &command,
+                    &info.reason,
+                    pack,
+                    pattern,
+                    explanation,
+                    allow_once_info.as_ref(),
+                    info.matched_span.as_ref(),
+                    info.severity,
+                    None, // confidence not yet available in PatternMatch
+                    info.suggestions,
+                    branch_ctx,
+                );
+            } else {
+                hook::output_denial_for_protocol(
+                    hook_protocol,
+                    &command,
+                    &info.reason,
+                    pack,
+                    pattern,
+                    explanation,
+                    allow_once_info.as_ref(),
+                    info.matched_span.as_ref(),
+                    info.severity,
+                    None, // confidence not yet available in PatternMatch
+                    info.suggestions,
+                    branch_ctx,
+                );
+            }
 
             // Log if configured
             if let Some(log_file) = &config.general.log_file {
                 let _ = hook::log_blocked_command(log_file, &command, &info.reason, pack);
             }
 
-            // All deny protocols, including Codex, return normally so buffered
-            // history is flushed by `HistoryWriter::Drop`. Codex gets a minimal
-            // stdout JSON decision from `output_denial_for_protocol`.
+            // Review-capable clients receive ask; all others receive their
+            // ordinary blocking response. Returning normally lets
+            // `HistoryWriter::Drop` flush the buffered audit entry.
         }
         DecisionMode::Warn => {
             hook::output_warning_for_protocol(
@@ -1060,13 +1050,13 @@ fn print_help() {
     eprintln!(
         "    {} {} {}",
         "│".bright_black(),
-        r#"{"hooks": {"PreToolUse": [{"matcher": "Bash","#.white(),
+        r#"{"hooks":{"PreToolUse":[{"matcher":"Bash|PowerShell","#.white(),
         "│".bright_black()
     );
     eprintln!(
         "    {}   {} {}",
         "│".bright_black(),
-        r#""hooks": [{"type": "command", "command": "dcg"}]}]}}"#.white(),
+        r#""hooks":[{"type":"command","command":"dcg"}]}]}}"#.white(),
         "│".bright_black()
     );
     eprintln!(
@@ -1926,6 +1916,29 @@ mod tests {
 
             assert_eq!(result.decision, EvaluationDecision::Allow);
             assert!(result.pattern_info.is_none());
+        }
+
+        #[test]
+        fn hook_agent_cannot_disable_mandatory_core_packs() {
+            let mut config = Config::default();
+            config.agents.profiles.insert(
+                "unknown".to_string(),
+                AgentProfile {
+                    disabled_packs: vec!["core".to_string(), "core.git".to_string()],
+                    ..Default::default()
+                },
+            );
+
+            let result = evaluate_with_agent(&config, &Agent::Unknown, "git reset --hard HEAD~1");
+
+            assert_eq!(result.decision, EvaluationDecision::Deny);
+            assert_eq!(
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pack_id.as_deref()),
+                Some("core.git")
+            );
         }
     }
 

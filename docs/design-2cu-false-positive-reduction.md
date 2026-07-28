@@ -228,7 +228,7 @@ highlights gaps and the script(s) that provide coverage today.
 | Area | Hook | CLI | Scan | Evidence | Notes / Gaps |
 |------|------|-----|------|----------|--------------|
 | Hook allow/deny core (git/rm) | ✅ | — | — | `scripts/e2e_test.sh` | Broad allow/deny cases + path normalization |
-| Policy modes (warn/log/deny) | ✅ | — | — | `scripts/e2e_test.sh` | Uses `DCG_POLICY_DEFAULT_MODE` |
+| Policy modes (ask/warn/log/deny) | ✅ | — | — | `scripts/e2e_test.sh` | Uses `DCG_POLICY_DEFAULT_MODE` |
 | Pack enablement (non-core packs) | ✅ | — | — | `scripts/e2e_test.sh` | Docker/K8s/DB/infra packs via `DCG_PACKS` |
 | Non-Bash tools ignored | ✅ | — | — | `scripts/e2e_test.sh` | Read/Write/Edit/Grep/Glob |
 | Malformed hook input | ✅ | — | — | `scripts/e2e_test.sh` | Invalid JSON, missing fields |

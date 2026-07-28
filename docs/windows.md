@@ -72,7 +72,10 @@ to the always-on `core.filesystem` / `core.git` and default-on `system.disk`):
 - **`windows.filesystem`** (default-on, opt-out with `disabled = ["windows.filesystem"]` or `["windows"]`):
   cmd `del /s`, `rd /s` / `rmdir /s`, `format <drive>:`; PowerShell `Remove-Item
   -Recurse` (with or without `-Force`) and its aliases (`rm`/`del`/`rd`/`ri`/`erase`), `Clear-Content`,
-  `Clear-RecycleBin`. Whitelists PowerShell `-WhatIf` previews only on
+  `Clear-RecycleBin`, and the .NET recursive-delete APIs callable from plain
+  PowerShell: `[System.IO.Directory]::Delete($path, $true)` (also the
+  `[IO.Directory]` accelerator spelling) and `<DirectoryInfo>.Delete($true)`.
+  Whitelists PowerShell `-WhatIf` previews only on
   cmdlets/aliases that honor it, plus deletes scoped to temp dirs.
 - **`windows.system`** (default-on, opt-out as above): `vssadmin delete shadows`
   and `wmic shadowcopy delete` (Volume Shadow Copy destruction — a ransomware
@@ -93,6 +96,18 @@ Enable the opt-in packs (e.g. to scan committed `.ps1`/`.cmd` scripts in CI) wit
 Windows patterns are **case-insensitive** (`RD /S /Q` == `rd /s /q`,
 `Remove-Item` == `remove-item`).
 
+For workstations where an agent runs without interactive tool approval, the
+opt-in `careful_company_running_windows` preset also enables the full Windows
+category, Snowflake and other destructive service packs, and six additional
+packs covering outbound mail/chat/uploads/transfers/tunnels and security-control
+tampering. The preset applies equivalent policy outcomes to statically
+inspectable PowerShell and `cmd.exe` hook events; shell-specific quoting,
+escaping, control prefixes, chaining, and launcher syntax are interpreted
+before matching. Its membership is curated rather than open-ended, so new dcg
+packs do not enter the reused service categories in company policy without
+review. See [Careful company policy for Windows
+agents](careful-company-windows.md).
+
 `dcg scan` understands PowerShell (`.ps1`/`.psm1`/`.psd1`) and Windows batch
 (`.cmd`/`.bat`) scripts in addition to the cross-platform formats.
 
@@ -104,7 +119,7 @@ wire format is recognized on Windows. Hook *configuration* coverage:
 | Agent | Config path | Configured by |
 |-------|-------------|---------------|
 | Codex CLI | `%USERPROFILE%\.codex\hooks.json` | `install.ps1` (automatic full JSON merge, UTF-8 **no BOM**) |
-| Claude Code | `%USERPROFILE%\.claude\settings.json` | `install.ps1` (full JSON merge, UTF-8 **no BOM**) |
+| Claude Code | `%USERPROFILE%\.claude\settings.json` | `install.ps1` (`Bash|PowerShell` matcher, PowerShell-safe absolute command, full JSON merge, UTF-8 **no BOM**) |
 | Gemini CLI | `%USERPROFILE%\.gemini\settings.json` | `install.ps1` (full JSON merge, UTF-8 **no BOM**) |
 | GitHub Copilot CLI | `%COPILOT_HOME%\hooks\dcg.json` or `%USERPROFILE%\.copilot\hooks\dcg.json` | `install.ps1` (automatic user-level JSON merge) when Copilot is detected, or with `-EasyMode` / `-Force`; protects every workspace |
 | Cursor IDE | `%USERPROFILE%\.cursor\hooks.json` plus `%USERPROFILE%\.cursor\hooks\dcg-pre-shell.ps1` | `install.ps1` (pure PowerShell bridge; no Python dependency) |
@@ -120,6 +135,14 @@ wire format is recognized on Windows. Hook *configuration* coverage:
   Codex extends hook coverage upstream
   ([openai/codex#16246](https://github.com/openai/codex/issues/16246)). The simple
   per-tool shell path *is* intercepted. This is upstream, not fixable in dcg.
+- **Runtime-built Cmd words**: dcg sees the command text supplied to the hook,
+  not the future process environment. It decodes deterministic caret syntax and
+  recursively inspects static `cmd /c`, `call`, `if`, `start`, and
+  `for ... do` payloads, but `%VAR%` / delayed `!VAR!` expansion can synthesize
+  an executable, option, or destination only after the hook returns. Dynamic
+  nested-launcher payloads fail closed; direct runtime-built arguments cannot
+  always be attributed to a concrete pack rule. Use endpoint/network egress
+  controls as the independent boundary for that class of behavior.
 - **Legacy conhost stderr color**: dcg enables Windows virtual-terminal
   processing for **stdout** at startup, so colored output renders correctly on
   legacy conhost. The blocked-command panel is written to **stderr**; modern
@@ -129,15 +152,16 @@ wire format is recognized on Windows. Hook *configuration* coverage:
   (`#![forbid(unsafe_code)]`). Set `NO_COLOR=1` for guaranteed plain output.
 - **System config layer**: lives at `%ProgramData%\dcg` (there is no `/etc` on
   Windows); absent → the layer is simply not loaded.
-- **History DB is best-effort telemetry under heavy concurrency.** The fsqlite
-  history DB is validated on real Windows by a CI stress test
+- **History DB is best-effort telemetry under heavy concurrency.** The bundled
+  upstream SQLite history DB is validated on real Windows by a CI stress test
   (`scripts/win_history_concurrency.ps1`): concurrent writer processes never
   corrupt it and a killed writer never wedges later runs. History writes are
   *best-effort* — under extreme concurrent-process contention a few decision
   records may not land, because logging must never block or break the security
   hook. This is **by design** (and reproduces on Linux too, so it is not a
   Windows-specific defect); the block/allow decision itself is always correct and
-  the DB never corrupts. Sequential / normal use records every decision.
+  the DB never corrupts. Sequential / normal use records every decision, and
+  `history.max_size_mb` is enforced as a hard main-database page cap.
 - **Fuzzing** stays Linux/macOS-only (`cargo-fuzz` does not support `windows-msvc`);
   it does not affect the shipping binary, which builds and tests on `windows-msvc`.
 - **No Authenticode signature (decision).** `dcg.exe` is **not** Authenticode

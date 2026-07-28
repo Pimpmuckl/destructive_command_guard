@@ -432,6 +432,16 @@ These patterns match potentially destructive commands:
 | `abort-query` | !abort cancels an active Snowflake query. | medium |
 | `interactive-edit` | !edit executes SQL modified in an external editor that dcg cannot inspect in advance. | high |
 | `execute-immediate` | EXECUTE IMMEDIATE runs generated SQL whose rendered semantics require explicit review. | medium |
+| `cli-object-drop-database` | snow object drop database/schema removes the object and everything inside it. | critical |
+| `cli-object-drop` | snow object drop permanently removes a Snowflake object. | high |
+| `cli-stage-drop` | snow stage drop removes the stage; internal staged files are not recoverable. | high |
+| `cli-stage-remove` | snow stage remove deletes files from a stage. | high |
+| `cli-app-teardown` | snow app teardown drops the Native App and (with --cascade) its owned objects. | high |
+| `cli-app-version-drop` | snow app version drop removes a Native App version definition. | medium |
+| `cli-snowpark-drop` | snow snowpark drop removes a deployed procedure or function from Snowflake. | medium |
+| `cli-spcs-drop` | snow spcs ... drop removes container services infrastructure. | high |
+| `cli-dbt-drop` | snow dbt drop removes a dbt project object from Snowflake. | medium |
+| `cli-dcm-drop` | snow dcm drop removes a DCM project object from Snowflake. | medium |
 
 ### Allowlist Guidance
 

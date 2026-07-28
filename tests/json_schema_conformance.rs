@@ -271,22 +271,22 @@ fn real_claude_deny_output_conforms_to_hook_schema() {
 }
 
 #[test]
-fn real_claude_warn_output_conforms_to_hook_schema() {
+fn real_claude_ask_output_conforms_to_hook_schema() {
     let schema = load_json("docs/json-schema/hook-output.json");
     let (instance, stderr) = run_claude_hook(
         "git reset --hard HEAD~1",
-        Some("[policy.rules]\n\"core.git:reset-hard\" = \"warn\"\n"),
+        Some("[policy]\ndefault_mode = \"ask\"\n"),
     );
 
     validate(&schema, &instance)
         .unwrap_or_else(|errors| panic!("real warn hook output does not conform:\n{errors}"));
     assert_eq!(
         instance["hookSpecificOutput"]["permissionDecision"], "ask",
-        "warn policy must emit Claude ask JSON"
+        "ask policy must emit Claude review JSON"
     );
     assert!(
-        stderr.contains("WARNING") || stderr.contains("warn"),
-        "stderr should contain the human-readable warning, got:\n{stderr}"
+        stderr.contains("BLOCKED") || stderr.contains("blocked"),
+        "stderr should contain the human-readable review block, got:\n{stderr}"
     );
 }
 

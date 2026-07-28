@@ -27,7 +27,7 @@ must validate when present:
 - `pack_id`
 - `pattern_name`
 - `rule_id` (pack_id:pattern_name)
-- `mode` (deny/warn/log)
+- `mode` (deny/ask/warn/log)
 - `source` (pack, heredoc_ast, config_override, legacy_pattern)
 - `reason_contains` (substring match)
 
@@ -59,12 +59,18 @@ The corpus MUST include edge cases:
 
 1) Pack ordering is deterministic and stable.
    - Packs are ordered by tier, then lexicographically by pack_id.
-   - Tier ordering is fixed (safe, core, system, infrastructure, cloud,
-     kubernetes, containers, database, package_managers, strict_git, cicd).
+   - Tier ordering is fixed. `PackRegistry::pack_tier` in `src/packs/mod.rs` is
+     the source of truth; as of this writing it runs safe, core/storage/remote,
+     system, infrastructure, apigateway/cdn/cloud/dns/loadbalancer/platform,
+     kubernetes, containers, backup/database/messaging/search, package_managers,
+     strict_git, cicd/email/featureflags/secrets/monitoring/payment, windows,
+     careful_company_running_windows, then unknown.
 
 2) Safe-before-destructive evaluation is preserved.
-   - All safe patterns across enabled packs are evaluated first.
-   - Any safe match immediately allows the command.
+   - Each enabled pack evaluates its safe patterns before its destructive
+     patterns.
+   - A safe match suppresses only that owning pack. It never prevents another
+     enabled pack from enforcing a different security boundary.
 
 3) Allowlist scope is precise.
    - A matched allowlist entry bypasses only the specific matched rule.

@@ -7,7 +7,11 @@
 //!     `format <drive>:`.
 //!   - PowerShell: `Remove-Item -Recurse` (with or without `-Force`) and its aliases
 //!     (`rm`/`del`/`rd`/`rmdir`/`ri`/`erase`), `Clear-Content` (empties a file),
-//!     `Clear-RecycleBin` (purges the Recycle Bin so deletes become unrecoverable).
+//!     `Clear-RecycleBin` (purges the Recycle Bin so deletes become unrecoverable),
+//!     and the .NET filesystem APIs PowerShell can call with no external tool:
+//!     `[System.IO.Directory]::Delete($path, $true)` (also the `[IO.Directory]`
+//!     accelerator spelling) and `<DirectoryInfo>.Delete($true)`, both of which
+//!     are the API equivalent of `Remove-Item -Recurse -Force`.
 //!
 //! Whitelist-first: PowerShell `-WhatIf` previews on cmdlets that actually honor
 //! it are allowed. Recursive temp cleanup is intentionally reviewed: ambient
@@ -19,10 +23,13 @@
 //! `super`-module docs for the keyword-casing convention.
 
 use crate::normalize::{
-    NormalizeTokenKind, ShellDialect, ShellTokenDecoder, ShellTokenRole, tokenize_for_shell_dialect,
+    NormalizeToken, NormalizeTokenKind, ShellDialect, ShellTokenDecoder, ShellTokenRole,
+    tokenize_for_shell_dialect,
 };
+use crate::packs::regex_engine::LazyCompiledRegex;
 use crate::packs::{DestructivePattern, Pack, PatternSuggestion, SafePattern};
 use crate::{destructive_pattern, safe_pattern};
+use std::borrow::Cow;
 use std::ops::Range;
 
 const MAX_WINDOWS_FILESYSTEM_SEMANTIC_BYTES: usize = 64 * 1024;
@@ -162,6 +169,17 @@ const REMOVE_ITEM_SUGGESTIONS: &[PatternSuggestion] = &[
     ),
 ];
 
+const DOTNET_DELETE_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "Remove-Item -Recurse <path> -WhatIf",
+        "Preview the deletion with the cmdlet equivalent before running anything irreversible",
+    ),
+    PatternSuggestion::new(
+        "Move-Item <path> $env:TEMP\\trash",
+        "Move the directory to a temp/trash location instead of deleting it (the .NET APIs bypass the Recycle Bin)",
+    ),
+];
+
 const FORMAT_SUGGESTIONS: &[PatternSuggestion] = &[PatternSuggestion::new(
     "Get-Volume",
     "List volumes and confirm the exact drive before any format — formatting is irreversible",
@@ -198,6 +216,29 @@ const POWERSHELL_PROTECTED_EXECUTABLES: &[&str] = &[
     "clc",
     "clear-recyclebin",
 ];
+
+/// `[System.IO.Directory]::Delete($path, $true)` (or the `[IO.Directory]`
+/// accelerator spelling) with a literally-true second argument, anchored to the
+/// start of a word token by the semantic caller. PowerShell type literals are
+/// case-insensitive and tolerate whitespace around `[`, `]`, and `::`.
+static DOTNET_DIRECTORY_DELETE_RECURSIVE_EXPRESSION: LazyCompiledRegex = LazyCompiledRegex::new(
+    r#"(?i)^\[\s*(?:system\.)?io\.directory\s*\]\s*::\s*delete\s*\((?=[^|&\r\n]*?,\s*(?:\$true|1|"true"|'true')\s*\))"#,
+);
+
+/// Any `[System.IO.Directory]::Delete(...)` call, anchored to a word start.
+/// Covers the single-argument form (removes an empty directory) and calls
+/// whose second argument is dynamic — PowerShell coerces any truthy value
+/// (including every non-empty string) to `$true`, so an unresolved flag must
+/// still be reviewed.
+static DOTNET_DIRECTORY_DELETE_EXPRESSION: LazyCompiledRegex =
+    LazyCompiledRegex::new(r"(?i)^\[\s*(?:system\.)?io\.directory\s*\]\s*::\s*delete\s*\(");
+
+/// `<DirectoryInfo>.Delete($true)` instance-method spelling, for example
+/// `(Get-Item $path).Delete($true)` or a `[System.IO.DirectoryInfo]` variable.
+/// `$true` is required so that unrelated `.delete(...)` member calls in inline
+/// scripts of other languages do not match.
+static DIRECTORYINFO_DELETE_RECURSIVE_MEMBER: LazyCompiledRegex =
+    LazyCompiledRegex::new(r"(?i)\.\s*delete\s*\(\s*\$true\s*\)");
 
 fn syntax_is_incomplete(raw: &str, dialect: ShellDialect) -> bool {
     let mut chars = raw.chars().peekable();
@@ -788,6 +829,223 @@ fn powershell_wholly_quoted(raw: &str) -> bool {
     matches!(raw.as_bytes().first(), Some(b'\'' | b'"'))
 }
 
+/// Return whether a raw PowerShell word is exactly one variable expression.
+///
+/// A bare variable at the start of a statement is a value expression, not an
+/// executable. PowerShell requires the call operator (`& $command`) to invoke
+/// the string stored in a variable; that executable role is handled by the
+/// dedicated call-operator analysis.
+fn powershell_bare_variable_expression(raw: &str) -> bool {
+    let Some(rest) = raw.strip_prefix('$') else {
+        return false;
+    };
+    if let Some(braced) = rest.strip_prefix('{') {
+        return braced
+            .strip_suffix('}')
+            .is_some_and(|name| !name.is_empty() && !name.chars().any(char::is_control));
+    }
+    !rest.is_empty()
+        && rest
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':' | b'?'))
+}
+
+fn powershell_here_string_end(command: &str, start: usize) -> Option<usize> {
+    let bytes = command.as_bytes();
+    if bytes.get(start) != Some(&b'@') {
+        return None;
+    }
+    let quote = *bytes.get(start + 1)?;
+    if !matches!(quote, b'\'' | b'"') {
+        return None;
+    }
+
+    let mut header_end = start + 2;
+    let content_start = loop {
+        let character = command.get(header_end..)?.chars().next()?;
+        match character {
+            '\r' if bytes.get(header_end + 1) == Some(&b'\n') => break header_end + 2,
+            '\r' | '\n' => break header_end + 1,
+            horizontal if horizontal.is_whitespace() => header_end += horizontal.len_utf8(),
+            _ => return None,
+        }
+    };
+
+    let mut line_start = content_start;
+    while line_start < bytes.len() {
+        if bytes.get(line_start) == Some(&quote) && bytes.get(line_start + 1) == Some(&b'@') {
+            return Some(line_start + 2);
+        }
+        let mut newline = line_start;
+        while newline < bytes.len() && !matches!(bytes[newline], b'\r' | b'\n') {
+            newline += 1;
+        }
+        if newline == bytes.len() {
+            return None;
+        }
+        line_start = if bytes.get(newline..newline + 2) == Some(b"\r\n") {
+            newline + 2
+        } else {
+            newline + 1
+        };
+    }
+    None
+}
+
+/// Mask PowerShell comments and complete here-strings while preserving byte
+/// offsets, newlines, and executable syntax outside those inert regions.
+///
+/// The raw PowerShell tokenizer keeps a here-string together as one word, but
+/// its contents are still visible to semantic keyword checks. That is useful
+/// when the string is later executed by `Invoke-Expression` (handled by the
+/// evaluator's nested-code analysis), but this direct filesystem pass must not
+/// treat an example inside an assignment as an immediate delete.
+fn mask_powershell_comments_and_here_strings(command: &str) -> Cow<'_, str> {
+    let classified = crate::context::classify_command(command);
+    let inert_context_ranges: Vec<Range<usize>> = classified
+        .spans()
+        .iter()
+        .filter(|span| {
+            matches!(
+                span.kind,
+                crate::context::SpanKind::Argument
+                    | crate::context::SpanKind::Data
+                    | crate::context::SpanKind::Comment
+            )
+        })
+        .map(|span| span.byte_range.clone())
+        .collect();
+    let mask_ranges: Vec<Range<usize>> = classified
+        .spans()
+        .iter()
+        .filter(|span| span.kind == crate::context::SpanKind::Comment)
+        .map(|span| span.byte_range.clone())
+        .collect();
+    let mut here_string_ranges = Vec::<Range<usize>>::new();
+
+    let bytes = command.as_bytes();
+    let mut index = 0usize;
+    while index + 1 < bytes.len() {
+        if bytes[index] == b'@'
+            && matches!(bytes[index + 1], b'\'' | b'"')
+            && !inert_context_ranges
+                .iter()
+                .any(|range| range.contains(&index))
+            && let Some(end) = powershell_here_string_end(command, index)
+        {
+            here_string_ranges.push(index..end);
+            index = end;
+        } else {
+            index += 1;
+        }
+    }
+
+    if mask_ranges.is_empty() && here_string_ranges.is_empty() {
+        return Cow::Borrowed(command);
+    }
+    let mut masked = command.as_bytes().to_vec();
+    for range in mask_ranges {
+        for byte in &mut masked[range] {
+            if !matches!(*byte, b'\r' | b'\n') {
+                *byte = b' ';
+            }
+        }
+    }
+    for range in here_string_ranges {
+        for byte in &mut masked[range.clone()] {
+            if !matches!(*byte, b'\r' | b'\n') {
+                *byte = b' ';
+            }
+        }
+        // Keep the replacement syntactically valid. Leaving only whitespace
+        // after `$value =` makes the semantic parser correctly fail closed on
+        // an incomplete assignment; a multiline single-quoted empty value
+        // preserves the inert expression role without changing byte offsets.
+        masked[range.start] = b'\'';
+        masked[range.end - 1] = b'\'';
+    }
+    Cow::Owned(String::from_utf8(masked).expect("masking ASCII bytes preserves UTF-8"))
+}
+
+/// Detect a .NET directory-delete expression in an executable position within
+/// one PowerShell segment.
+///
+/// `[System.IO.Directory]::Delete($path, $true)` and
+/// `<DirectoryInfo>.Delete($true)` execute without any external tool, so the
+/// cmdlet-oriented executable analysis above never sees them. The scan starts
+/// only at word tokens that are not wholly quoted: a quoted string in an
+/// ordinary statement is data, not an invocation (evaluating it requires a
+/// call operator or `Invoke-Expression`, which are analyzed elsewhere). For
+/// the member-call spelling, a match inside a wholly quoted word is likewise
+/// ignored.
+fn powershell_dotnet_directory_delete_rule(
+    segment: &str,
+    tokens: &[NormalizeToken],
+) -> Option<&'static str> {
+    // The intact-command caller uses this detector before PowerShell's
+    // structural parentheses are split. Preserve that benefit without
+    // reinterpreting examples inside comments, quoted arguments, or
+    // here-strings as executable .NET calls.
+    let inert_ranges: Vec<Range<usize>> = crate::context::classify_command(segment)
+        .spans()
+        .iter()
+        .filter(|span| {
+            matches!(
+                span.kind,
+                crate::context::SpanKind::Argument
+                    | crate::context::SpanKind::Data
+                    | crate::context::SpanKind::Comment
+            )
+        })
+        .map(|span| span.byte_range.clone())
+        .collect();
+    let quoted_word_ranges: Vec<Range<usize>> = tokens
+        .iter()
+        .filter(|token| {
+            token.kind == NormalizeTokenKind::Word
+                && token.text(segment).is_some_and(powershell_wholly_quoted)
+        })
+        .map(|token| token.byte_range.clone())
+        .collect();
+    for token in tokens
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+    {
+        let Some(raw) = token.text(segment) else {
+            continue;
+        };
+        if powershell_wholly_quoted(raw) {
+            continue;
+        }
+        let Some(tail) = segment.get(token.byte_range.start..) else {
+            continue;
+        };
+        if let Some((match_start, _)) = DOTNET_DIRECTORY_DELETE_RECURSIVE_EXPRESSION.find(tail) {
+            let absolute = token.byte_range.start.saturating_add(match_start);
+            if !inert_ranges.iter().any(|range| range.contains(&absolute)) {
+                return Some("dotnet-directory-delete-recursive");
+            }
+        }
+        if let Some((match_start, _)) = DOTNET_DIRECTORY_DELETE_EXPRESSION.find(tail) {
+            let absolute = token.byte_range.start.saturating_add(match_start);
+            if !inert_ranges.iter().any(|range| range.contains(&absolute)) {
+                return Some("dotnet-directory-delete");
+            }
+        }
+        if let Some((match_start, _)) = DIRECTORYINFO_DELETE_RECURSIVE_MEMBER.find(tail) {
+            let absolute = token.byte_range.start.saturating_add(match_start);
+            if !quoted_word_ranges
+                .iter()
+                .any(|range| range.contains(&absolute))
+                && !inert_ranges.iter().any(|range| range.contains(&absolute))
+            {
+                return Some("directoryinfo-delete-recursive");
+            }
+        }
+    }
+    None
+}
+
 fn powershell_segment_semantic_decision(
     segment: &str,
     quoted_executable_is_command: bool,
@@ -799,6 +1057,12 @@ fn powershell_segment_semantic_decision(
         .count();
     if word_count == 0 {
         return WindowsFilesystemSemanticDecision::NoMatch;
+    }
+    // .NET filesystem-delete expressions execute without any protected
+    // executable, so they are detected before (and independently of) the
+    // cmdlet-oriented analysis below.
+    if let Some(rule) = powershell_dotnet_directory_delete_rule(segment, &tokens) {
+        return WindowsFilesystemSemanticDecision::Destructive(rule);
     }
     let raw_words: Vec<_> = tokens
         .iter()
@@ -813,6 +1077,9 @@ fn powershell_segment_semantic_decision(
     // `quoted_executable_is_command` only when a statement-leading `&` proves
     // that the string occupies an executable role.
     if !quoted_executable_is_command && powershell_wholly_quoted(raw_executable) {
+        return WindowsFilesystemSemanticDecision::NoMatch;
+    }
+    if !quoted_executable_is_command && powershell_bare_variable_expression(raw_executable) {
         return WindowsFilesystemSemanticDecision::NoMatch;
     }
     let mut decoder = ShellTokenDecoder::new(ShellDialect::PowerShell);
@@ -1269,6 +1536,23 @@ fn contains_powershell_protected_word_case_insensitive(command: &str) -> bool {
         })
 }
 
+/// Case-insensitive candidate check for the .NET directory-delete surface.
+///
+/// PowerShell type literals resolve case-insensitively while the shared
+/// keyword index is case-sensitive. `[System.IO.Directory]::Delete` and
+/// `[System.IO.DirectoryInfo]` both split into a bare `directory` /
+/// `directoryinfo` word here; the bounded semantic parser still decides
+/// whether the word actually occupies an executable expression.
+fn contains_dotnet_directory_word_case_insensitive(command: &str) -> bool {
+    command
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+        })
+        .any(|word| {
+            word.eq_ignore_ascii_case("directory") || word.eq_ignore_ascii_case("directoryinfo")
+        })
+}
+
 /// Analyze native-Windows filesystem syntax with bounded, caller-proven shell
 /// decoding. The returned rule name is a member of this pack.
 #[must_use]
@@ -1307,6 +1591,26 @@ pub(crate) fn windows_filesystem_semantic_decision_in_dialect(
         // failing closed is the only sound bounded result.
         return WindowsFilesystemSemanticDecision::Unverified;
     }
+
+    if dialect == ShellDialect::PowerShell {
+        // Parentheses are structural PowerShell separators, so segmenting first
+        // would split `[IO.Directory]::Delete($path, $true)` into pieces and
+        // hide the recursive flag from the .NET-expression detector. Inspect
+        // the bounded intact command first; the detector remains token- and
+        // quote-aware, so inert quoted spellings are still treated as data.
+        let tokens = tokenize_for_shell_dialect(command, ShellDialect::PowerShell);
+        if let Some(rule) = powershell_dotnet_directory_delete_rule(command, &tokens) {
+            return WindowsFilesystemSemanticDecision::Destructive(rule);
+        }
+    }
+
+    let masked_powershell;
+    let command = if dialect == ShellDialect::PowerShell {
+        masked_powershell = mask_powershell_comments_and_here_strings(command);
+        masked_powershell.as_ref()
+    } else {
+        command
+    };
 
     let has_dialect_syntax = match dialect {
         ShellDialect::PowerShell => {
@@ -1426,7 +1730,8 @@ pub(crate) fn windows_filesystem_semantic_scan_required(
     };
     let has_case_insensitive_powershell_candidate =
         matches!(dialect, ShellDialect::PowerShell | ShellDialect::Unknown)
-            && contains_powershell_protected_word_case_insensitive(command);
+            && (contains_powershell_protected_word_case_insensitive(command)
+                || contains_dotnet_directory_word_case_insensitive(command));
     (has_relevant_escape || has_case_insensitive_powershell_candidate)
         && !matches!(
             windows_filesystem_semantic_decision_in_dialect(command, dialect),
@@ -1441,12 +1746,15 @@ pub fn create_pack() -> Pack {
         id: "windows.filesystem".to_string(),
         name: "Windows Filesystem",
         description: "Protects against recursive/forced filesystem destruction on Windows: cmd \
-                      `del /s`, `rd /s`, `format <drive>:`, and PowerShell `Remove-Item -Recurse \
-                      (with or without `-Force`; aliases included), `Clear-Content`, and \
-                      `Clear-RecycleBin`.",
-        // Realistic casings for the case-sensitive keyword quick-reject (see
-        // super-module docs). cmd verbs: lower + UPPER. PowerShell cmdlets:
-        // PascalCase + lower. Aliases (rm/ri/clc) included so PS alias forms gate.
+                      `del /s`, `rd /s`, `format <drive>:`, PowerShell `Remove-Item -Recurse \
+                      (with or without `-Force`; aliases included), `Clear-Content`, \
+                      `Clear-RecycleBin`, and the .NET recursive-delete APIs \
+                      `[System.IO.Directory]::Delete($path, $true)` and \
+                      `<DirectoryInfo>.Delete($true)`.",
+        // Conventional casings retained for readable metadata (see the
+        // super-module docs); quick-rejection itself is ASCII
+        // case-insensitive. Aliases (rm/ri/clc) remain explicit because they
+        // are different command names, not casing variants.
         keywords: &[
             // cmd recursive delete / format
             "del",
@@ -1475,6 +1783,16 @@ pub fn create_pack() -> Pack {
             "Clear-RecycleBin",
             "clear-recyclebin",
             "CLEAR-RECYCLEBIN",
+            // .NET directory-delete APIs. `IO.Directory` is a substring of
+            // both `[System.IO.Directory]` and `[System.IO.DirectoryInfo]`;
+            // `.Delete(` gates the DirectoryInfo member-call spelling.
+            "IO.Directory",
+            "io.directory",
+            "Io.Directory",
+            "IO.DIRECTORY",
+            ".Delete(",
+            ".delete(",
+            ".DELETE(",
         ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
@@ -1621,6 +1939,54 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Leave the Recycle Bin intact so recent deletes remain recoverable",
             CLEAR_SUGGESTIONS
         ),
+        // === .NET: [System.IO.Directory]::Delete($path, $true) ===
+        // Keep the recursive-flag rule before the general rule so a literally
+        // recursive call reports the more specific id and severity.
+        destructive_pattern!(
+            "dotnet-directory-delete-recursive",
+            r#"(?i)\[\s*(?:system\.)?io\.directory\s*\]\s*::\s*delete\s*\((?=[^|&\r\n]*?,\s*(?:\$true|1|"true"|'true')\s*\))"#,
+            "[System.IO.Directory]::Delete with a true recursive flag deletes an entire directory tree.",
+            Critical,
+            "`[System.IO.Directory]::Delete($path, $true)` (or the `[IO.Directory]` accelerator \
+             spelling) is the .NET equivalent of `Remove-Item -Recurse -Force`: it removes the \
+             directory and everything under it, bypasses the Recycle Bin, and needs no external \
+             tool — plain PowerShell can call it directly. A wrong path, relative path, or \
+             variable expansion destroys an entire working tree with no undo.\n\n\
+             Safer alternatives:\n\
+             - Preview with the cmdlet equivalent: Remove-Item -Recurse <path> -WhatIf\n\
+             - Move the directory to a temp/trash location instead of deleting it",
+            DOTNET_DELETE_SUGGESTIONS
+        ),
+        // === .NET: [System.IO.Directory]::Delete(...) — any other call ===
+        destructive_pattern!(
+            "dotnet-directory-delete",
+            r"(?i)\[\s*(?:system\.)?io\.directory\s*\]\s*::\s*delete\s*\(",
+            "[System.IO.Directory]::Delete removes a directory outside the Recycle Bin.",
+            High,
+            "`[System.IO.Directory]::Delete` permanently removes the target directory. With a \
+             dynamic second argument the call can still recurse: PowerShell coerces any truthy \
+             value — including every non-empty string — to `$true`. Even the single-argument \
+             form deletes the directory (when empty) with no Recycle Bin entry.\n\n\
+             Safer alternatives:\n\
+             - Preview with the cmdlet equivalent: Remove-Item <path> -WhatIf\n\
+             - Move the directory to a temp/trash location instead of deleting it",
+            DOTNET_DELETE_SUGGESTIONS
+        ),
+        // === .NET: <DirectoryInfo>.Delete($true) instance-method spelling ===
+        destructive_pattern!(
+            "directoryinfo-delete-recursive",
+            r"(?i)\.\s*delete\s*\(\s*\$true\s*\)",
+            ".Delete($true) on a DirectoryInfo object recursively deletes the directory tree.",
+            Critical,
+            "`<DirectoryInfo>.Delete($true)` — for example `(Get-Item $path).Delete($true)` or a \
+             `[System.IO.DirectoryInfo]` variable — recursively deletes the directory and all of \
+             its contents, bypassing the Recycle Bin exactly like \
+             `[System.IO.Directory]::Delete($path, $true)`.\n\n\
+             Safer alternatives:\n\
+             - Preview with the cmdlet equivalent: Remove-Item -Recurse <path> -WhatIf\n\
+             - Move the directory to a temp/trash location instead of deleting it",
+            DOTNET_DELETE_SUGGESTIONS
+        ),
     ]
 }
 
@@ -1705,6 +2071,145 @@ mod tests {
     }
 
     #[test]
+    fn blocks_dotnet_directory_delete_recursive() {
+        let pack = create_pack();
+        let checks = [
+            r"[System.IO.Directory]::Delete('E:\Dcg_test', $true)",
+            r"[IO.Directory]::Delete($path, $true)",
+            r"[io.directory]::delete($path,$true)",
+            r"[System.IO.Directory]::Delete('D:\data', 1)",
+            r#"[System.IO.Directory]::Delete($root, "true")"#,
+            r"[ System.IO.Directory ] :: Delete ($repo, $true)",
+            r"[System.IO.Directory]::Delete((Join-Path $root 'sub'), $true)",
+        ];
+        for command in checks {
+            assert_blocks_with_pattern(&pack, command, "dotnet-directory-delete-recursive");
+            assert_blocks_with_severity(&pack, command, Severity::Critical);
+        }
+    }
+
+    #[test]
+    fn blocks_dotnet_directory_delete_other_forms() {
+        let pack = create_pack();
+        // Dynamic second argument (PowerShell coerces any truthy value to
+        // $true) and the single-argument empty-directory form.
+        for command in [
+            r"[System.IO.Directory]::Delete($path, $flag)",
+            r"[IO.Directory]::Delete('C:\obsolete-empty')",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "dotnet-directory-delete");
+            assert_blocks_with_severity(&pack, command, Severity::High);
+        }
+    }
+
+    #[test]
+    fn blocks_directoryinfo_recursive_delete() {
+        let pack = create_pack();
+        let checks = [
+            r"$dir.Delete($true)",
+            r"(Get-Item 'C:\tmp\scratch').Delete($true)",
+            r"([System.IO.DirectoryInfo]'C:\src').Delete($true)",
+            r"(New-Object System.IO.DirectoryInfo 'C:\src').Delete( $true )",
+        ];
+        for command in checks {
+            assert_blocks_with_pattern(&pack, command, "directoryinfo-delete-recursive");
+            assert_blocks_with_severity(&pack, command, Severity::Critical);
+        }
+    }
+
+    #[test]
+    fn dotnet_directory_read_apis_do_not_match() {
+        let pack = create_pack();
+        assert_no_match(&pack, r"[System.IO.Directory]::Exists('C:\src')");
+        assert_no_match(&pack, r"[IO.Directory]::GetFiles('C:\src')");
+        assert_no_match(&pack, r"[System.IO.Directory]::CreateDirectory($path)");
+        assert_no_match(&pack, r"[System.IO.Directory]::GetCurrentDirectory()");
+        assert_no_match(&pack, r"[System.IO.File]::ReadAllText($path)");
+        // Member calls without a literal $true recursive flag are not this
+        // rule's target (a $false flag is the non-recursive one-arg form).
+        assert_no_match(&pack, r"$dir.Delete($false)");
+        assert_no_match(&pack, r"$queue.Delete($item)");
+    }
+
+    #[test]
+    fn powershell_semantic_detects_dotnet_directory_delete() {
+        let destructive = [
+            (
+                r"[System.IO.Directory]::Delete('E:\Dcg_test', $true)",
+                "dotnet-directory-delete-recursive",
+            ),
+            (
+                r"$x = [IO.Directory]::Delete($path, $true)",
+                "dotnet-directory-delete-recursive",
+            ),
+            (
+                r"[system.io.directory]::delete($path, $flag)",
+                "dotnet-directory-delete",
+            ),
+            (r"$dir.Delete($true)", "directoryinfo-delete-recursive"),
+            (
+                r"(Get-Item 'C:\tmp\scratch').Delete($true)",
+                "directoryinfo-delete-recursive",
+            ),
+        ];
+        for (command, expected) in destructive {
+            for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+                assert_eq!(
+                    windows_filesystem_semantic_decision_in_dialect(command, dialect),
+                    WindowsFilesystemSemanticDecision::Destructive(expected),
+                    "{dialect:?} must classify {command}"
+                );
+            }
+        }
+        // A wholly quoted spelling in an ordinary statement is data for a
+        // proven-PowerShell caller; executing it requires a call operator or
+        // Invoke-Expression, which are analyzed elsewhere.
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(
+                r"Write-Output '[System.IO.Directory]::Delete($p, $true)'",
+                ShellDialect::PowerShell,
+            ),
+            WindowsFilesystemSemanticDecision::NoMatch
+        );
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(
+                r"Write-Output '$dir.Delete($true)'",
+                ShellDialect::PowerShell,
+            ),
+            WindowsFilesystemSemanticDecision::NoMatch
+        );
+        for inert in [
+            r"Write-Output ok # [System.IO.Directory]::Delete($p, $true)",
+            r"<# [System.IO.Directory]::Delete($p, $true) #> Write-Output ok",
+            r#"Write-Output "example: [System.IO.Directory]::Delete($p, $true)""#,
+            "$text = @'\n[System.IO.Directory]::Delete($p, $true)\n'@; Write-Output $text",
+        ] {
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(inert, ShellDialect::PowerShell,),
+                WindowsFilesystemSemanticDecision::NoMatch,
+                "inert PowerShell data must not execute: {inert:?}"
+            );
+        }
+        for active_after_inert in [
+            "# [System.IO.Directory]::Delete($p, $true)\n[IO.Directory]::Delete($p, $true)",
+            "<# [System.IO.Directory]::Delete($p, $true) #>; $dir.Delete($true)",
+            "$text = @'\n[System.IO.Directory]::Delete($p, $true)\n'@\n[IO.Directory]::Delete($p, $true)",
+            r#"Write-Output<#; [IO.Directory]::Delete("C:\src", $true); #>"#,
+        ] {
+            assert!(
+                matches!(
+                    windows_filesystem_semantic_decision_in_dialect(
+                        active_after_inert,
+                        ShellDialect::PowerShell,
+                    ),
+                    WindowsFilesystemSemanticDecision::Destructive(_)
+                ),
+                "an inert example must not hide a later executable delete: {active_after_inert:?}"
+            );
+        }
+    }
+
+    #[test]
     fn blocks_cmd_deletes_even_with_powershell_whatif_token() {
         let pack = create_pack();
         let checks = [
@@ -1738,6 +2243,10 @@ mod tests {
             "format C: /q",
             "CLEAR-CONTENT C:\\app\\server.log",
             "CLEAR-RECYCLEBIN -Force",
+            "[System.IO.Directory]::Delete('E:\\Dcg_test', $true)",
+            "[io.directory]::delete($path, $true)",
+            "$dir.Delete($true)",
+            "$dir.delete($true)",
         ] {
             assert!(pack.might_match(cmd), "keyword gate should admit: {cmd}");
         }
@@ -2179,6 +2688,14 @@ mod tests {
                 ShellDialect::PowerShell,
             ),
             ("& \"@cmd\" report.txt", ShellDialect::PowerShell),
+            (
+                "$command = 'Clear-Content'; Write-Output $command",
+                ShellDialect::PowerShell,
+            ),
+            (
+                "${command-name} = 'Remove-Item'; ${command-name} -Recurse C:\\src",
+                ShellDialect::PowerShell,
+            ),
         ];
         for (command, dialect) in harmless {
             assert_eq!(
@@ -2216,6 +2733,7 @@ mod tests {
             ("f^ormat \"%DRIVE%:\" /q", ShellDialect::Cmd),
             ("d^el /? /s%MODE% C:\\src", ShellDialect::Cmd),
             ("Remove`-Item @parameters C:\\src", ShellDialect::PowerShell),
+            ("& $command -Recurse C:\\src", ShellDialect::PowerShell),
         ] {
             assert_eq!(
                 windows_filesystem_semantic_decision_in_dialect(command, dialect),

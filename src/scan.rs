@@ -29,8 +29,8 @@
 
 use crate::config::{Config, HeredocSettings};
 use crate::evaluator::{
-    EvaluationDecision, MatchSource, PatternMatch,
-    evaluate_command_with_pack_order_at_path_in_dialect,
+    EvaluationDecision, PatternMatch, evaluate_command_with_pack_order_at_path_in_dialect,
+    resolve_effective_mode,
 };
 use crate::normalize::ShellDialect;
 use crate::packs::{DecisionMode, REGISTRY, Severity};
@@ -495,6 +495,8 @@ pub fn evaluate_extracted_command(
         }
     }
 
+    let decision_mode = resolve_effective_mode(config, &extracted.command, &result);
+
     let Some(pattern) = result.pattern_info else {
         return Some(ScanFinding {
             file: extracted.file.clone(),
@@ -510,10 +512,10 @@ pub fn evaluate_extracted_command(
         });
     };
 
-    let (rule_id, severity, decision_mode) = resolve_severity_and_rule_id(config, &pattern);
+    let (rule_id, severity) = resolve_severity_and_rule_id(&pattern);
 
     let scan_decision = match decision_mode {
-        Some(DecisionMode::Deny) | None => ScanDecision::Deny,
+        Some(DecisionMode::Deny | DecisionMode::Ask) | None => ScanDecision::Deny,
         Some(DecisionMode::Warn) => ScanDecision::Warn,
         Some(DecisionMode::Log) => ScanDecision::Allow,
     };
@@ -545,33 +547,19 @@ pub fn evaluate_extracted_command(
     })
 }
 
-fn resolve_severity_and_rule_id(
-    config: &Config,
-    pattern: &PatternMatch,
-) -> (Option<String>, Option<Severity>, Option<DecisionMode>) {
+fn resolve_severity_and_rule_id(pattern: &PatternMatch) -> (Option<String>, Option<Severity>) {
     let Some(pack_id) = pattern.pack_id.as_deref() else {
-        return (None, None, None);
+        return (None, None);
     };
 
     let Some(pattern_name) = pattern.pattern_name.as_deref() else {
-        return (None, None, None);
+        return (None, None);
     };
 
     let rule_id = Some(format!("{pack_id}:{pattern_name}"));
-
     let severity = pattern.severity;
 
-    // Never downgrade explicit blocks; packs/AST matches are policy-controlled.
-    let mode = match pattern.source {
-        MatchSource::Pack | MatchSource::HeredocAst => {
-            config
-                .policy()
-                .resolve_mode(Some(pack_id), Some(pattern_name), severity)
-        }
-        MatchSource::ConfigOverride | MatchSource::LegacyPattern => DecisionMode::Deny,
-    };
-
-    (rule_id, severity, Some(mode))
+    (rule_id, severity)
 }
 
 fn redact_and_truncate(command: &str, options: &ScanOptions) -> String {
@@ -1531,29 +1519,7 @@ fn contains_shell_command_substitution(s: &str) -> bool {
 }
 
 fn is_shell_assignment_word(word: &str) -> bool {
-    let Some(eq) = word.find('=') else {
-        return false;
-    };
-
-    if eq == 0 {
-        return false;
-    }
-
-    let var = &word[..eq];
-    is_shell_var_name(var)
-}
-
-fn is_shell_var_name(s: &str) -> bool {
-    let mut it = s.chars();
-    let Some(first) = it.next() else {
-        return false;
-    };
-
-    if !(first.is_ascii_alphabetic() || first == '_') {
-        return false;
-    }
-
-    it.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    crate::normalize::is_env_assignment(word)
 }
 
 fn keyword_contains_whitespace(keyword: &str) -> bool {
@@ -4493,6 +4459,39 @@ fail_on = "nope"
         assert_eq!(finding.severity, ScanSeverity::Error);
         assert_eq!(finding.rule_id.as_deref(), Some("core.git:reset-hard"));
         assert!(finding.reason.is_some());
+    }
+
+    #[test]
+    fn evaluator_integration_applies_confidence_policy() {
+        let mut config = default_config();
+        config.confidence.enabled = true;
+        config.confidence.warn_threshold = 1.0;
+
+        let ctx = ScanEvalContext::from_config(&config);
+        let options = ScanOptions {
+            format: ScanFormat::Pretty,
+            fail_on: ScanFailOn::Error,
+            max_file_size_bytes: 1024 * 1024,
+            max_findings: 100,
+            redact: ScanRedactMode::None,
+            truncate: 0,
+        };
+        let extracted = ExtractedCommand {
+            file: "test".to_string(),
+            line: 1,
+            col: None,
+            extractor_id: "shell.script".to_string(),
+            command: "rm -rf ./some/path".to_string(),
+            metadata: None,
+        };
+
+        let finding = evaluate_extracted_command(&extracted, &options, &config, &ctx)
+            .expect("confidence-downgraded matches remain visible as scan findings");
+        assert_eq!(finding.decision, ScanDecision::Warn);
+        assert_eq!(
+            finding.rule_id.as_deref(),
+            Some("core.filesystem:rm-rf-general")
+        );
     }
 
     #[test]

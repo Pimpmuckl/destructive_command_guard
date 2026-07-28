@@ -56,9 +56,10 @@ pub fn create_pack() -> Pack {
                       `net user|localgroup /delete`, `sc delete`, `schtasks /delete`, \
                       `wsl --unregister` (destroys a WSL distro), and `robocopy /MIR` (mirror \
                       delete).",
-        // Realistic keyword casings (case-sensitive quick-reject); see
-        // packs::windows module docs. Short verbs (reg/net/sc) are noisy
-        // substrings but the `(?i)\b...\b` regexes still gate precisely.
+        // Conventional keyword casings retained for readable metadata; the
+        // quick-reject itself is ASCII case-insensitive. Short verbs
+        // (reg/net/sc) are noisy substrings, but the `(?i)\b...\b` regexes
+        // still gate precisely.
         keywords: &[
             "reg", "REG", "net", "NET", "sc", "SC", "schtasks", "SCHTASKS", "wsl", "WSL",
             "robocopy", "ROBOCOPY",

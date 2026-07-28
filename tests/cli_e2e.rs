@@ -1697,7 +1697,7 @@ mod config_tests {
             .and_then(|arr| arr.as_array())
             .expect("PreToolUse array");
         let has_dcg = hooks.iter().any(|entry| {
-            entry.get("matcher").and_then(|m| m.as_str()) == Some("Bash")
+            entry.get("matcher").and_then(|m| m.as_str()) == Some("Bash|PowerShell")
                 && entry
                     .get("hooks")
                     .and_then(|h| h.as_array())
@@ -2153,6 +2153,15 @@ block = [
             "\"/bin/rm\" -rf /etc",
             "sudo \"/bin/rm\" -rf /etc",
             "FOO=1 \"/bin/rm\" -rf /etc",
+            "FOO=1 rm -rf /",
+            "FOO=1 rm -rf /etc",
+            "FOO=bar rm -rf /home/example/probe",
+            "FOO=\"bar baz\" rm -rf /home/example/probe",
+            "A=1 B=2 rm -rf /home/example/probe",
+            "  FOO=1 rm -rf /home/example/probe",
+            "FOO=1 sudo rm -rf /home/example/probe",
+            "FOO=1 dd if=/dev/zero of=/dev/sda",
+            "FOO=1 mkfs.ext4 /dev/sda1",
         ];
 
         for cmd in deny_cases {
@@ -4316,7 +4325,7 @@ mod stats_rules_tests {
         // Don't seed any data
 
         // Create the database, then close the setup handle before the dcg
-        // subprocess opens the same FrankenSQLite file.
+        // subprocess opens the same SQLite file.
         let db = HistoryDb::open(Some(env.db_path.clone())).expect("create db");
         drop(db);
 

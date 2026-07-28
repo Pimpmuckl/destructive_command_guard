@@ -1,5 +1,5 @@
 #!/usr/bin/env pwsh
-# Concurrency / stale-lock stress test for the dcg fsqlite history DB (.7.1).
+# Concurrency / stale-lock stress test for dcg's bundled SQLite history DB.
 # Runs on windows-latest CI (a real Windows runtime) and locally on any OS.
 #
 # Validates:
@@ -18,6 +18,7 @@ try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 
 $script:fail = 0
+$script:lastHookFailure = ""
 function Note($m) { Write-Host "  $m" }
 function Pass($m) { Write-Host "$([char]0x2713) $m" -ForegroundColor Green }
 function Fail($m) { Write-Host "$([char]0x2717) $m" -ForegroundColor Red; $script:fail = 1 }
@@ -55,6 +56,42 @@ function Invoke-One {
     Start-Process -FilePath $bin -RedirectStandardInput $inputFile `
         -RedirectStandardOutput $o -RedirectStandardError $e -PassThru -NoNewWindow
 }
+function Test-CompletedHook {
+    param($Process, [int]$Idx, [int]$TimeoutMs)
+
+    $script:lastHookFailure = ""
+    if (-not $Process.WaitForExit($TimeoutMs) -or -not $Process.HasExited) {
+        $script:lastHookFailure = "timed out after ${TimeoutMs}ms"
+        return $false
+    }
+
+    # Windows PowerShell 5.1 can leave Process.ExitCode unset for a native
+    # process started with redirected standard handles, even after
+    # WaitForExit() reports success. Validate a nonzero code wherever the
+    # runtime exposes it, then require dcg's actual hook contract on stdout.
+    if ($null -ne $Process.ExitCode -and $Process.ExitCode -ne 0) {
+        $script:lastHookFailure = "native exit code $($Process.ExitCode)"
+        return $false
+    }
+    $stdout = Join-Path $work "out$Idx.txt"
+    if (-not (Test-Path -LiteralPath $stdout -PathType Leaf)) {
+        $script:lastHookFailure = "stdout file was not created"
+        return $false
+    }
+    $text = Get-Content -LiteralPath $stdout -Raw
+    if ($text -notmatch '"hookEventName"\s*:\s*"PreToolUse"' -or
+        $text -notmatch '"permissionDecision"\s*:\s*"deny"') {
+        $stderr = Join-Path $work "err$Idx.txt"
+        $stderrText = if (Test-Path -LiteralPath $stderr -PathType Leaf) {
+            (Get-Content -LiteralPath $stderr -Raw).Trim()
+        } else {
+            "<missing>"
+        }
+        $script:lastHookFailure = "invalid stdout='$($text.Trim())'; stderr='$stderrText'"
+        return $false
+    }
+    return $true
+}
 function Get-RecordCount {
     $stats = (& $bin history stats 2>&1 | Out-String)
     if ($stats -match 'Total commands:\s*(\d+)') { return [int]$Matches[1] }
@@ -68,11 +105,21 @@ function Test-Integrity {
 
 try {
     # Phase 1: under NORMAL (sequential) use, every decision is persisted and
-    # read back — this is the hard "all readable" guarantee.
+    # read back -- this is the hard "all readable" guarantee.
     Write-Host ""
     Write-Host "=== Phase 1: sequential writes are complete (all-readable guarantee) ==="
     $seq = 8
-    for ($i = 0; $i -lt $seq; $i++) { $p = Invoke-One -Idx (1000 + $i); [void]$p.WaitForExit(30000) }
+    $sequentialHooksOk = $true
+    for ($i = 0; $i -lt $seq; $i++) {
+        $idx = 1000 + $i
+        $p = Invoke-One -Idx $idx
+        if (-not (Test-CompletedHook -Process $p -Idx $idx -TimeoutMs 30000)) {
+            $sequentialHooksOk = $false
+            Note "sequential hook $i failed: $script:lastHookFailure"
+        }
+    }
+    if ($sequentialHooksOk) { Pass "all $seq sequential hooks completed with valid deny JSON" }
+    else { Fail "one or more sequential hooks timed out, failed, or emitted invalid output" }
     if (Test-Path $db) { Pass "DB created at the DCG_HISTORY_DB path" } else { Fail "DB not at DCG_HISTORY_DB path ($db)" }
     $nseq = Get-RecordCount
     if ($nseq -eq $seq) { Pass "all $seq sequential decisions logged + read back (history stats: $nseq)" }
@@ -80,20 +127,25 @@ try {
     if (Test-Integrity) { Pass "integrity PASSED after sequential writes" } else { Fail "integrity failed after sequential writes" }
 
     # Phase 2: under HEAVY concurrent-process contention the security-critical
-    # invariants must hold — no corruption, no broken hooks. History itself is
+    # invariants must hold -- no corruption, no broken hooks. History itself is
     # best-effort async telemetry (it must NEVER block/break the hook), so under
     # extreme contention a few records may not land; that is by design, not a
-    # corruption (it reproduces on Linux too). We assert: every hook exits 0,
-    # integrity stays PASSED, and the count grows monotonically with no phantom
-    # records — and we report the landed fraction.
+    # corruption (it reproduces on Linux too). We assert: every hook completes
+    # with its valid deny protocol, integrity stays PASSED, and the count grows
+    # monotonically with no phantom records -- and we report the landed fraction.
     Write-Host ""
-    Write-Host "=== Phase 2: $Count concurrent writers — no corruption, no broken hooks ==="
+    Write-Host "=== Phase 2: $Count concurrent writers -- no corruption, no broken hooks ==="
     $procs = @()
     for ($i = 0; $i -lt $Count; $i++) { $procs += Invoke-One -Idx $i }
-    foreach ($p in $procs) { [void]$p.WaitForExit(120000) }
-    $bad = @($procs | Where-Object { $_.ExitCode -ne 0 })
-    if ($bad.Count -eq 0) { Pass "all $Count concurrent hook processes exited 0 (the hook never breaks under contention)" }
-    else { Fail "$($bad.Count) concurrent hook process(es) exited non-zero" }
+    $bad = 0
+    for ($i = 0; $i -lt $procs.Count; $i++) {
+        if (-not (Test-CompletedHook -Process $procs[$i] -Idx $i -TimeoutMs 120000)) {
+            $bad++
+            Note "concurrent hook $i failed: $script:lastHookFailure"
+        }
+    }
+    if ($bad -eq 0) { Pass "all $Count concurrent hooks completed with valid deny JSON" }
+    else { Fail "$bad concurrent hook process(es) timed out, failed, or emitted invalid output" }
 
     if (Test-Integrity) { Pass "integrity PASSED after $Count concurrent writes (NO corruption)" }
     else { Fail "integrity did NOT pass after concurrent writes" }
@@ -103,12 +155,12 @@ try {
     if ($nconc -gt $nseq -and $nconc -le ($nseq + $Count)) {
         Pass "concurrent writes persisted + readable: $landed/$Count landed (monotonic, no phantom records)"
         if ($landed -lt $Count) {
-            Note "NOTE: $($Count - $landed) record(s) dropped under extreme contention — BY DESIGN (best-effort telemetry never blocks the hook); not corruption, reproduces on Linux."
+            Note "NOTE: $($Count - $landed) record(s) dropped under extreme contention -- BY DESIGN (best-effort telemetry never blocks the hook); not corruption, reproduces on Linux."
         }
     } else { Fail "concurrent count out of range: $nconc (expected $($nseq + 1)..$($nseq + $Count))" }
 
     # Phase 3: a writer killed mid-write must NOT wedge subsequent runs on a stale
-    # lock — the next invocation recovers, integrity holds, count grows.
+    # lock -- the next invocation recovers, integrity holds, count grows.
     Write-Host ""
     Write-Host "=== Phase 3: killed-writer stale-lock recovery ==="
     $victim = Invoke-One -Idx 9000
@@ -119,10 +171,10 @@ try {
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $after = Invoke-One -Idx 9001
-    [void]$after.WaitForExit(30000)
+    $afterOk = Test-CompletedHook -Process $after -Idx 9001 -TimeoutMs 30000
     $sw.Stop()
-    if ($after.HasExited -and $after.ExitCode -eq 0) { Pass "post-kill invocation completed (exit 0) in $([int]$sw.Elapsed.TotalMilliseconds)ms — not wedged on a stale lock" }
-    else { Fail "post-kill invocation did NOT complete cleanly (wedged?) — exit=$($after.ExitCode)" }
+    if ($afterOk) { Pass "post-kill hook completed with valid deny JSON in $([int]$sw.Elapsed.TotalMilliseconds)ms -- not wedged on a stale lock" }
+    else { Fail "post-kill hook timed out, failed, or emitted invalid output (wedged?): $script:lastHookFailure" }
 
     if (Test-Integrity) { Pass "integrity still PASSED after the killed writer (dead-writer reclamation OK)" }
     else { Fail "integrity check failed after the killed writer" }

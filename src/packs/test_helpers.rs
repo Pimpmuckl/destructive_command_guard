@@ -819,6 +819,7 @@ impl EvalSnapshot {
 
         let effective_mode = result.effective_mode.map(|m| match m {
             DecisionMode::Deny => "deny".to_string(),
+            DecisionMode::Ask => "ask".to_string(),
             DecisionMode::Warn => "warn".to_string(),
             DecisionMode::Log => "log".to_string(),
         });

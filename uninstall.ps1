@@ -6,8 +6,8 @@
 # Options:
 #   -Dest DIR       Binary install directory (default: ~/.local/bin)
 #   -Yes            Skip confirmation prompt
-#   -KeepConfig     Preserve ~/.config/dcg
-#   -KeepHistory    Preserve ~/.local/share/dcg
+#   -KeepConfig     Preserve config in native and legacy dcg state roots
+#   -KeepHistory    Preserve history.db, backups, and local history data
 #   -KeepPath       Preserve PATH entry for -Dest
 #   -Purge          Remove config and history even if keep flags are set
 #   -Quiet          Suppress non-error output
@@ -43,26 +43,52 @@ function Test-CommandTokenLooksLikePath {
     $Token -match '[\\/]')
 }
 
+function Get-QuotedCommandProgram {
+  param([string]$Text)
+
+  if ([string]::IsNullOrEmpty($Text) -or $Text.Length -lt 2) { return "" }
+  $quote = $Text[0]
+  if ($quote -ne "'" -and $quote -ne '"') { return "" }
+
+  $program = New-Object System.Text.StringBuilder
+  $index = 1
+  while ($index -lt $Text.Length) {
+    $character = $Text[$index]
+    if ($character -eq $quote) {
+      if ($quote -eq "'" -and
+          $index + 1 -lt $Text.Length -and
+          $Text[$index + 1] -eq "'") {
+        [void]$program.Append("'")
+        $index += 2
+        continue
+      }
+      return $program.ToString()
+    }
+    if ($quote -eq '"' -and
+        $character -eq [char]96 -and
+        $index + 1 -lt $Text.Length) {
+      [void]$program.Append($Text[$index + 1])
+      $index += 2
+      continue
+    }
+    [void]$program.Append($character)
+    $index += 1
+  }
+  ""
+}
+
 function Get-DcgCommandName {
   param([string]$Command)
 
   if ([string]::IsNullOrWhiteSpace($Command)) { return "" }
 
   $trimmed = $Command.Trim()
-  if ($trimmed.StartsWith('"')) {
-    $end = $trimmed.IndexOf('"', 1)
-    if ($end -gt 0) {
-      $program = $trimmed.Substring(1, $end - 1)
-    } else {
-      $program = $trimmed.Trim('"')
-    }
-  } elseif ($trimmed.StartsWith("'")) {
-    $end = $trimmed.IndexOf("'", 1)
-    if ($end -gt 0) {
-      $program = $trimmed.Substring(1, $end - 1)
-    } else {
-      $program = $trimmed.Trim("'")
-    }
+  if ($trimmed.StartsWith('&')) {
+    $trimmed = $trimmed.Substring(1).TrimStart()
+  }
+  if ($trimmed.StartsWith('"') -or $trimmed.StartsWith("'")) {
+    $program = Get-QuotedCommandProgram $trimmed
+    if ([string]::IsNullOrEmpty($program)) { return "" }
   } else {
     # A BARE (unquoted) value may be a path that itself contains spaces (e.g. an
     # install under `C:\Users\John Doe\.local\bin\dcg.exe`). Splitting on
@@ -90,10 +116,16 @@ function Test-DcgHookCommand {
   param([object]$Hook)
 
   if ($null -eq $Hook) { return $false }
-  $prop = $Hook.PSObject.Properties["command"]
-  if ($null -eq $prop) { return $false }
+  if ($Hook -is [System.Collections.IDictionary]) {
+    if (-not $Hook.Contains("command")) { return $false }
+    $command = $Hook["command"]
+  } else {
+    $prop = $Hook.PSObject.Properties["command"]
+    if ($null -eq $prop) { return $false }
+    $command = $prop.Value
+  }
 
-  $name = Get-DcgCommandName ([string]$prop.Value)
+  $name = Get-DcgCommandName ([string]$command)
   $name -eq "dcg" -or $name -eq "dcg.exe"
 }
 
@@ -158,15 +190,15 @@ function Test-EmptyObject {
 }
 
 function Remove-DcgHooksFromJsonFile {
-  # Strip dcg's hook from a Claude-Code-style hooks file. Defaults to
-  # PreToolUse/Bash (Claude + Codex); pass -EventName/-Matcher for Gemini
-  # (BeforeTool/run_shell_command). Removes ONLY dcg-owned inner hooks, preserves
-  # coexisting hooks/matchers, prunes emptied containers. UTF-8 no BOM.
+  # Strip dcg's hook from every matcher entry under a Claude-Code-style event.
+  # Looking across all matchers repairs historical misinstallations where dcg
+  # was executable but attached to a matcher the agent never invoked. Removes
+  # ONLY dcg-owned inner hooks, preserves coexisting hooks/matchers, prunes
+  # emptied containers. UTF-8 no BOM.
   param(
     [string]$Path,
     [switch]$DeleteEmptyFile,
-    [string]$EventName = "PreToolUse",
-    [string]$Matcher = "Bash"
+    [string]$EventName = "PreToolUse"
   )
 
   if (-not (Test-Path $Path -PathType Leaf)) { return $false }
@@ -191,11 +223,6 @@ function Remove-DcgHooksFromJsonFile {
   $removed = $false
 
   foreach ($entry in (Get-JsonArray $preToolUse)) {
-    if ((Get-ObjectPropertyValue $entry "matcher") -ne $Matcher) {
-      $newPreToolUse += $entry
-      continue
-    }
-
     $inner = Get-ObjectPropertyValue $entry "hooks"
     if ($null -eq $inner) {
       $newPreToolUse += $entry
@@ -247,6 +274,59 @@ function Remove-DcgHooksFromJsonFile {
   }
 
   $true
+}
+
+function Remove-DcgStateDirectories {
+  # history.db currently lives beside config.toml in $ConfigDir. Treat it and
+  # SQLite's live sidecars as history so -KeepConfig and -KeepHistory remain
+  # independent. Backups also share the native Windows config root because
+  # dirs::data_dir() resolves to roaming AppData. $DataDir contains local logs.
+  param(
+    [string]$ConfigDir,
+    [string]$DataDir,
+    [switch]$KeepConfig,
+    [switch]$KeepHistory
+  )
+
+  $historyNames = @(
+    "history.db",
+    "history.db-wal",
+    "history.db-shm",
+    "backups",
+    "blocked.log"
+  )
+  $sameStateRoot = (
+    [System.IO.Path]::GetFullPath($ConfigDir) -ieq
+    [System.IO.Path]::GetFullPath($DataDir)
+  )
+
+  if (Test-Path $ConfigDir -PathType Container) {
+    if (-not $KeepConfig -and -not $KeepHistory) {
+      Remove-Item -Recurse -Force -LiteralPath $ConfigDir
+      Write-Ok "Removed $ConfigDir"
+    } elseif (-not $KeepConfig) {
+      foreach ($item in @(Get-ChildItem -Force -LiteralPath $ConfigDir)) {
+        if ($item.Name -notin $historyNames) {
+          Remove-Item -Recurse -Force -LiteralPath $item.FullName
+        }
+      }
+      Write-Ok "Removed configuration from $ConfigDir (preserved history)"
+    } elseif (-not $KeepHistory) {
+      foreach ($name in $historyNames) {
+        $historyPath = Join-Path $ConfigDir $name
+        if (Test-Path -LiteralPath $historyPath) {
+          Remove-Item -Recurse -Force -LiteralPath $historyPath
+        }
+      }
+      Write-Ok "Removed history database from $ConfigDir"
+    }
+  }
+
+  if (-not $sameStateRoot -and -not $KeepHistory -and
+      (Test-Path $DataDir -PathType Container)) {
+    Remove-Item -Recurse -Force -LiteralPath $DataDir
+    Write-Ok "Removed $DataDir"
+  }
 }
 
 function Remove-DcgFromUserPath {
@@ -433,7 +513,7 @@ if (Remove-DcgHooksFromJsonFile -Path $codexHooks -DeleteEmptyFile) {
 
 # Gemini CLI (BeforeTool / run_shell_command).
 $geminiSettings = Join-Path (Join-Path $HOME ".gemini") "settings.json"
-if (Remove-DcgHooksFromJsonFile -Path $geminiSettings -EventName "BeforeTool" -Matcher "run_shell_command" -DeleteEmptyFile) {
+if (Remove-DcgHooksFromJsonFile -Path $geminiSettings -EventName "BeforeTool" -DeleteEmptyFile) {
   Write-Ok "Removed Gemini CLI hook"
 }
 
@@ -482,16 +562,45 @@ if (-not $KeepPath) {
   }
 }
 
-$configDir = Join-Path $HOME ".config\dcg"
-if (-not $KeepConfig -and (Test-Path $configDir)) {
-  Remove-Item -Recurse -Force -Path $configDir
-  Write-Ok "Removed $configDir"
+$nativeConfigDir = $null
+$nativeConfigBase = $env:APPDATA
+if ([string]::IsNullOrWhiteSpace($nativeConfigBase)) {
+  $nativeConfigBase = [Environment]::GetFolderPath(
+    [Environment+SpecialFolder]::ApplicationData
+  )
+}
+$nativeDataBase = $env:LOCALAPPDATA
+if ([string]::IsNullOrWhiteSpace($nativeDataBase)) {
+  $nativeDataBase = [Environment]::GetFolderPath(
+    [Environment+SpecialFolder]::LocalApplicationData
+  )
 }
 
-$historyDir = Join-Path $HOME ".local\share\dcg"
-if (-not $KeepHistory -and (Test-Path $historyDir)) {
-  Remove-Item -Recurse -Force -Path $historyDir
-  Write-Ok "Removed $historyDir"
+if (-not [string]::IsNullOrWhiteSpace($nativeConfigBase)) {
+  $nativeConfigDir = Join-Path $nativeConfigBase "dcg"
+  $nativeDataDir = if ([string]::IsNullOrWhiteSpace($nativeDataBase)) {
+    Join-Path $HOME ".local\share\dcg"
+  } else {
+    Join-Path $nativeDataBase "dcg"
+  }
+  Remove-DcgStateDirectories -ConfigDir $nativeConfigDir -DataDir $nativeDataDir `
+    -KeepConfig:$KeepConfig -KeepHistory:$KeepHistory
+}
+
+# dcg continues to honor its historical XDG-style paths on Windows. Clean them
+# as a separate root unless they resolve to the same directory as native
+# roaming/local AppData.
+$legacyConfigDir = Join-Path $HOME ".config\dcg"
+$legacyDataDir = Join-Path $HOME ".local\share\dcg"
+$nativeConfigResolved = if ($null -ne $nativeConfigDir) {
+  [System.IO.Path]::GetFullPath($nativeConfigDir)
+} else {
+  ""
+}
+$legacyConfigResolved = [System.IO.Path]::GetFullPath($legacyConfigDir)
+if ($legacyConfigResolved -ine $nativeConfigResolved) {
+  Remove-DcgStateDirectories -ConfigDir $legacyConfigDir -DataDir $legacyDataDir `
+    -KeepConfig:$KeepConfig -KeepHistory:$KeepHistory
 }
 
 Write-Ok "Uninstall complete"

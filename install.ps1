@@ -178,26 +178,52 @@ function Test-CommandTokenLooksLikePath {
     $Token -match '[\\/]')
 }
 
+function Get-QuotedCommandProgram {
+  param([string]$Text)
+
+  if ([string]::IsNullOrEmpty($Text) -or $Text.Length -lt 2) { return "" }
+  $quote = $Text[0]
+  if ($quote -ne "'" -and $quote -ne '"') { return "" }
+
+  $program = New-Object System.Text.StringBuilder
+  $index = 1
+  while ($index -lt $Text.Length) {
+    $character = $Text[$index]
+    if ($character -eq $quote) {
+      if ($quote -eq "'" -and
+          $index + 1 -lt $Text.Length -and
+          $Text[$index + 1] -eq "'") {
+        [void]$program.Append("'")
+        $index += 2
+        continue
+      }
+      return $program.ToString()
+    }
+    if ($quote -eq '"' -and
+        $character -eq [char]96 -and
+        $index + 1 -lt $Text.Length) {
+      [void]$program.Append($Text[$index + 1])
+      $index += 2
+      continue
+    }
+    [void]$program.Append($character)
+    $index += 1
+  }
+  ""
+}
+
 function Get-DcgCommandName {
   param([string]$Command)
 
   if ([string]::IsNullOrWhiteSpace($Command)) { return "" }
 
   $trimmed = $Command.Trim()
-  if ($trimmed.StartsWith('"')) {
-    $end = $trimmed.IndexOf('"', 1)
-    if ($end -gt 0) {
-      $program = $trimmed.Substring(1, $end - 1)
-    } else {
-      $program = $trimmed.Trim('"')
-    }
-  } elseif ($trimmed.StartsWith("'")) {
-    $end = $trimmed.IndexOf("'", 1)
-    if ($end -gt 0) {
-      $program = $trimmed.Substring(1, $end - 1)
-    } else {
-      $program = $trimmed.Trim("'")
-    }
+  if ($trimmed.StartsWith('&')) {
+    $trimmed = $trimmed.Substring(1).TrimStart()
+  }
+  if ($trimmed.StartsWith('"') -or $trimmed.StartsWith("'")) {
+    $program = Get-QuotedCommandProgram $trimmed
+    if ([string]::IsNullOrEmpty($program)) { return "" }
   } else {
     $program = ($trimmed -split '\s+', 2)[0]
     if (Test-CommandTokenLooksLikePath $program) {
@@ -219,10 +245,16 @@ function Test-DcgHookCommand {
   param([object]$Hook)
 
   if ($null -eq $Hook) { return $false }
-  $prop = $Hook.PSObject.Properties["command"]
-  if ($null -eq $prop) { return $false }
+  if ($Hook -is [System.Collections.IDictionary]) {
+    if (-not $Hook.Contains("command")) { return $false }
+    $command = $Hook["command"]
+  } else {
+    $prop = $Hook.PSObject.Properties["command"]
+    if ($null -eq $prop) { return $false }
+    $command = $prop.Value
+  }
 
-  $name = Get-DcgCommandName ([string]$prop.Value)
+  $name = Get-DcgCommandName ([string]$command)
   $name -eq "dcg" -or $name -eq "dcg.exe"
 }
 
@@ -296,38 +328,67 @@ function Test-UserPathContains {
   $false
 }
 
-# Generic: true when the config already has exactly one dcg hook under a Bash
-# Generic: true when the config already has exactly one dcg hook under the given
-# $Event/$Matcher, equal to $DcgPath and first. Shared by Codex/Claude (PreToolUse
-# /Bash) and Gemini (BeforeTool/run_shell_command).
+# Generic: true when the config already has exactly one dcg hook anywhere under
+# the given $Event, installed under $Matcher, equal to $DcgHook, and first.
+# $OwnedMatchers identifies legacy matcher entries whose malformed hook arrays
+# must be rejected during migrations.
+function Test-HookMatchesDesired {
+  param([object]$Actual, [object]$Desired)
+
+  if (-not (Test-JsonObject $Actual) -or -not (Test-JsonObject $Desired)) { return $false }
+  if (@($Actual.PSObject.Properties).Count -ne @($Desired.PSObject.Properties).Count) {
+    return $false
+  }
+  foreach ($prop in $Desired.PSObject.Properties) {
+    $actualProp = $Actual.PSObject.Properties[$prop.Name]
+    if ($null -eq $actualProp -or $actualProp.Value -ne $prop.Value) {
+      return $false
+    }
+  }
+  $true
+}
+
 function Test-AgentHookCurrent {
-  param([object]$Config, [string]$DcgPath, [string]$Event, [string]$Matcher)
+  param(
+    [object]$Config,
+    [object]$DcgHook,
+    [string]$Event,
+    [string]$Matcher,
+    [string[]]$OwnedMatchers = @($Matcher)
+  )
 
   $hooks = Get-ObjectPropertyValue $Config "hooks"
   if ($null -eq $hooks) { return $false }
 
-  $dcgCommands = @()
-  $firstHookCommand = $null
-  $firstMatcherSeen = $false
-  foreach ($entry in (Get-JsonArray (Get-ObjectPropertyValue $hooks $Event))) {
-    if ((Get-ObjectPropertyValue $entry "matcher") -ne $Matcher) { continue }
-    $entryHooks = Get-JsonArray (Get-ObjectPropertyValue $entry "hooks")
-    if (-not $firstMatcherSeen) {
-      $firstMatcherSeen = $true
-      if ($entryHooks.Count -gt 0) {
-        $firstHookCommand = [string](Get-ObjectPropertyValue $entryHooks[0] "command")
-      }
+  $eventValue = Get-ObjectPropertyValue $hooks $Event
+  if (-not (Test-JsonArray $eventValue)) { return $false }
+  $entries = @(Get-JsonArray $eventValue)
+  if ($entries.Count -eq 0) { return $false }
+
+  $dcgHooks = @()
+  foreach ($entry in $entries) {
+    $entryMatcher = Get-ObjectPropertyValue $entry "matcher"
+    $entryHooksValue = Get-ObjectPropertyValue $entry "hooks"
+    if (-not (Test-JsonArray $entryHooksValue)) {
+      if ($entryMatcher -in $OwnedMatchers) { return $false }
+      continue
     }
+    $entryHooks = @(Get-JsonArray $entryHooksValue)
     foreach ($hook in $entryHooks) {
       if (Test-DcgHookCommand $hook) {
-        $dcgCommands += [string](Get-ObjectPropertyValue $hook "command")
+        $dcgHooks += $hook
       }
     }
   }
 
-  $dcgCommands.Count -eq 1 -and
-    $dcgCommands[0] -eq $DcgPath -and
-    $firstHookCommand -eq $DcgPath
+  $firstEntry = $entries[0]
+  $firstEntryHooksValue = Get-ObjectPropertyValue $firstEntry "hooks"
+  if (-not (Test-JsonArray $firstEntryHooksValue)) { return $false }
+  $firstEntryHooks = @(Get-JsonArray $firstEntryHooksValue)
+  $dcgHooks.Count -eq 1 -and
+    (Get-ObjectPropertyValue $firstEntry "matcher") -eq $Matcher -and
+    $firstEntryHooks.Count -gt 0 -and
+    (Test-HookMatchesDesired $firstEntryHooks[0] $DcgHook)
 }
 
 # Atomically write $Object as JSON to $Path as UTF-8 WITHOUT a BOM. The BOM is
@@ -348,18 +409,21 @@ function Write-JsonFileNoBom {
 
 # Shared create-or-merge for a Claude-Code-style hooks file. Ensures
 # `hooks.<Event>` has an entry with `matcher: <Matcher>` containing exactly one
-# dcg hook ($DcgHook, whose command is $DcgPath), hoisted first, with any other
-# hooks/entries preserved. Idempotent. Refuses to touch invalid JSON / malformed
-# shapes (throws with $Label). Used by Codex/Claude (PreToolUse/Bash) and Gemini
-# (BeforeTool/run_shell_command). Returns "created" | "already" | "merged".
+# dcg hook ($DcgHook), hoisted first, with any other hooks/entries preserved.
+# Stale dcg hooks are removed from every matcher entry so an earlier
+# misinstallation cannot leave an executable but ineffective duplicate.
+# $OwnedMatchers identifies legacy matcher values whose malformed hook arrays
+# must be rejected. Coexisting hooks are never widened. Idempotent. Refuses to
+# touch invalid JSON / malformed owned shapes (throws with $Label).
+# Returns "created" | "already" | "merged".
 function Merge-AgentHookFile {
   param(
     [string]$HooksFile,
     [object]$DcgHook,
-    [string]$DcgPath,
     [string]$Event,
     [string]$Matcher,
-    [string]$Label
+    [string]$Label,
+    [string[]]$OwnedMatchers = @($Matcher)
   )
 
   if (-not (Test-Path $HooksFile -PathType Leaf)) {
@@ -396,7 +460,7 @@ function Merge-AgentHookFile {
     }
   }
 
-  if (Test-AgentHookCurrent $config $DcgPath $Event $Matcher) {
+  if (Test-AgentHookCurrent $config $DcgHook $Event $Matcher $OwnedMatchers) {
     return "already"
   }
 
@@ -405,30 +469,69 @@ function Merge-AgentHookFile {
     Set-ObjectPropertyValue $config "hooks" $hooks
   }
 
-  $matchedHooks = @()
+  $canonicalEntry = $null
   $newEventEntries = @()
 
   foreach ($entry in (Get-JsonArray (Get-ObjectPropertyValue $hooks $Event))) {
-    if ((Get-ObjectPropertyValue $entry "matcher") -eq $Matcher) {
+    $entryMatcher = Get-ObjectPropertyValue $entry "matcher"
+    if ($entryMatcher -eq $Matcher) {
       $entryHooks = Get-ObjectPropertyValue $entry "hooks"
       if ($null -ne $entryHooks -and -not (Test-JsonArray $entryHooks)) {
         throw "$Label $Matcher matcher hooks must contain a list; leaving it unchanged: $HooksFile"
       }
+      $filtered = @()
       foreach ($hook in (Get-JsonArray $entryHooks)) {
         if (-not (Test-DcgHookCommand $hook)) {
-          $matchedHooks += $hook
+          $filtered += $hook
         }
       }
+      if ($null -eq $canonicalEntry) {
+        $canonicalEntry = $entry
+        Set-ObjectPropertyValue $canonicalEntry "hooks" $filtered
+      } elseif ($filtered.Count -gt 0 -or (Get-JsonArray $entryHooks).Count -eq 0) {
+        Set-ObjectPropertyValue $entry "hooks" $filtered
+        $newEventEntries += $entry
+      }
     } else {
-      $newEventEntries += $entry
+      $entryHooks = Get-ObjectPropertyValue $entry "hooks"
+      if ($null -eq $entryHooks) {
+        $newEventEntries += $entry
+        continue
+      }
+      if (-not (Test-JsonArray $entryHooks)) {
+        if ($entryMatcher -in $OwnedMatchers) {
+          throw "$Label $entryMatcher matcher hooks must contain a list; leaving it unchanged: $HooksFile"
+        }
+        $newEventEntries += $entry
+        continue
+      }
+      $filtered = @()
+      $removedDcg = $false
+      foreach ($hook in (Get-JsonArray $entryHooks)) {
+        if (Test-DcgHookCommand $hook) {
+          $removedDcg = $true
+        } else {
+          $filtered += $hook
+        }
+      }
+      if (-not $removedDcg -or $filtered.Count -gt 0) {
+        if ($removedDcg) {
+          Set-ObjectPropertyValue $entry "hooks" $filtered
+        }
+        $newEventEntries += $entry
+      }
     }
   }
 
-  $dcgEntry = [pscustomobject][ordered]@{
-    matcher = $Matcher
-    hooks = @($DcgHook) + $matchedHooks
+  if ($null -eq $canonicalEntry) {
+    $canonicalEntry = [pscustomobject][ordered]@{
+      matcher = $Matcher
+      hooks = @()
+    }
   }
-  $newEventEntries = @($dcgEntry) + $newEventEntries
+  $canonicalHooks = @($DcgHook) + @(Get-JsonArray (Get-ObjectPropertyValue $canonicalEntry "hooks"))
+  Set-ObjectPropertyValue $canonicalEntry "hooks" $canonicalHooks
+  $newEventEntries = @($canonicalEntry) + $newEventEntries
 
   Set-ObjectPropertyValue $hooks $Event $newEventEntries
   Write-JsonFileNoBom -Path $HooksFile -Object $config
@@ -451,11 +554,12 @@ function Configure-CodexHook {
   }
 
   $dcgHook = [pscustomobject][ordered]@{ type = "command"; command = $DcgPath }
-  Merge-AgentHookFile -HooksFile $hooksFile -DcgHook $dcgHook -DcgPath $DcgPath -Event "PreToolUse" -Matcher "Bash" -Label "Codex hooks.json"
+  Merge-AgentHookFile -HooksFile $hooksFile -DcgHook $dcgHook -Event "PreToolUse" -Matcher "Bash" -Label "Codex hooks.json"
 }
 
-# Configure Claude Code's PreToolUse/Bash hook in ~/.claude/settings.json. Claude
-# Code uses the same hook shape as Codex, so this reuses Merge-PreToolUseBashHookFile.
+# Configure Claude Code's PreToolUse hook for both native shell tools in
+# ~/.claude/settings.json. The hook itself runs in PowerShell so an absolute
+# Windows path is not reinterpreted by Git Bash (#232).
 # Configures when ~/.claude exists or `claude` is on PATH (or always under -Force,
 # used by -EasyMode). Returns "created" | "already" | "merged" | "skipped".
 function Configure-ClaudeHook {
@@ -472,8 +576,13 @@ function Configure-ClaudeHook {
     New-Item -ItemType Directory -Force -Path $claudeDir | Out-Null
   }
 
-  $dcgHook = [pscustomobject][ordered]@{ type = "command"; command = $DcgPath }
-  Merge-AgentHookFile -HooksFile $settingsFile -DcgHook $dcgHook -DcgPath $DcgPath -Event "PreToolUse" -Matcher "Bash" -Label "Claude settings.json"
+  $escapedDcgPath = $DcgPath.Replace("'", "''")
+  $dcgHook = [pscustomobject][ordered]@{
+    type = "command"
+    command = "& '$escapedDcgPath'"
+    shell = "powershell"
+  }
+  Merge-AgentHookFile -HooksFile $settingsFile -DcgHook $dcgHook -Event "PreToolUse" -Matcher "Bash|PowerShell" -Label "Claude settings.json" -OwnedMatchers @("Bash", "Bash|PowerShell")
 }
 
 # Configure Gemini CLI's BeforeTool / run_shell_command hook in
@@ -501,7 +610,7 @@ function Configure-GeminiHook {
     command = $DcgPath
     timeout = 5000
   }
-  Merge-AgentHookFile -HooksFile $settingsFile -DcgHook $dcgHook -DcgPath $DcgPath -Event "BeforeTool" -Matcher "run_shell_command" -Label "Gemini settings.json"
+  Merge-AgentHookFile -HooksFile $settingsFile -DcgHook $dcgHook -Event "BeforeTool" -Matcher "run_shell_command" -Label "Gemini settings.json"
 }
 
 # Defend against zip-slip, ambiguous layouts, and non-file entries BEFORE

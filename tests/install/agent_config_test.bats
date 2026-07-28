@@ -2639,8 +2639,8 @@ EOF
     assert_codex_hooks_not_contains "/usr/local/bin/dcg"
 }
 
-@test "unconfigure_codex: preserves non-Bash dcg command hook" {
-    log_test "Testing Codex uninstall only removes Bash-owned dcg hooks..."
+@test "unconfigure_codex: removes wrong-matcher dcg command hook" {
+    log_test "Testing Codex uninstall repairs wrong-matcher dcg hooks..."
     command -v python3 &>/dev/null || skip "python3 not available"
 
     seed_codex_hooks_json '{
@@ -2669,8 +2669,8 @@ EOF
     log_codex_hooks_transition
 
     [ "$status" -eq 0 ]
-    assert_codex_hooks_contains '"matcher": "Read"'
-    assert_codex_hooks_contains "/opt/read-hook/dcg"
+    assert_codex_hooks_not_contains '"matcher": "Read"'
+    assert_codex_hooks_not_contains "/opt/read-hook/dcg"
     assert_codex_hooks_contains "atuin history start"
     assert_codex_hooks_not_contains "/usr/local/bin/dcg\""
 }

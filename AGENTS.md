@@ -130,7 +130,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 | `clap` + `clap_complete` | CLI argument parsing with shell completions |
 | `chrono` | RFC 3339 timestamps |
 | `ast-grep-core` + `ast-grep-language` | AST-based pattern matching for heredoc/inline-script content |
-| `fsqlite` | Telemetry database (FrankenSQLite with concurrent writing) |
+| `rusqlite` | Bundled upstream SQLite for best-effort telemetry history |
 | `rust-mcp-sdk` | MCP server integration (stdio transport) |
 | `tokio` | Async runtime for MCP server mode |
 | `ratatui` + `comfy-table` + `indicatif` + `console` | TUI/CLI visual polish |
@@ -241,8 +241,32 @@ platform-sensitive, follow these conventions:
 - **Windows packs.** `src/packs/windows/` holds the native-Windows packs
   (`windows.filesystem`/`windows.system` default-ON on Windows, `windows.misc`/
   `windows.powershell` opt-in). Patterns use inline `(?i)`; keyword arrays
-  enumerate realistic casings because the keyword quick-reject is case-sensitive
-  (see `src/packs/windows/mod.rs`). See [`docs/windows.md`](docs/windows.md).
+  may retain conventional casing variants for readability, but keyword
+  quick-rejection is ASCII case-insensitive so mixed-case Windows spellings
+  cannot skip the regex stage (see `src/packs/windows/mod.rs`). See
+  [`docs/windows.md`](docs/windows.md).
+- **The `careful_company_running_windows` preset.**
+  `src/packs/careful_company_running_windows/` holds six opt-in sub-packs
+  covering **outbound communication and data egress** (email, chat/webhooks,
+  HTTP upload, file transfer, tunnels) plus **tampering with the controls that
+  supervise the agent** (Defender/firewall/EDR, audit logs, and dcg's own
+  bypass/uninstall). It is the only pack ID with *curated transitive
+  membership*: enabling it also enables the pinned
+  `CAREFUL_COMPANY_PRESET_MEMBERS` list in `src/packs/mod.rs`
+  (`windows.*`, `database.*`, `storage.*`, `remote.*`, `backup.*`, `secrets.*`,
+  `cloud.*`). That list is deliberately explicit — do **not** convert it to
+  prefix matching, or future packs will join a security posture silently.
+  Two invariants to preserve when touching this area:
+  - **Tier order.** `windows.*` is tier 11 and the preset is tier 12, so
+    Windows packs keep claiming attribution for commands both match. Rule ids
+    (`pack_id:pattern_name`) are what allowlists key on, so reordering these
+    silently invalidates existing `windows.*` allowlist entries.
+  - **The `hfdt` trust boundary.** While any preset sub-pack is enabled,
+    `src/evaluator.rs` allows a command whose executable is `hfdt` **before any
+    pack runs** — including `core.*`. It is structural (whole-segment
+    executable match, no chains/redirection/substitution), but it does mean
+    enabling the preset *reduces* coverage for that one executable. Keep it
+    documented in `README.md` and `docs/careful-company-windows.md`.
 
 ---
 

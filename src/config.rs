@@ -813,6 +813,10 @@ struct HistoryConfigLayer {
     retention_days: Option<u32>,
     max_size_mb: Option<u32>,
     database_path: Option<String>,
+    auto_prune: Option<bool>,
+    prune_check_interval_hours: Option<u32>,
+    batch_size: Option<u32>,
+    batch_flush_interval_ms: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1868,20 +1872,59 @@ pub struct PacksConfig {
 }
 
 impl PacksConfig {
-    /// Get enabled pack IDs as a deduplicated set.
-    #[must_use]
-    pub fn enabled_pack_ids(&self) -> HashSet<String> {
-        let mut enabled: HashSet<String> = self.enabled.iter().cloned().collect();
+    /// Expand every known built-in category or preset to concrete pack IDs.
+    ///
+    /// Registry expansion deliberately retains the requested category ID so
+    /// metadata callers can tell what was requested. Configuration evaluation
+    /// cannot retain it, however: a later registry expansion would otherwise
+    /// reintroduce a leaf removed by `disabled` (for example, enabling
+    /// `database` while disabling `database.redis`). Keep real pack IDs,
+    /// external/unknown IDs, and the mandatory `core` marker; discard only
+    /// known category-only IDs after their leaves have been materialized.
+    fn expand_known_pack_groups(enabled: &HashSet<String>) -> HashSet<String> {
+        let mut expanded = crate::packs::REGISTRY.expand_enabled(enabled);
+        expanded.retain(|id| {
+            id == "core"
+                || crate::packs::REGISTRY.get_entry(id).is_some()
+                || crate::packs::REGISTRY.packs_in_category(id).is_empty()
+        });
+        expanded
+    }
 
-        // Remove explicitly disabled packs.
-        for disabled in &self.disabled {
-            enabled.remove(disabled);
-            // Also remove sub-packs if a category is disabled.
-            enabled.retain(|p| !p.starts_with(&format!("{disabled}.")));
+    /// Remove an explicitly disabled concrete pack or ordinary category.
+    ///
+    /// Presets are handled before expansion instead. Removing every expanded
+    /// preset member here would also remove packs enabled independently by a
+    /// platform default, a direct leaf, or another category.
+    fn remove_disabled_pack_group(enabled: &mut HashSet<String>, disabled: &str) {
+        enabled.remove(disabled);
+        enabled.retain(|pack_id| !pack_id.starts_with(&format!("{disabled}.")));
+    }
+
+    /// Remove disabled preset *sources* before expansion.
+    ///
+    /// A preset is an enablement contribution, not an ownership claim over its
+    /// member packs. If `cloud` and the careful-Windows preset are both enabled,
+    /// disabling only the preset must leave the independently requested cloud
+    /// packs enabled.
+    fn remove_disabled_preset_markers(requested: &mut HashSet<String>, disabled: &[String]) {
+        for disabled_id in disabled {
+            if crate::packs::preset_members(disabled_id).is_some() {
+                requested.remove(disabled_id);
+            }
         }
+    }
 
-        // Core is always enabled (cannot be disabled).
-        enabled.insert("core".to_string());
+    fn remove_disabled_non_preset_groups(enabled: &mut HashSet<String>, disabled: &[String]) {
+        for disabled_id in disabled {
+            if crate::packs::preset_members(disabled_id).is_none() {
+                Self::remove_disabled_pack_group(enabled, disabled_id);
+            }
+        }
+    }
+
+    fn requested_pack_ids(&self, include_windows_defaults: bool) -> HashSet<String> {
+        let mut enabled: HashSet<String> = self.enabled.iter().cloned().collect();
 
         // `system.disk` is default-on but opt-out-able. It guards
         // catastrophic, unrecoverable disk operations (`mkfs /dev/sda`,
@@ -1892,13 +1935,7 @@ impl PacksConfig {
         // genuinely need to run mkfs/dd-to-device unblocked can opt out
         // via `disabled = ["system.disk"]` (or `disabled = ["system"]`
         // to drop all system.* packs).
-        let system_disk_explicitly_disabled = self
-            .disabled
-            .iter()
-            .any(|d| d == "system.disk" || d == "system");
-        if !system_disk_explicitly_disabled {
-            enabled.insert("system.disk".to_string());
-        }
+        enabled.insert("system.disk".to_string());
 
         // Windows-native packs are default-ON only on Windows: a fresh Windows
         // install must block `del /s`, `rd /s`, `Remove-Item -Recurse -Force`,
@@ -1907,19 +1944,41 @@ impl PacksConfig {
         // Unix users can still opt in (e.g. to scan committed `.ps1`/`.cmd`
         // scripts) via `enabled = ["windows.filesystem"]`. Opt out on Windows
         // with `disabled = ["windows.filesystem"]` (or `disabled = ["windows"]`).
-        #[cfg(windows)]
-        {
-            // Catastrophic Windows packs default-ON; each opt-out-able by its own
-            // id or by the `windows` category.
+        if include_windows_defaults {
             for pack_id in ["windows.filesystem", "windows.system"] {
-                let disabled = self.disabled.iter().any(|d| d == pack_id || d == "windows");
-                if !disabled {
-                    enabled.insert(pack_id.to_string());
-                }
+                enabled.insert(pack_id.to_string());
             }
         }
+        enabled
+    }
+
+    fn resolve_requested_pack_ids(
+        mut requested: HashSet<String>,
+        disabled: &[String],
+    ) -> HashSet<String> {
+        // Cancel preset contributions before expansion so independently
+        // requested/default member packs retain their provenance.
+        Self::remove_disabled_preset_markers(&mut requested, disabled);
+
+        // Expand before applying exclusions. Filtering a requested category
+        // first is insufficient because the registry would expand the surviving
+        // parent later and silently put the excluded leaf back.
+        let mut enabled = Self::expand_known_pack_groups(&requested);
+
+        // Ordinary leaf/category exclusions remain last-wins after expansion.
+        Self::remove_disabled_non_preset_groups(&mut enabled, disabled);
+
+        // Core is always enabled (cannot be disabled). Keeping the category
+        // marker is intentional: registry callers expand it to both core packs.
+        enabled.insert("core".to_string());
 
         enabled
+    }
+
+    /// Get enabled pack IDs as a deduplicated set.
+    #[must_use]
+    pub fn enabled_pack_ids(&self) -> HashSet<String> {
+        Self::resolve_requested_pack_ids(self.requested_pack_ids(cfg!(windows)), &self.disabled)
     }
 
     /// Expand custom_paths, resolving tilde, ${repo_root}, and glob patterns.
@@ -2004,8 +2063,9 @@ impl PacksConfig {
 
 /// Decision mode policy configuration.
 ///
-/// Controls how matched patterns are handled: deny (block), warn (allow with warning),
-/// or log (silent allow with optional logging).
+/// Controls how matched patterns are handled: deny (block), ask (require
+/// operator review), warn (allow with warning), or log (silent allow with
+/// optional logging).
 ///
 /// Defaults respect severity: Critical/High → deny, Medium → warn, Low → log.
 /// This config allows overriding the default behavior per pack or per specific rule.
@@ -2056,6 +2116,8 @@ pub struct PolicyConfig {
 pub enum PolicyMode {
     /// Block the command (output JSON deny, print warning).
     Deny,
+    /// Require explicit operator review; fail closed if the client cannot ask.
+    Ask,
     /// Warn but allow (print warning to stderr, no JSON deny).
     Warn,
     /// Log only (silent allow, record for history).
@@ -2068,6 +2130,7 @@ impl PolicyMode {
     pub const fn to_decision_mode(self) -> crate::packs::DecisionMode {
         match self {
             Self::Deny => crate::packs::DecisionMode::Deny,
+            Self::Ask => crate::packs::DecisionMode::Ask,
             Self::Warn => crate::packs::DecisionMode::Warn,
             Self::Log => crate::packs::DecisionMode::Log,
         }
@@ -2108,16 +2171,10 @@ impl PolicyConfig {
             }
         }
 
-        // Safety constraint: Critical rules may only be loosened via an explicit per-rule override.
-        // Pack-level/global defaults must never downgrade Critical to warn/log.
-        if matches!(severity, Some(crate::packs::Severity::Critical)) {
-            return crate::packs::DecisionMode::Deny;
-        }
-
         // 2. Pack-specific override
         if let Some(pack) = pack_id {
             if let Some(mode) = self.packs.get(pack) {
-                return mode.to_decision_mode();
+                return constrain_critical_policy(mode.to_decision_mode(), severity);
             }
         }
 
@@ -2135,11 +2192,31 @@ impl PolicyConfig {
             });
 
         if let Some(mode) = effective_default_mode {
-            return mode.to_decision_mode();
+            return constrain_critical_policy(mode.to_decision_mode(), severity);
         }
 
         // 4. Severity-based default
         severity.map_or(crate::packs::DecisionMode::Deny, |s| s.default_mode())
+    }
+}
+
+/// Critical rules may use deny or the still-blocking ask mode from broad
+/// policy. Warn/log remain available only through an explicit per-rule
+/// override, preserving the existing safeguard against accidental global
+/// relaxation.
+const fn constrain_critical_policy(
+    mode: crate::packs::DecisionMode,
+    severity: Option<crate::packs::Severity>,
+) -> crate::packs::DecisionMode {
+    if matches!(severity, Some(crate::packs::Severity::Critical))
+        && matches!(
+            mode,
+            crate::packs::DecisionMode::Warn | crate::packs::DecisionMode::Log
+        )
+    {
+        crate::packs::DecisionMode::Deny
+    } else {
+        mode
     }
 }
 
@@ -2671,18 +2748,23 @@ pub struct HistoryConfig {
     /// Redaction mode for stored commands.
     pub redaction_mode: HistoryRedactionMode,
     /// Retention window in days.
+    #[schemars(range(min = 1, max = 3650))]
     pub retention_days: u32,
     /// Maximum database size in megabytes.
+    #[schemars(range(min = 1))]
     pub max_size_mb: u32,
     /// Optional database file path override.
     pub database_path: Option<String>,
     /// Enable automatic pruning of old entries.
     pub auto_prune: bool,
     /// Interval in hours between automatic prune checks.
+    #[schemars(range(min = 1))]
     pub prune_check_interval_hours: u32,
     /// Batch size for write operations (improves performance).
+    #[schemars(range(min = 1))]
     pub batch_size: u32,
     /// Flush interval in milliseconds for batched writes.
+    #[schemars(range(min = 1))]
     pub batch_flush_interval_ms: u32,
 }
 
@@ -2723,7 +2805,7 @@ impl HistoryConfig {
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid retention values.
+    /// Returns an error for invalid history values.
     pub fn validate(&self) -> Result<(), String> {
         if self.retention_days == 0 {
             return Err("history retention_days must be at least 1".to_string());
@@ -2734,7 +2816,48 @@ impl HistoryConfig {
                 Self::MAX_RETENTION_DAYS
             ));
         }
+        if self.max_size_mb == 0 {
+            return Err("history max_size_mb must be at least 1".to_string());
+        }
+        if self.prune_check_interval_hours == 0 {
+            return Err("history prune_check_interval_hours must be at least 1".to_string());
+        }
+        if self.batch_size == 0 {
+            return Err("history batch_size must be at least 1".to_string());
+        }
+        if self.batch_flush_interval_ms == 0 {
+            return Err("history batch_flush_interval_ms must be at least 1".to_string());
+        }
         Ok(())
+    }
+
+    /// Repair invalid runtime values to conservative, non-spinning minima.
+    ///
+    /// The public config type can be constructed directly and layered TOML is
+    /// intentionally presence-aware, so schema validation alone is not a
+    /// runtime boundary. Return whether any value needed repair so the loader
+    /// can surface a single concise warning.
+    fn normalize_runtime_invariants(&mut self) -> bool {
+        let original = (
+            self.retention_days,
+            self.max_size_mb,
+            self.prune_check_interval_hours,
+            self.batch_size,
+            self.batch_flush_interval_ms,
+        );
+        self.retention_days = self.retention_days.clamp(1, Self::MAX_RETENTION_DAYS);
+        self.max_size_mb = self.max_size_mb.max(1);
+        self.prune_check_interval_hours = self.prune_check_interval_hours.max(1);
+        self.batch_size = self.batch_size.max(1);
+        self.batch_flush_interval_ms = self.batch_flush_interval_ms.max(1);
+        original
+            != (
+                self.retention_days,
+                self.max_size_mb,
+                self.prune_check_interval_hours,
+                self.batch_size,
+                self.batch_flush_interval_ms,
+            )
     }
 }
 
@@ -3735,6 +3858,14 @@ impl Config {
 
         // Apply environment variable overrides (highest priority)
         config.apply_env_overrides();
+        if config.history.normalize_runtime_invariants() {
+            eprintln!(
+                "Warning: invalid history limits were clamped to safe runtime values \
+                 (retention_days=1..={}, max_size_mb>=1, prune_check_interval_hours>=1, \
+                 batch_size>=1, batch_flush_interval_ms>=1)",
+                HistoryConfig::MAX_RETENTION_DAYS
+            );
+        }
 
         (config, sources)
     }
@@ -3765,7 +3896,7 @@ impl Config {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn load_layer_from_file_with_source(path: &Path, source: ConfigSource) -> Option<ConfigLayer> {
         Self::load_layer_from_file_with_outcome(
             path,
@@ -3855,7 +3986,14 @@ impl Config {
     #[must_use]
     pub fn load_from_file(path: &Path) -> Option<Self> {
         let content = read_config_file_bounded(path, ConfigSource::Untrusted)?;
-        toml::from_str(&content).ok()
+        let mut config: Self = toml::from_str(&content).ok()?;
+        if config.history.normalize_runtime_invariants() {
+            eprintln!(
+                "Warning: invalid history limits in '{}' were clamped to safe runtime values",
+                path.display()
+            );
+        }
+        Some(config)
     }
 
     fn user_config_candidates() -> Vec<PathBuf> {
@@ -3922,7 +4060,7 @@ impl Config {
 
     /// Load the enforcement-only subset of project-level configuration
     /// (`.dcg.toml` in repo root).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn load_project_config_layer_from(start_dir: Option<&Path>) -> Option<ConfigLayer> {
         let start_dir = start_dir?;
         let repo_root = find_repo_root(start_dir, REPO_ROOT_SEARCH_MAX_HOPS)?;
@@ -4183,6 +4321,18 @@ impl Config {
         if let Some(database_path) = history.database_path {
             self.history.database_path = Some(database_path);
         }
+        if let Some(auto_prune) = history.auto_prune {
+            self.history.auto_prune = auto_prune;
+        }
+        if let Some(prune_check_interval_hours) = history.prune_check_interval_hours {
+            self.history.prune_check_interval_hours = prune_check_interval_hours;
+        }
+        if let Some(batch_size) = history.batch_size {
+            self.history.batch_size = batch_size;
+        }
+        if let Some(batch_flush_interval_ms) = history.batch_flush_interval_ms {
+            self.history.batch_flush_interval_ms = batch_flush_interval_ms;
+        }
     }
 
     fn merge_interactive_layer(&mut self, interactive: InteractiveConfigLayer) {
@@ -4396,7 +4546,7 @@ impl Config {
         // Policy config (env overrides)
         // -----------------------------------------------------------------
 
-        // DCG_POLICY_DEFAULT_MODE=deny|warn|log
+        // DCG_POLICY_DEFAULT_MODE=deny|ask|warn|log
         if let Some(mode) = get_env(&format!("{ENV_PREFIX}_POLICY_DEFAULT_MODE")) {
             if let Some(parsed) = parse_policy_mode(&mode) {
                 self.policy.default_mode = Some(parsed);
@@ -4650,19 +4800,40 @@ impl Config {
     /// on top of the base configuration.
     #[must_use]
     pub fn enabled_pack_ids_for_agent(&self, agent: &crate::agent::Agent) -> HashSet<String> {
-        let mut packs = self.enabled_pack_ids();
         let profile = self.agents.profile_for_agent(agent);
+        let packs_config = if self.projects.is_empty() {
+            self.packs.clone()
+        } else if let Ok(cwd) = std::env::current_dir() {
+            self.effective_packs_for_project(&cwd)
+        } else {
+            self.packs.clone()
+        };
 
-        // Remove disabled packs (and their sub-packs)
-        for disabled in &profile.disabled_packs {
-            packs.remove(disabled);
-            packs.retain(|p| !p.starts_with(&format!("{disabled}.")));
-        }
+        // A profile can cancel a preset contribution from the base config, but
+        // it must not remove member packs that were also enabled independently
+        // (including Windows' default-on filesystem/system packs).
+        let mut base_requested = packs_config.requested_pack_ids(cfg!(windows));
+        PacksConfig::remove_disabled_preset_markers(&mut base_requested, &profile.disabled_packs);
+        let mut packs =
+            PacksConfig::resolve_requested_pack_ids(base_requested, &packs_config.disabled);
 
-        // Add extra packs
-        for extra in &profile.extra_packs {
-            packs.insert(extra.clone());
-        }
+        // Agent extras intentionally override base exclusions. Resolve them as
+        // a separate contribution so profile-level preset cancellation still
+        // preserves direct/category/default sources from the base.
+        let mut extra_requested: HashSet<String> = profile.extra_packs.iter().cloned().collect();
+        PacksConfig::remove_disabled_preset_markers(&mut extra_requested, &profile.disabled_packs);
+        packs.extend(PacksConfig::expand_known_pack_groups(&extra_requested));
+
+        // Ordinary profile leaf/category exclusions are last-wins. Preset
+        // exclusions were already applied to the source markers above.
+        PacksConfig::remove_disabled_non_preset_groups(&mut packs, &profile.disabled_packs);
+
+        // Agent profiles may narrow optional packs, but they must not bypass the
+        // same invariant as the base configuration: core protections are
+        // mandatory. Reinsert the category marker after profile exclusions so
+        // `disabled_packs = ["core"]` cannot silently remove core.git and
+        // core.filesystem when the registry resolves the final set.
+        packs.insert("core".to_string());
 
         packs
     }
@@ -4900,6 +5071,7 @@ custom_paths = [
 [policy]
 # Optional global override for how matched rules are handled:
 # - "deny": block (default)
+# - "ask": require native operator review; unsupported clients fail closed
 # - "warn": allow but print a warning to stderr (no hook JSON deny)
 # - "log": allow silently (no stderr/stdout; optional log_file history)
 #
@@ -4918,6 +5090,7 @@ custom_paths = [
 [policy.packs]
 # Override mode for an entire pack (pack_id => mode).
 # Examples:
+# "core.git" = "ask"                # require native review for git operations
 # "core.git" = "warn"                # warn-first rollout for git pack
 # "containers.docker" = "deny"       # keep docker destructive ops as hard blocks
 
@@ -5123,6 +5296,7 @@ fn env_disable_flag_enabled(value: &str) -> bool {
 fn parse_policy_mode(value: &str) -> Option<PolicyMode> {
     match value.trim().to_ascii_lowercase().as_str() {
         "deny" | "block" => Some(PolicyMode::Deny),
+        "ask" | "review" => Some(PolicyMode::Ask),
         "warn" | "warning" => Some(PolicyMode::Warn),
         "log" | "log-only" | "logonly" => Some(PolicyMode::Log),
         _ => None,
@@ -5648,8 +5822,118 @@ auto_prune_expired = true
             ..Default::default()
         };
         let enabled = config.enabled_pack_ids();
-        assert!(enabled.contains("kubernetes"));
+        assert!(
+            !enabled.contains("kubernetes"),
+            "known category markers must be replaced by concrete leaves"
+        );
+        assert!(enabled.contains("kubernetes.kubectl"));
+        assert!(enabled.contains("kubernetes.kustomize"));
         assert!(!enabled.contains("kubernetes.helm"));
+    }
+
+    #[test]
+    fn careful_windows_preset_expands_to_curated_destructive_and_egress_leaves() {
+        let config = Config {
+            packs: PacksConfig {
+                enabled: vec!["careful_company_running_windows".to_string()],
+                disabled: vec!["database.mongodb".to_string()],
+                custom_paths: vec![],
+            },
+            ..Default::default()
+        };
+        let enabled = config.enabled_pack_ids();
+
+        for expected in [
+            "careful_company_running_windows.chat",
+            "careful_company_running_windows.email",
+            "careful_company_running_windows.guardrails",
+            "careful_company_running_windows.transfer",
+            "careful_company_running_windows.tunnel",
+            "careful_company_running_windows.upload",
+            "windows.filesystem",
+            "windows.misc",
+            "windows.powershell",
+            "windows.system",
+            "database.snowflake",
+            "storage.s3",
+            "remote.scp",
+            "backup.rclone",
+            "secrets.vault",
+            "cloud.aws",
+        ] {
+            assert!(
+                enabled.contains(expected),
+                "curated preset must include {expected}: {enabled:?}"
+            );
+        }
+        assert!(
+            !enabled.contains("database.mongodb"),
+            "leaf exclusions must win after preset expansion"
+        );
+        assert!(
+            !enabled.contains("containers.docker"),
+            "unreviewed categories must not silently join the curated preset"
+        );
+        assert!(
+            !enabled.contains("careful_company_running_windows"),
+            "preset marker must resolve to concrete leaves"
+        );
+    }
+
+    #[test]
+    fn disabling_careful_windows_preset_removes_only_its_enablement_contribution() {
+        let config = Config {
+            packs: PacksConfig {
+                enabled: vec![
+                    "careful_company_running_windows".to_string(),
+                    "cloud".to_string(),
+                    "database.snowflake".to_string(),
+                ],
+                disabled: vec!["careful_company_running_windows".to_string()],
+                custom_paths: vec![],
+            },
+            ..Default::default()
+        };
+        let enabled = config.enabled_pack_ids();
+
+        assert!(
+            !enabled
+                .iter()
+                .any(|pack_id| pack_id.starts_with("careful_company_running_windows.")),
+            "disabling the preset must remove its own leaves: {enabled:?}"
+        );
+        for cloud_pack in ["cloud.aws", "cloud.gcp", "cloud.azure"] {
+            assert!(
+                enabled.contains(cloud_pack),
+                "independent cloud-category enablement must survive preset cancellation: {enabled:?}"
+            );
+        }
+        assert!(
+            enabled.contains("database.snowflake"),
+            "an independently enabled preset member must retain its own provenance: {enabled:?}"
+        );
+        assert!(
+            !enabled.contains("remote.scp"),
+            "a preset-only member must disappear with the preset contribution: {enabled:?}"
+        );
+    }
+
+    #[test]
+    fn disabling_preset_preserves_native_windows_default_packs() {
+        let packs = PacksConfig {
+            enabled: vec!["careful_company_running_windows".to_string()],
+            disabled: vec!["careful_company_running_windows".to_string()],
+            custom_paths: vec![],
+        };
+        let enabled = PacksConfig::resolve_requested_pack_ids(
+            packs.requested_pack_ids(true),
+            &packs.disabled,
+        );
+
+        assert!(enabled.contains("windows.filesystem"));
+        assert!(enabled.contains("windows.system"));
+        assert!(!enabled.contains("windows.misc"));
+        assert!(!enabled.contains("windows.powershell"));
     }
 
     #[test]
@@ -5709,6 +5993,19 @@ auto_prune_expired = true
         assert_eq!(config.redaction_mode, HistoryRedactionMode::Pattern);
         assert_eq!(config.retention_days, HistoryConfig::DEFAULT_RETENTION_DAYS);
         assert_eq!(config.max_size_mb, HistoryConfig::DEFAULT_MAX_SIZE_MB);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_history_config_rejects_zero_size_cap() {
+        let config = HistoryConfig {
+            max_size_mb: 0,
+            ..HistoryConfig::default()
+        };
+        assert_eq!(
+            config.validate().unwrap_err(),
+            "history max_size_mb must be at least 1"
+        );
     }
 
     #[test]
@@ -5720,6 +6017,10 @@ redaction_mode = "full"
 retention_days = 30
 max_size_mb = 250
 database_path = "/tmp/dcg-history.db"
+auto_prune = true
+prune_check_interval_hours = 6
+batch_size = 25
+batch_flush_interval_ms = 40
 "#;
         let config: Config = toml::from_str(input).expect("config parses");
         assert!(config.history.enabled);
@@ -5730,6 +6031,31 @@ database_path = "/tmp/dcg-history.db"
             config.history.database_path.as_deref(),
             Some("/tmp/dcg-history.db")
         );
+        assert!(config.history.auto_prune);
+        assert_eq!(config.history.prune_check_interval_hours, 6);
+        assert_eq!(config.history.batch_size, 25);
+        assert_eq!(config.history.batch_flush_interval_ms, 40);
+    }
+
+    #[test]
+    fn history_runtime_fields_survive_presence_aware_layer_merge() {
+        let layer: ConfigLayer = toml::from_str(
+            r"
+[history]
+auto_prune = true
+prune_check_interval_hours = 7
+batch_size = 13
+batch_flush_interval_ms = 29
+",
+        )
+        .expect("history layer parses");
+        let mut config = Config::default();
+        config.merge_layer(layer);
+
+        assert!(config.history.auto_prune);
+        assert_eq!(config.history.prune_check_interval_hours, 7);
+        assert_eq!(config.history.batch_size, 13);
+        assert_eq!(config.history.batch_flush_interval_ms, 29);
     }
 
     #[test]
@@ -5816,6 +6142,27 @@ database_path = "/tmp/dcg-history.db"
             ..Default::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn history_runtime_invariants_prevent_zero_interval_worker_spins() {
+        let mut config = HistoryConfig {
+            retention_days: 0,
+            max_size_mb: 0,
+            prune_check_interval_hours: 0,
+            batch_size: 0,
+            batch_flush_interval_ms: 0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+        assert!(config.normalize_runtime_invariants());
+        assert_eq!(config.retention_days, 1);
+        assert_eq!(config.max_size_mb, 1);
+        assert_eq!(config.prune_check_interval_hours, 1);
+        assert_eq!(config.batch_size, 1);
+        assert_eq!(config.batch_flush_interval_ms, 1);
+        assert!(config.validate().is_ok());
+        assert!(!config.normalize_runtime_invariants());
     }
 
     // =========================================================================
@@ -7636,6 +7983,10 @@ enabled = false
             crate::packs::DecisionMode::Deny
         );
         assert_eq!(
+            PolicyMode::Ask.to_decision_mode(),
+            crate::packs::DecisionMode::Ask
+        );
+        assert_eq!(
             PolicyMode::Warn.to_decision_mode(),
             crate::packs::DecisionMode::Warn
         );
@@ -7761,6 +8112,21 @@ enabled = false
     }
 
     #[test]
+    fn test_policy_resolve_mode_critical_can_require_review_globally() {
+        let policy = PolicyConfig {
+            default_mode: Some(PolicyMode::Ask),
+            ..Default::default()
+        };
+
+        let mode = policy.resolve_mode(
+            Some("core.git"),
+            Some("reset-hard"),
+            Some(crate::packs::Severity::Critical),
+        );
+        assert_eq!(mode, crate::packs::DecisionMode::Ask);
+    }
+
+    #[test]
     fn test_policy_resolve_mode_critical_can_be_loosened_by_rule() {
         let mut policy = PolicyConfig::default();
         policy
@@ -7815,6 +8181,8 @@ enabled = false
         for (input, expected) in [
             ("deny", Some(PolicyMode::Deny)),
             ("block", Some(PolicyMode::Deny)),
+            ("ask", Some(PolicyMode::Ask)),
+            ("review", Some(PolicyMode::Ask)),
             ("warn", Some(PolicyMode::Warn)),
             ("warning", Some(PolicyMode::Warn)),
             ("log", Some(PolicyMode::Log)),
@@ -8637,6 +9005,88 @@ additional_allowlist = ["git push origin main"]
         let packs = config.enabled_pack_ids_for_agent(&Agent::ClaudeCode);
         assert!(packs.contains("containers.docker"));
         assert!(packs.contains("core"));
+    }
+
+    #[test]
+    fn test_agent_disabled_leaf_is_not_reintroduced_by_extra_category() {
+        use crate::agent::Agent;
+
+        let mut config = Config::default();
+        config.agents.profiles.insert(
+            "claude-code".to_string(),
+            AgentProfile {
+                extra_packs: vec!["kubernetes".to_string()],
+                disabled_packs: vec!["kubernetes.helm".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let packs = config.enabled_pack_ids_for_agent(&Agent::ClaudeCode);
+        assert!(packs.contains("kubernetes.kubectl"));
+        assert!(packs.contains("kubernetes.kustomize"));
+        assert!(!packs.contains("kubernetes.helm"));
+        assert!(
+            !packs.contains("kubernetes"),
+            "a surviving category marker would reintroduce the disabled leaf"
+        );
+    }
+
+    #[test]
+    fn agent_profile_cannot_disable_mandatory_core_packs() {
+        use crate::agent::Agent;
+
+        let mut config = Config::default();
+        config.agents.profiles.insert(
+            "claude-code".to_string(),
+            AgentProfile {
+                disabled_packs: vec!["core".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let packs = config.enabled_pack_ids_for_agent(&Agent::ClaudeCode);
+        assert!(
+            packs.contains("core"),
+            "agent-level exclusions must preserve the mandatory core marker: {packs:?}"
+        );
+        let ordered = crate::packs::REGISTRY.expand_enabled_ordered(&packs);
+        assert!(ordered.iter().any(|pack| pack == "core.git"));
+        assert!(ordered.iter().any(|pack| pack == "core.filesystem"));
+    }
+
+    #[test]
+    fn agent_can_cancel_preset_without_removing_independent_members() {
+        use crate::agent::Agent;
+
+        let mut config = Config::default();
+        config.packs.enabled = vec![
+            "careful_company_running_windows".to_string(),
+            "cloud".to_string(),
+            "database.snowflake".to_string(),
+        ];
+        config.agents.profiles.insert(
+            "claude-code".to_string(),
+            AgentProfile {
+                disabled_packs: vec!["careful_company_running_windows".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let packs = config.enabled_pack_ids_for_agent(&Agent::ClaudeCode);
+        assert!(
+            !packs
+                .iter()
+                .any(|pack_id| pack_id.starts_with("careful_company_running_windows.")),
+            "agent exclusion must remove the preset leaves: {packs:?}"
+        );
+        for cloud_pack in ["cloud.aws", "cloud.gcp", "cloud.azure"] {
+            assert!(
+                packs.contains(cloud_pack),
+                "profile preset cancellation must preserve base category enablement: {packs:?}"
+            );
+        }
+        assert!(packs.contains("database.snowflake"));
+        assert!(!packs.contains("remote.scp"));
     }
 
     #[test]

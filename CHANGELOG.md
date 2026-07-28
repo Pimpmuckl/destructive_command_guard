@@ -11,6 +11,150 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## Unreleased
+
+## [v0.7.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.1) -- 2026-07-27 [Release]
+
+### Windows correctness
+
+- Keep caller-proven PowerShell syntax out of the Bash-backed database
+  indirect-input fallback when no protected database or DNS consumer is
+  present. This lets the intended `windows.filesystem` rule classify .NET
+  directory deletion while retaining fail-closed handling for dynamic
+  PowerShell database targets and real database pipelines.
+
+## [v0.7.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.0) -- 2026-07-27 [Release]
+
+### Policy and protocols
+
+- Add an opt-in `ask` policy mode. Claude Code and GitHub Copilot receive their
+  native operator-review response, while clients without a review decision
+  fail closed with their normal blocking protocol. `warn` remains a true
+  warning-only mode and consistently allows execution.
+- Configure Claude Code's Windows hook for both `Bash` and `PowerShell` tools.
+  The PowerShell-safe wrapper launches an absolute `dcg.exe` path without Git
+  Bash consuming its backslashes, and installer migration preserves unrelated
+  hooks and matcher metadata while collapsing only dcg-owned duplicates.
+
+### Correctness and storage
+
+- Ignore destructive command text that is merely quoted data in shell control
+  flow, ordinary pipelines, and redirects (#230), while continuing to block
+  later executable matches and text piped into an interpreter. Preserve the
+  conservative raw scan for non-shell interpreter heredocs where quoted text
+  can still reach a dynamic execution sink.
+- Evaluate commands after leading POSIX environment assignments so assignment
+  prefixes cannot bypass filesystem, disk, permission, or opt-in pack rules
+  (#231).
+- Replace the history subsystem's experimental SQLite backend with bundled
+  upstream SQLite through `rusqlite`. History now enforces `max_size_mb`,
+  checkpoints and compacts storage, validates FTS integrity across reopen
+  cycles, and disables further writes rather than exceeding the configured
+  capacity or continuing after a fatal storage error (#229).
+
+### Distribution
+
+- Repair the official Homebrew formula for all four supported architectures,
+  accurately represent the custom license rider, test safe and denied dcg
+  decisions, and make formula smoke failures blocking in tap CI (#227).
+- Harden the tap updater so every versioned URL and checksum is replaced
+  exactly once, all four checksums are validated, and missing architecture
+  blocks or placeholder checksums fail the update.
+
+## [v0.6.12](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.12) -- 2026-07-27 [Release]
+
+Native-Windows binary release that supersedes the unpublished v0.6.10 and
+v0.6.11 source tags.
+
+### Validation
+
+- Correct the native E2E wrapper fixtures so Cmd deletion syntax is executed
+  through an actual nested `cmd /c` process instead of being misclassified as
+  PowerShell syntax. The mixed PowerShell-to-Cmd launcher paths now exercise
+  the protection they describe without adding a false positive for
+  PowerShell's unrelated `rd` alias.
+- Verify the release candidate on a native Windows workstation: all 348
+  PowerShell/Cmd E2E scenarios pass, including the curated
+  `careful_company_running_windows` policy.
+
+## [v0.6.11](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.11) -- 2026-07-27 [Tag]
+
+Native-Windows validation release that supersedes the unpublished v0.6.10
+source tag.
+
+### Correctness
+
+- Preserve caller-proven shell dialect boundaries in `windows.filesystem`.
+  POSIX `rm -r` commands are no longer reinterpreted as PowerShell
+  `Remove-Item -Recurse` aliases merely because dcg itself is running on
+  Windows; unknown-shell input remains conservatively checked.
+- Make the Windows PowerShell 5.1 E2E harness capture native stderr without
+  turning intentional deny diagnostics into terminating `NativeCommandError`
+  exceptions. The native suite now uses an isolated conformance-test timeout
+  rather than the production 200ms latency budget.
+- Exercise Windows-native rules under their actual Cmd or PowerShell dialect,
+  including nested launchers. Recursive deletion through `%TEMP%` remains
+  review-required because the expansion is caller-controlled.
+
+## [v0.6.10](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.10) -- 2026-07-27 [Tag]
+
+### Packs
+
+- **Add the curated `careful_company_running_windows` preset.** The opt-in
+  policy is designed for Windows workstations where coding agents run without
+  interactive tool approval. Six new leaf packs cover outbound email and chat,
+  HTTP uploads, file-transfer tools, public tunnels/raw channels, and tampering
+  with endpoint, audit, or dcg guardrails. High-confidence sends deny by
+  default; ambiguous generic API writes warn; ordinary reads, downloads,
+  package installation, internal destinations, and named-remote Git pushes
+  remain usable.
+- Enabling the preset also activates an explicitly pinned set of the existing
+  Windows, database, storage, remote, backup, secrets, and cloud packs, including
+  Snowflake. Leaf exclusions are applied after category/preset expansion, and
+  future packs in those reused categories do not silently join the curated
+  policy.
+- Enforce equivalent outcomes for native `cmd.exe` and PowerShell submissions.
+  Cmd analysis now handles caret escaping, case-insensitive command resolution,
+  leading and attached redirections, nested command groups, `if`/`start`/`for`
+  control flow, nested `cmd /c` and `call`, and shell-specific safe argument
+  data without letting message text suppress a real egress rule. Dynamic
+  control expansion and pathologically deep grouping fail closed under the
+  preset, while ordinary echo, search, Git-message, and `hfdt` workflows remain
+  available.
+- Treat a direct `hfdt`/`hfdt.exe` invocation as a trusted first-party command
+  while the preset is active. The exemption is executable-position aware and
+  refuses lookalikes, dynamic command targets, substitutions, redirections,
+  pipelines, and chained commands.
+
+- **Close the PowerShell .NET recursive-delete false negative (#222).**
+  `windows.filesystem` previously only understood cmdlet spellings, so
+  `[System.IO.Directory]::Delete($path, $true)` — the .NET equivalent of
+  `Remove-Item -Recurse -Force`, callable from plain PowerShell with no
+  external tool — was allowed. New rules deny the static-method form
+  (`dotnet-directory-delete-recursive` Critical for a literally-true second
+  argument, `dotnet-directory-delete` High for dynamic-flag and
+  single-argument calls, both namespace spellings `[System.IO.Directory]` and
+  `[IO.Directory]`) and the instance-method spelling
+  `<DirectoryInfo>.Delete($true)` (`directoryinfo-delete-recursive` Critical,
+  covering `(Get-Item $path).Delete($true)` and `[System.IO.DirectoryInfo]`
+  variables). Detection runs in the caller-dialect semantic pass (so proven
+  PowerShell callers are covered) and as raw patterns for unknown callers;
+  wholly quoted spellings remain inert data for proven-PowerShell callers.
+  Read-only APIs (`::Exists`, `::GetFiles`, `::CreateDirectory`) and member
+  deletes without a literal `$true` do not match.
+
+- **Guard the Snowflake CLI's direct object-lifecycle surface (#212
+  follow-up).** The `database.snowflake` pack's semantic layer covers SQL
+  submitted through `snow sql`; the CLI can also drop live objects with no SQL
+  payload at all. New pattern-based rules deny `snow object drop`
+  (database/schema Critical, other types High), `snow stage drop` and
+  `snow stage remove`, `snow app teardown`, `snow app version drop`,
+  `snow snowpark drop`, `snow dbt drop`, `snow dcm drop`, and `snow spcs
+  service|compute-pool|image-repository drop`, including `--force`/`--cascade`
+  variants and interspersed global options. Read-only `snow object
+  list/describe`, `snow stage list/list-files/describe`, and `snow stage copy`
+  remain unmatched.
+
 ## [v0.6.9](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.9) -- 2026-07-18 [Release]
 
 Security and correctness release that supersedes the unpublished v0.6.8 source

@@ -1132,23 +1132,19 @@ fn claude_deny_git_checkout_file_restore() {
 }
 
 #[test]
-fn claude_deny_or_warn_git_stash_drop() {
+fn claude_default_warn_git_stash_drop_is_nonblocking() {
     let outcome = run_claude_hook("git stash drop");
     assert_eq!(
         outcome.exit_code, 0,
         "git stash drop must exit 0 via Claude\n{outcome}"
     );
     assert!(
-        !outcome.stdout.is_empty(),
-        "git stash drop must produce stdout JSON via Claude\n{outcome}"
+        outcome.stdout.is_empty(),
+        "default warn must allow without requesting Claude review\n{outcome}"
     );
-    let json = outcome.stdout_json();
-    let decision = json["hookSpecificOutput"]["permissionDecision"]
-        .as_str()
-        .unwrap_or("");
     assert!(
-        decision == "deny" || decision == "ask",
-        "git stash drop must be denied or warned (ask), got '{decision}'\n{outcome}"
+        outcome.stderr_contains("dcg WARNING"),
+        "default warn must remain human-visible\n{outcome}"
     );
 }
 
@@ -1192,17 +1188,17 @@ fn claude_allow_git_clean_dry_run_not_blocked() {
 }
 
 // ---------------------------------------------------------------------------
-// P2.9.3 — Claude warn path: exit=0, stdout JSON with permissionDecision="ask"
+// P2.9.3 — Explicit review policy: native ask on capable hook clients
 // ---------------------------------------------------------------------------
 
 #[test]
-fn claude_warn_path_exits_zero_with_ask_json() {
+fn claude_ask_path_exits_zero_with_native_review_json() {
     let home = tempfile::tempdir().expect("tempdir");
     let config_dir = home.path().join(".config/dcg");
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::write(
         config_dir.join("config.toml"),
-        b"[policy.rules]\n\"core.git:reset-hard\" = \"warn\"\n",
+        b"[policy]\ndefault_mode = \"ask\"\n",
     )
     .unwrap();
 
@@ -1237,39 +1233,39 @@ fn claude_warn_path_exits_zero_with_ask_json() {
         home_dir: home.path().to_path_buf(),
     };
 
-    assert_eq!(outcome.exit_code, 0, "Claude warn must exit 0\n{outcome}");
+    assert_eq!(outcome.exit_code, 0, "Claude ask must exit 0\n{outcome}");
     assert!(
         !outcome.stdout.is_empty(),
-        "Claude warn must produce stdout JSON (unlike Codex warn which has empty stdout)\n{outcome}"
+        "Claude ask must produce stdout JSON\n{outcome}"
     );
 
     let json = outcome.stdout_json();
     let hso = &json["hookSpecificOutput"];
     assert_eq!(
         hso["permissionDecision"], "ask",
-        "Claude warn must have permissionDecision='ask'\n{outcome}"
+        "Claude ask must have permissionDecision='ask'\n{outcome}"
     );
     assert!(
         hso["permissionDecisionReason"]
             .as_str()
             .unwrap_or("")
-            .contains("warn"),
-        "Claude warn reason must mention 'warn'\n{outcome}"
+            .contains("APPROVAL REQUIRED"),
+        "Claude ask reason must explain that approval is required\n{outcome}"
     );
 
-    // stderr should have a human-visible warning
+    // stderr should have a human-visible blocked/pending-review warning
     assert!(
         !outcome.stderr.is_empty(),
-        "Claude warn stderr must be non-empty\n{outcome}"
+        "Claude ask stderr must be non-empty\n{outcome}"
     );
     assert!(
-        outcome.stderr_contains("WARNING") || outcome.stderr_contains("warn"),
-        "stderr must contain warning text\n{outcome}"
+        outcome.stderr_contains("BLOCKED"),
+        "stderr must contain the blocked-command review context\n{outcome}"
     );
 }
 
 #[test]
-fn copilot_warn_path_exits_zero_with_minimal_ask_json() {
+fn copilot_ask_path_exits_zero_with_minimal_review_json() {
     let payload = serde_json::json!({
         "event": "pre-tool-use",
         "toolName": "bash",
@@ -1281,22 +1277,22 @@ fn copilot_warn_path_exits_zero_with_minimal_ask_json() {
 
     let outcome = run_hook_raw_with_config(
         payload.as_bytes(),
-        r#"[policy.rules]
-"core.git:reset-hard" = "warn"
+        r#"[policy]
+default_mode = "ask"
 "#,
         &[],
     );
 
-    assert_eq!(outcome.exit_code, 0, "Copilot warn must exit 0\n{outcome}");
+    assert_eq!(outcome.exit_code, 0, "Copilot ask must exit 0\n{outcome}");
     assert!(
         !outcome.stdout.is_empty(),
-        "Copilot warn must produce stdout JSON\n{outcome}"
+        "Copilot ask must produce stdout JSON\n{outcome}"
     );
 
     let json = outcome.stdout_json();
     assert_eq!(
         json["permissionDecision"], "ask",
-        "Copilot warn must have permissionDecision='ask'\n{outcome}"
+        "Copilot ask must have permissionDecision='ask'\n{outcome}"
     );
     assert_eq!(json.as_object().map(serde_json::Map::len), Some(2));
     assert!(
@@ -1307,9 +1303,42 @@ fn copilot_warn_path_exits_zero_with_minimal_ask_json() {
         json["permissionDecisionReason"]
             .as_str()
             .unwrap_or("")
-            .contains("warn"),
-        "Copilot warn reason must mention 'warn'\n{outcome}"
+            .contains("APPROVAL REQUIRED"),
+        "Copilot ask reason must explain that approval is required\n{outcome}"
     );
+}
+
+#[test]
+fn warn_policy_remains_non_blocking_on_review_capable_clients() {
+    let claude = run_hook_raw_with_config(
+        build_claude_payload("git reset --hard HEAD~1").as_bytes(),
+        "[policy.rules]\n\"core.git:reset-hard\" = \"warn\"\n",
+        &[],
+    );
+    assert_eq!(claude.exit_code, 0, "Claude warn must exit 0\n{claude}");
+    assert!(
+        claude.stdout.is_empty(),
+        "Claude warn must not be confused with ask\n{claude}"
+    );
+    assert!(!claude.stderr.is_empty(), "Claude warn must be visible");
+
+    let copilot_payload = serde_json::json!({
+        "event": "pre-tool-use",
+        "toolName": "bash",
+        "toolArgs": {"command": "git reset --hard HEAD~1"},
+    })
+    .to_string();
+    let copilot = run_hook_raw_with_config(
+        copilot_payload.as_bytes(),
+        "[policy.rules]\n\"core.git:reset-hard\" = \"warn\"\n",
+        &[],
+    );
+    assert_eq!(copilot.exit_code, 0, "Copilot warn must exit 0\n{copilot}");
+    assert!(
+        copilot.stdout.is_empty(),
+        "Copilot warn must not be confused with ask\n{copilot}"
+    );
+    assert!(!copilot.stderr.is_empty(), "Copilot warn must be visible");
 }
 
 // ---------------------------------------------------------------------------
@@ -2495,7 +2524,7 @@ fn codex_deny_writes_history_entry_on_normal_exit() {
     );
 
     // Normal return runs Drop-based history flushing, so the DB exists with data.
-    // fsqlite/sqlite page size is 4096; a newly-created DB with schema + one row
+    // SQLite's page size is 4096; a newly-created DB with schema + one row
     // may be exactly 4096 bytes (one page).
     assert!(
         db_path.exists(),

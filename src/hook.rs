@@ -610,19 +610,22 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
         return codex_protocol(input);
     }
 
-    // PowerShell tool names ("powershell"/"pwsh") are only ever emitted by
-    // Codex-style payloads -- Claude Code's shell tool is always "Bash" (or
-    // "launch-process"), never a PowerShell name, so this cannot collide with
-    // Claude Code. On Windows, Codex drives commands through PowerShell but
-    // does not always populate `turn_id` (issue #125), so the turn_id-gated
-    // check above misses it and the destructive command would otherwise slip
-    // through as a ClaudeCompatible result whose extension fields Codex's
-    // strict parser drops. Classify a PowerShell tool name as Codex
-    // unconditionally so the minimal Codex JSON path is used.
+    // Explicit Windows-shell tool names ("powershell"/"pwsh"/"cmd"/"cmd.exe")
+    // are only ever emitted by Codex-style payloads -- Claude Code's shell
+    // tool is always "Bash" (or "launch-process"), so this cannot collide with
+    // Claude Code. On Windows, Codex does not always populate `turn_id`
+    // (issue #125), so the turn_id-gated check above misses these tools and the
+    // destructive command would otherwise slip through as a ClaudeCompatible
+    // result whose extension fields Codex's strict parser drops. Classify an
+    // explicit Windows shell as Codex unconditionally so the minimal Codex
+    // JSON path is used.
     // (`bash`/`launch-process` stay turn_id-gated because Claude Code
     // legitimately uses those names.)
-    let is_powershell_tool = matches!(tool_name.as_str(), "powershell" | "pwsh");
-    if is_powershell_tool {
+    let is_explicit_windows_shell = matches!(
+        tool_name.as_str(),
+        "powershell" | "pwsh" | "cmd" | "cmd.exe"
+    );
+    if is_explicit_windows_shell {
         return codex_protocol(input);
     }
 
@@ -964,6 +967,46 @@ pub fn format_denial_message(
     pack: Option<&str>,
     pattern: Option<&str>,
 ) -> String {
+    format_matched_message(
+        "BLOCKED by dcg",
+        command,
+        reason,
+        explanation,
+        pack,
+        pattern,
+        "If this operation is truly needed, ask the user for explicit permission and have them run the command manually.",
+    )
+}
+
+/// Format a native-review request for a matched destructive command.
+#[must_use]
+pub fn format_review_message(
+    command: &str,
+    reason: &str,
+    explanation: Option<&str>,
+    pack: Option<&str>,
+    pattern: Option<&str>,
+) -> String {
+    format_matched_message(
+        "APPROVAL REQUIRED by dcg",
+        command,
+        reason,
+        explanation,
+        pack,
+        pattern,
+        "Approve this command only after reviewing the operation and its target. Denying it keeps the command blocked.",
+    )
+}
+
+fn format_matched_message(
+    heading: &str,
+    command: &str,
+    reason: &str,
+    explanation: Option<&str>,
+    pack: Option<&str>,
+    pattern: Option<&str>,
+    instruction: &str,
+) -> String {
     let explain_hint = format_explain_hint(command);
     let rule_id = build_rule_id(pack, pattern);
     let explanation_text = format_explanation_text(explanation, rule_id.as_deref(), pack);
@@ -978,14 +1021,13 @@ pub fn format_denial_message(
     );
 
     format!(
-        "BLOCKED by dcg\n\n\
+        "{heading}\n\n\
          {explain_hint}\n\n\
          Reason: {reason}\n\n\
          {explanation_block}\n\n\
          {rule_line}\
          Command: {command}\n\n\
-         If this operation is truly needed, ask the user for explicit \
-         permission and have them run the command manually."
+         {instruction}"
     )
 }
 
@@ -1422,6 +1464,114 @@ pub fn write_denial_to(
     }
 }
 
+/// Write an operator-review request for a matched destructive command.
+///
+/// Claude-compatible and Copilot hooks receive their native `ask` decision.
+/// Every other supported protocol receives its ordinary deny/block response;
+/// an opt-in review policy must never become an allow merely because a client
+/// cannot represent review.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub fn write_review_request_to(
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+    protocol: HookProtocol,
+    command: &str,
+    reason: &str,
+    pack: Option<&str>,
+    pattern: Option<&str>,
+    explanation: Option<&str>,
+    allow_once: Option<&AllowOnceInfo>,
+    matched_span: Option<&MatchSpan>,
+    severity: Option<crate::packs::Severity>,
+    confidence: Option<f64>,
+    pattern_suggestions: &[PatternSuggestion],
+    branch_context: Option<&crate::evaluator::BranchContext>,
+) {
+    if !matches!(
+        protocol,
+        HookProtocol::ClaudeCompatible | HookProtocol::Copilot
+    ) {
+        write_denial_to(
+            stdout,
+            stderr,
+            protocol,
+            command,
+            reason,
+            pack,
+            pattern,
+            explanation,
+            allow_once,
+            matched_span,
+            severity,
+            confidence,
+            pattern_suggestions,
+            branch_context,
+        );
+        return;
+    }
+
+    print_colorful_warning_to(
+        stderr,
+        command,
+        reason,
+        pack,
+        pattern,
+        explanation,
+        allow_once.map(|info| info.code.as_str()),
+        matched_span,
+        pattern_suggestions,
+        severity,
+        branch_context,
+        WarningAudience::HumanOperator,
+    );
+
+    let message = format_review_message(command, reason, explanation, pack, pattern);
+    match protocol {
+        HookProtocol::ClaudeCompatible => {
+            let rule_id = build_rule_id(pack, pattern);
+            let remediation = allow_once.map(|info| Remediation {
+                safe_alternative: get_contextual_suggestion(command).map(String::from),
+                explanation: format_explanation_text(explanation, rule_id.as_deref(), pack),
+                allow_once_command: format!("dcg allow-once {}", info.code),
+            });
+            let output = HookOutput {
+                hook_specific_output: HookSpecificOutput {
+                    hook_event_name: "PreToolUse",
+                    permission_decision: "ask",
+                    permission_decision_reason: Cow::Owned(message),
+                    allow_once_code: allow_once.map(|info| info.code.clone()),
+                    allow_once_full_hash: allow_once.map(|info| info.full_hash.clone()),
+                    rule_id,
+                    pack_id: pack.map(String::from),
+                    severity,
+                    confidence,
+                    remediation,
+                },
+            };
+            let _ = serde_json::to_writer(&mut *stdout, &output);
+            let _ = writeln!(stdout);
+        }
+        HookProtocol::Copilot => {
+            let output = CopilotHookOutput {
+                permission_decision: "ask",
+                permission_decision_reason: Cow::Owned(message),
+            };
+            let _ = serde_json::to_writer(&mut *stdout, &output);
+            let _ = writeln!(stdout);
+        }
+        HookProtocol::Gemini
+        | HookProtocol::Codex
+        | HookProtocol::CodexAsk
+        | HookProtocol::Hermes
+        | HookProtocol::Grok
+        | HookProtocol::Antigravity => {
+            unreachable!("non-review protocols returned through write_denial_to")
+        }
+    }
+}
+
 /// Output a denial response to stdout (JSON for hook protocol).
 #[cold]
 #[inline(never)]
@@ -1445,6 +1595,46 @@ pub fn output_denial_for_protocol(
     let err = io::stderr();
     let mut err_handle = err.lock();
     write_denial_to(
+        &mut out_handle,
+        &mut err_handle,
+        protocol,
+        command,
+        reason,
+        pack,
+        pattern,
+        explanation,
+        allow_once,
+        matched_span,
+        severity,
+        confidence,
+        pattern_suggestions,
+        branch_context,
+    );
+}
+
+/// Output an operator-review request using the active hook protocol.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub fn output_review_request_for_protocol(
+    protocol: HookProtocol,
+    command: &str,
+    reason: &str,
+    pack: Option<&str>,
+    pattern: Option<&str>,
+    explanation: Option<&str>,
+    allow_once: Option<&AllowOnceInfo>,
+    matched_span: Option<&MatchSpan>,
+    severity: Option<crate::packs::Severity>,
+    confidence: Option<f64>,
+    pattern_suggestions: &[PatternSuggestion],
+    branch_context: Option<&crate::evaluator::BranchContext>,
+) {
+    let out = io::stdout();
+    let mut out_handle = out.lock();
+    let err = io::stderr();
+    let mut err_handle = err.lock();
+    write_review_request_to(
         &mut out_handle,
         &mut err_handle,
         protocol,
@@ -1683,40 +1873,18 @@ pub(crate) fn write_warning_to(
         let _ = writeln!(stderr, "  {} {}", "Command:".bright_black(), command);
     }
 
-    // -- stdout: hook-protocol JSON with "ask" decision --
+    // -- stdout: protocol-specific non-blocking response --
     let rule_id = build_rule_id(pack, pattern);
     let warn_reason = format!("DCG warn: {reason}");
 
     match protocol {
-        HookProtocol::ClaudeCompatible => {
-            let output = HookOutput {
-                hook_specific_output: HookSpecificOutput {
-                    hook_event_name: "PreToolUse",
-                    permission_decision: "ask",
-                    permission_decision_reason: Cow::Owned(warn_reason),
-                    allow_once_code: None,
-                    allow_once_full_hash: None,
-                    rule_id,
-                    pack_id: pack.map(String::from),
-                    severity: None,
-                    confidence: None,
-                    remediation: None,
-                },
-            };
-
-            let _ = serde_json::to_writer(&mut *stdout, &output);
-            let _ = writeln!(stdout);
-        }
-        HookProtocol::Copilot => {
-            // `ask` is part of Copilot's documented preToolUse contract.
-            let output = CopilotHookOutput {
-                permission_decision: "ask",
-                permission_decision_reason: Cow::Owned(warn_reason),
-            };
-
-            let _ = serde_json::to_writer(&mut *stdout, &output);
-            let _ = writeln!(stdout);
-        }
+        // Silence means "no blocking opinion" for review-capable clients.
+        // Keeping warn distinct from ask preserves the documented policy:
+        // warn proceeds, while ask requires an explicit operator decision.
+        HookProtocol::ClaudeCompatible
+        | HookProtocol::Copilot
+        | HookProtocol::Codex
+        | HookProtocol::CodexAsk => {}
         HookProtocol::Gemini => {
             // Gemini hooks support allow/deny only. Preserve dcg warn as
             // non-blocking while still surfacing the warning text to Gemini.
@@ -1735,9 +1903,6 @@ pub(crate) fn write_warning_to(
 
             let _ = serde_json::to_writer(&mut *stdout, &output);
             let _ = writeln!(stdout);
-        }
-        HookProtocol::Codex | HookProtocol::CodexAsk => {
-            // Codex: stderr warning already written above; no stdout JSON.
         }
         HookProtocol::Hermes => {
             // Hermes hooks support a "block" decision but no documented
@@ -2149,15 +2314,24 @@ mod tests {
     }
 
     #[test]
-    fn test_powershell_tool_without_turn_id_is_codex() {
+    fn test_explicit_windows_shell_without_turn_id_is_codex() {
         // issue #125: on Windows, Codex drives shell commands through
-        // PowerShell but does not always send `turn_id`. Without the
-        // PowerShell-name fallback this payload would be classified as
+        // PowerShell or cmd.exe but does not always send `turn_id`. Without
+        // the explicit-Windows-shell fallback this payload would be classified as
         // ClaudeCompatible (exit 0 + JSON that Codex's strict parser drops),
-        // letting the destructive command through. A PowerShell tool name is
-        // Codex-only (Claude Code always uses "Bash"/"launch-process"), so it
-        // must classify as Codex even with no turn_id.
-        for tool in ["powershell", "pwsh", "PowerShell", "PWSH"] {
+        // letting the destructive command through. These tool names are
+        // Codex-only (Claude Code always uses "Bash"/"launch-process"), so
+        // they must classify as Codex even with no turn_id.
+        for tool in [
+            "powershell",
+            "pwsh",
+            "PowerShell",
+            "PWSH",
+            "cmd",
+            "CMD",
+            "cmd.exe",
+            "CMD.EXE",
+        ] {
             let json = format!(
                 r#"{{"tool_name":"{tool}","tool_input":{{"command":"git reset --hard HEAD~1"}}}}"#
             );
@@ -2165,7 +2339,7 @@ mod tests {
             assert_eq!(
                 detect_protocol(&input),
                 HookProtocol::Codex,
-                "PowerShell tool_name {tool:?} must be treated as Codex (issue #125)"
+                "explicit Windows shell tool_name {tool:?} must be treated as Codex"
             );
             assert_eq!(
                 extract_command(&input),
@@ -2411,12 +2585,12 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_compatible_warn_ask_json_shape() {
+    fn test_claude_compatible_review_ask_json_shape() {
         let output = HookOutput {
             hook_specific_output: HookSpecificOutput {
                 hook_event_name: "PreToolUse",
                 permission_decision: "ask",
-                permission_decision_reason: Cow::Borrowed("DCG warn: risky pattern"),
+                permission_decision_reason: Cow::Borrowed("APPROVAL REQUIRED by dcg"),
                 allow_once_code: None,
                 allow_once_full_hash: None,
                 rule_id: Some("core.git:checkout-dot".to_string()),
@@ -2434,17 +2608,17 @@ mod tests {
             specific["permissionDecisionReason"]
                 .as_str()
                 .unwrap()
-                .starts_with("DCG warn:")
+                .starts_with("APPROVAL REQUIRED")
         );
         assert_eq!(specific["ruleId"], "core.git:checkout-dot");
         assert_eq!(specific["packId"], "core.git");
     }
 
     #[test]
-    fn test_copilot_warn_ask_json_shape() {
+    fn test_copilot_review_ask_json_shape() {
         let output = CopilotHookOutput {
             permission_decision: "ask",
-            permission_decision_reason: Cow::Borrowed("DCG warn: risky pattern"),
+            permission_decision_reason: Cow::Borrowed("APPROVAL REQUIRED by dcg"),
         };
         let json = serde_json::to_value(&output).unwrap();
         assert_eq!(json["permissionDecision"], "ask");
@@ -3473,7 +3647,82 @@ mod tests {
     }
 
     #[test]
-    fn test_write_warning_claude_produces_ask_json() {
+    fn test_write_review_request_asks_only_when_protocol_supports_review() {
+        let cases = [
+            (HookProtocol::ClaudeCompatible, "ask"),
+            (HookProtocol::Copilot, "ask"),
+            (HookProtocol::Codex, "deny"),
+            (HookProtocol::Gemini, "deny"),
+            (HookProtocol::Hermes, "block"),
+            (HookProtocol::Grok, "deny"),
+            (HookProtocol::Antigravity, "block"),
+        ];
+        let allow = test_allow_once();
+
+        for (protocol, expected_decision) in cases {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            write_review_request_to(
+                &mut stdout,
+                &mut stderr,
+                protocol,
+                "git reset --hard HEAD~1",
+                "destroys uncommitted changes",
+                Some("core.git"),
+                Some("reset-hard"),
+                Some("Rewrites the working tree and index."),
+                Some(&allow),
+                None,
+                Some(crate::packs::Severity::Critical),
+                Some(0.99),
+                &[],
+                None,
+            );
+
+            assert!(!stdout.is_empty(), "{protocol:?} must emit a decision");
+            assert!(!stderr.is_empty(), "{protocol:?} must emit a diagnostic");
+
+            let json: serde_json::Value = serde_json::from_slice(&stdout)
+                .unwrap_or_else(|error| panic!("{protocol:?} output must be JSON: {error}"));
+            let (decision, reason) = match protocol {
+                HookProtocol::ClaudeCompatible | HookProtocol::Codex | HookProtocol::CodexAsk => {
+                    let specific = &json["hookSpecificOutput"];
+                    (
+                        specific["permissionDecision"].as_str(),
+                        specific["permissionDecisionReason"].as_str(),
+                    )
+                }
+                HookProtocol::Copilot => (
+                    json["permissionDecision"].as_str(),
+                    json["permissionDecisionReason"].as_str(),
+                ),
+                HookProtocol::Gemini
+                | HookProtocol::Hermes
+                | HookProtocol::Grok
+                | HookProtocol::Antigravity => (json["decision"].as_str(), json["reason"].as_str()),
+            };
+
+            assert_eq!(decision, Some(expected_decision), "payload: {json}");
+            assert_ne!(decision, Some("allow"), "payload: {json}");
+            if matches!(
+                protocol,
+                HookProtocol::ClaudeCompatible | HookProtocol::Copilot
+            ) {
+                assert!(
+                    reason.is_some_and(|text| text.starts_with("APPROVAL REQUIRED by dcg")),
+                    "review-capable payload: {json}"
+                );
+            } else {
+                assert!(
+                    reason.is_some_and(|text| text.starts_with("BLOCKED by dcg")),
+                    "fail-closed payload: {json}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_write_warning_claude_is_non_blocking() {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
@@ -3488,18 +3737,7 @@ mod tests {
             Some("Check git diff first."),
         );
 
-        let stdout_str = String::from_utf8_lossy(&stdout);
-        let json: serde_json::Value = serde_json::from_str(stdout_str.trim())
-            .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\nstdout: {stdout_str}"));
-
-        let specific = &json["hookSpecificOutput"];
-        assert_eq!(specific["permissionDecision"], "ask");
-        assert!(
-            specific["permissionDecisionReason"]
-                .as_str()
-                .unwrap()
-                .starts_with("DCG warn:")
-        );
+        assert!(stdout.is_empty(), "warn must not request operator review");
         assert!(!stderr.is_empty(), "stderr must contain warning text");
     }
 
@@ -3541,7 +3779,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_warning_copilot_produces_ask_json() {
+    fn test_write_warning_copilot_is_non_blocking() {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
@@ -3556,13 +3794,8 @@ mod tests {
             None,
         );
 
-        let stdout_str = String::from_utf8_lossy(&stdout);
-        let json: serde_json::Value = serde_json::from_str(stdout_str.trim())
-            .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\nstdout: {stdout_str}"));
-
-        assert_eq!(json["permissionDecision"], "ask");
-        assert!(json.get("continue").is_none());
-        assert!(json.get("stopReason").is_none());
+        assert!(stdout.is_empty(), "warn must not request operator review");
+        assert!(!stderr.is_empty(), "stderr must contain warning text");
     }
 
     #[test]

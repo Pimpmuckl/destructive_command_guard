@@ -127,6 +127,7 @@ fn generate_category_doc(category: &str, packs: &[&Pack]) -> String {
         "safe" => "Safe Packs",
         "strict_git" => "Strict Git Packs",
         "package_managers" => "Package Manager Packs",
+        "careful_company_running_windows" => "Careful Company (Windows) Preset",
         _ => category,
     };
 

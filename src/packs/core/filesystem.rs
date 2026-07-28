@@ -961,6 +961,15 @@ pub(crate) fn parse_rm_command_segment_in_dialect(
     pipeline_stdin: bool,
     dialect: ShellDialect,
 ) -> RmParseDecision {
+    // A PowerShell assignment is an expression statement, not an executable
+    // invocation. Treating its variable name as a dynamic command creates
+    // false `rm-recursive-unverified` denials whenever the assigned value
+    // happens to contain splatting-like data (for example a here-string
+    // beginning with `@'`). Any executable `$()` content on the right-hand side
+    // is evaluated separately by the outer evaluator before this segment scan.
+    if dialect == ShellDialect::PowerShell && powershell_variable_assignment(command) {
+        return RmParseDecision::NoMatch;
+    }
     if dialect == ShellDialect::PowerShell {
         let powershell = parse_powershell_remove_item_segment(command, pipeline_stdin);
         if !matches!(powershell, RmParseDecision::NoMatch) {
@@ -980,6 +989,33 @@ pub(crate) fn parse_rm_command_segment_in_dialect(
     }
 
     parse_unverified_rm_command_segment(command, pipeline_stdin, dialect)
+}
+
+fn powershell_variable_assignment(command: &str) -> bool {
+    let Some(mut tail) = command.trim_start().strip_prefix('$') else {
+        return false;
+    };
+
+    if let Some(braced) = tail.strip_prefix('{') {
+        let Some(close) = braced.find('}') else {
+            return false;
+        };
+        tail = &braced[close + 1..];
+    } else {
+        let variable_len = tail
+            .bytes()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':'))
+            .count();
+        if variable_len == 0 {
+            return false;
+        }
+        tail = &tail[variable_len..];
+    }
+
+    let tail = tail.trim_start();
+    ["=", "+=", "-=", "*=", "/=", "%="]
+        .iter()
+        .any(|operator| tail.starts_with(operator))
 }
 
 /// Tell the evaluator's keyword-index layer when caller-proven shell syntax
@@ -1879,199 +1915,7 @@ fn rm_frontend_basename(word: &str) -> &str {
 }
 
 fn strip_rm_execution_frontend(command: &str) -> Option<&str> {
-    let tokens = tokenize_for_normalization(command);
-    let executable = rm_frontend_word(command, &tokens, 0)?;
-    let basename = rm_frontend_basename(executable);
-    let command_index = match basename {
-        "nice" => nice_command_index(command, &tokens)?,
-        "ionice" => ionice_command_index(command, &tokens)?,
-        "setsid" => setsid_command_index(command, &tokens)?,
-        "timeout" => timeout_command_index(command, &tokens)?,
-        "busybox" => busybox_command_index(command, &tokens)?,
-        _ => return None,
-    };
-    rm_frontend_suffix(command, &tokens, command_index)
-}
-
-fn terminal_frontend_option(word: &str) -> bool {
-    matches!(word, "-h" | "--help" | "-V" | "--version")
-}
-
-fn nice_command_index(command: &str, tokens: &[crate::normalize::NormalizeToken]) -> Option<usize> {
-    let mut index = 1usize;
-    while let Some(word) = rm_frontend_word(command, tokens, index) {
-        if word == "--" {
-            return (index + 1 < tokens.len()).then_some(index + 1);
-        }
-        if terminal_frontend_option(word) {
-            return None;
-        }
-        if matches!(word, "-n" | "--adjustment") {
-            index = index.checked_add(2)?;
-            continue;
-        }
-        if word
-            .strip_prefix("--adjustment=")
-            .is_some_and(|value| !value.is_empty())
-            || word
-                .strip_prefix("-n")
-                .is_some_and(|value| !value.is_empty())
-            || word
-                .strip_prefix('-')
-                .is_some_and(|value| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
-        {
-            index += 1;
-            continue;
-        }
-        return (!word.starts_with('-')).then_some(index);
-    }
-    None
-}
-
-fn ionice_command_index(
-    command: &str,
-    tokens: &[crate::normalize::NormalizeToken],
-) -> Option<usize> {
-    let mut index = 1usize;
-    while let Some(word) = rm_frontend_word(command, tokens, index) {
-        if word == "--" {
-            return (index + 1 < tokens.len()).then_some(index + 1);
-        }
-        if terminal_frontend_option(word)
-            || matches!(word, "-p" | "--pid" | "-P" | "--pgid" | "-u" | "--uid")
-            || word.starts_with("--pid=")
-            || word.starts_with("--pgid=")
-            || word.starts_with("--uid=")
-        {
-            return None;
-        }
-        if matches!(word, "-t" | "--ignore") {
-            index += 1;
-            continue;
-        }
-        if matches!(word, "-c" | "--class" | "-n" | "--classdata") {
-            index = index.checked_add(2)?;
-            continue;
-        }
-        if word
-            .strip_prefix("--class=")
-            .or_else(|| word.strip_prefix("--classdata="))
-            .is_some_and(|value| !value.is_empty())
-        {
-            index += 1;
-            continue;
-        }
-        if let Some(short) = word.strip_prefix('-').filter(|short| !short.is_empty()) {
-            let bytes = short.as_bytes();
-            let mut position = 0usize;
-            let mut consume_next = false;
-            while position < bytes.len() {
-                match bytes[position] {
-                    b't' => position += 1,
-                    b'c' | b'n' => {
-                        consume_next = position + 1 == bytes.len();
-                        position = bytes.len();
-                    }
-                    b'p' | b'P' | b'u' | b'h' | b'V' => return None,
-                    _ => return None,
-                }
-            }
-            index = index.checked_add(1 + usize::from(consume_next))?;
-            continue;
-        }
-        return Some(index);
-    }
-    None
-}
-
-fn setsid_command_index(
-    command: &str,
-    tokens: &[crate::normalize::NormalizeToken],
-) -> Option<usize> {
-    let mut index = 1usize;
-    while let Some(word) = rm_frontend_word(command, tokens, index) {
-        if word == "--" {
-            return (index + 1 < tokens.len()).then_some(index + 1);
-        }
-        if terminal_frontend_option(word) {
-            return None;
-        }
-        if matches!(word, "--ctty" | "--fork" | "--wait")
-            || word.strip_prefix('-').is_some_and(|flags| {
-                !flags.is_empty() && flags.bytes().all(|b| matches!(b, b'c' | b'f' | b'w'))
-            })
-        {
-            index += 1;
-            continue;
-        }
-        return (!word.starts_with('-')).then_some(index);
-    }
-    None
-}
-
-fn timeout_command_index(
-    command: &str,
-    tokens: &[crate::normalize::NormalizeToken],
-) -> Option<usize> {
-    let mut index = 1usize;
-    while let Some(word) = rm_frontend_word(command, tokens, index) {
-        if word == "--" {
-            index += 1;
-            break;
-        }
-        if terminal_frontend_option(word) {
-            return None;
-        }
-        if matches!(
-            word,
-            "-f" | "--foreground" | "-p" | "--preserve-status" | "-v" | "--verbose"
-        ) {
-            index += 1;
-            continue;
-        }
-        if matches!(word, "-k" | "--kill-after" | "-s" | "--signal") {
-            index = index.checked_add(2)?;
-            continue;
-        }
-        if word
-            .strip_prefix("--kill-after=")
-            .or_else(|| word.strip_prefix("--signal="))
-            .is_some_and(|value| !value.is_empty())
-            || word
-                .strip_prefix("-k")
-                .or_else(|| word.strip_prefix("-s"))
-                .is_some_and(|value| !value.is_empty())
-        {
-            index += 1;
-            continue;
-        }
-        if let Some(flags) = word.strip_prefix('-').filter(|flags| !flags.is_empty()) {
-            if flags.bytes().all(|flag| matches!(flag, b'f' | b'p' | b'v')) {
-                index += 1;
-                continue;
-            }
-            return None;
-        }
-        break;
-    }
-
-    // The first positional is DURATION; the following word is COMMAND.
-    let _duration = rm_frontend_word(command, tokens, index)?;
-    let command_index = index.checked_add(1)?;
-    rm_frontend_word(command, tokens, command_index)?;
-    Some(command_index)
-}
-
-fn busybox_command_index(
-    command: &str,
-    tokens: &[crate::normalize::NormalizeToken],
-) -> Option<usize> {
-    let applet = rm_frontend_word(command, tokens, 1)?;
-    matches!(
-        applet,
-        "rm" | "nice" | "ionice" | "setsid" | "timeout" | "xargs" | "find"
-    )
-    .then_some(1)
+    crate::normalize::strip_posix_execution_frontend(command).map(|(remaining, _)| remaining)
 }
 
 fn parse_rm_argv_frontend(command: &str) -> RmParseDecision {
@@ -6010,6 +5854,9 @@ mod tests {
             (r"echo %DELETE_CMD% -r ./tree", ShellDialect::Cmd),
             (r"& '$cmd' -r ./tree", ShellDialect::PowerShell),
             (r"& @('echo', 'printf')[1] ./tree", ShellDialect::PowerShell),
+            (r"$cmd = 'rm'", ShellDialect::PowerShell),
+            ("$text = @'\n@params\n'@", ShellDialect::PowerShell),
+            (r"${global:cmd} += 'rm'", ShellDialect::PowerShell),
         ] {
             assert!(
                 matches!(
