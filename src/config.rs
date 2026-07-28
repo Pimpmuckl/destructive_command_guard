@@ -4794,6 +4794,56 @@ impl Config {
         self.packs.enabled_pack_ids()
     }
 
+    /// Effective end-to-end hook evaluation budget in milliseconds.
+    ///
+    /// An explicit config or environment value always wins. The broad
+    /// `careful_company_running_windows` preset gets a larger default because
+    /// its cold-start pack set can exceed the ordinary 200ms budget on older
+    /// Windows workstations.
+    #[must_use]
+    pub fn effective_hook_timeout_ms(&self) -> u64 {
+        self.general.hook_timeout_ms.map_or_else(
+            || {
+                if self.careful_company_preset_is_requested() {
+                    crate::perf::CAREFUL_COMPANY_HOOK_EVALUATION_BUDGET_MS
+                } else {
+                    crate::perf::HOOK_EVALUATION_BUDGET_MS
+                }
+            },
+            |configured| configured.max(crate::perf::MIN_HOOK_TIMEOUT_MS),
+        )
+    }
+
+    /// Human-readable provenance for [`Self::effective_hook_timeout_ms`].
+    #[must_use]
+    pub fn hook_timeout_source(&self) -> &'static str {
+        if self.general.hook_timeout_ms.is_some() {
+            "configured"
+        } else if self.careful_company_preset_is_requested() {
+            "careful_company_running_windows preset"
+        } else {
+            "default"
+        }
+    }
+
+    fn careful_company_preset_is_requested(&self) -> bool {
+        let packs = if self.projects.is_empty() {
+            self.packs.clone()
+        } else if let Ok(cwd) = std::env::current_dir() {
+            self.effective_packs_for_project(&cwd)
+        } else {
+            self.packs.clone()
+        };
+        packs
+            .enabled
+            .iter()
+            .any(|pack| pack == "careful_company_running_windows")
+            && !packs
+                .disabled
+                .iter()
+                .any(|pack| pack == "careful_company_running_windows")
+    }
+
     /// Get enabled pack IDs adjusted for an agent's profile.
     ///
     /// This applies the agent's `disabled_packs` and `extra_packs` settings
@@ -7299,6 +7349,39 @@ enabled = false
         config.apply_env_overrides_from(|key| env_map.get(key).map(|v| (*v).to_string()));
 
         assert_eq!(config.general.hook_timeout_ms, Some(150));
+        assert_eq!(config.effective_hook_timeout_ms(), 150);
+        assert_eq!(config.hook_timeout_source(), "configured");
+    }
+
+    #[test]
+    fn careful_company_preset_gets_a_larger_default_hook_budget() {
+        let default = Config::default();
+        assert_eq!(
+            default.effective_hook_timeout_ms(),
+            crate::perf::HOOK_EVALUATION_BUDGET_MS
+        );
+        assert_eq!(default.hook_timeout_source(), "default");
+
+        let mut preset = Config::default();
+        preset.packs.enabled = vec!["careful_company_running_windows".to_string()];
+        assert_eq!(
+            preset.effective_hook_timeout_ms(),
+            crate::perf::CAREFUL_COMPANY_HOOK_EVALUATION_BUDGET_MS
+        );
+        assert_eq!(
+            preset.hook_timeout_source(),
+            "careful_company_running_windows preset"
+        );
+
+        preset.general.hook_timeout_ms = Some(750);
+        assert_eq!(preset.effective_hook_timeout_ms(), 750);
+        assert_eq!(preset.hook_timeout_source(), "configured");
+
+        preset.general.hook_timeout_ms = Some(0);
+        assert_eq!(
+            preset.effective_hook_timeout_ms(),
+            crate::perf::MIN_HOOK_TIMEOUT_MS
+        );
     }
 
     #[test]

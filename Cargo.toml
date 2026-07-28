@@ -1,6 +1,6 @@
 [package]
 name = "destructive_command_guard"
-version = "0.7.2-codexpp.1"
+version = "0.7.3-codexpp.1"
 edition = "2024"
 resolver = "2"
 authors = [
@@ -54,15 +54,17 @@ libc = "0.2"                # Nonblocking, no-follow opens for inspected stdin f
 clap = { version = "4.5", features = ["derive", "env"] }
 clap_complete = "4.6"
 once_cell = "1.19"
-base64 = "0.22"              # For decision log format parsing in simulate
+# Keep the scalar engine: logs and encoded-command analysis do not justify the
+# default SIMD feature, which is base64's only unsafe-code surface.
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 async-trait = "0.1.89"
-rust-mcp-sdk = { version = "0.9.0", default-features = false, features = ["server", "stdio", "macros"] }
+rust-mcp-sdk = { version = "1.0.1", default-features = false, features = ["server", "stdio", "macros"] }
 tokio = { version = "1.52", features = ["rt-multi-thread"] }
 rayon = { version = "1.11", optional = true }
 
 # AST-based pattern matching for heredoc/inline-script content
-ast-grep-core = "0.44"
-ast-grep-language = { version = "0.44", default-features = false, features = [
+ast-grep-core = "0.45"
+ast-grep-language = { version = "0.45", default-features = false, features = [
     "tree-sitter-bash",
     "tree-sitter-python",
     "tree-sitter-javascript",

@@ -12,8 +12,29 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - name: Verify release ref matches package version
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
+            echo "::error::distribution runs must target a v-prefixed tag (ref=$GITHUB_REF)"
+            exit 1
+          fi
+
+          manifest_version="$(
+            sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1
+          )"
+          if [[ -z "$manifest_version" ]]; then
+            echo "::error::unable to parse the package version from Cargo.toml"
+            exit 1
+          fi
+          if [[ "$GITHUB_REF_NAME" != "v${manifest_version}" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $manifest_version"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
+          toolchain: nightly-2026-06-06
           components: rustfmt, clippy
 
       - name: Check formatting
@@ -97,7 +118,7 @@ jobs:
         # x86_64-darwin got an arm64 binary; #174). Install the SAME pinned
         # nightly here and add the target std to it. Keep this channel in sync
         # with rust-toolchain.toml.
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: nightly-2026-06-06
           targets: ${{ matrix.target }}
@@ -303,6 +324,63 @@ jobs:
             shasum -a 256 "$script" > "$script.sha256"
             cosign sign-blob --yes --bundle "$script.sigstore.json" "$script"
           done
+
+      - name: Verify complete signed release matrix
+        # Fail closed before publishing. A release is not complete unless every
+        # declared platform archive and both installers have a valid checksum
+        # sidecar plus a non-empty Sigstore bundle. This prevents a disabled,
+        # skipped, or partially successful build matrix from yielding another
+        # platform-incomplete public release (#238).
+        run: |
+          set -euo pipefail
+          cd dist
+
+          archives=(
+            dcg-x86_64-unknown-linux-musl.tar.xz
+            dcg-aarch64-unknown-linux-gnu.tar.xz
+            dcg-x86_64-apple-darwin.tar.xz
+            dcg-aarch64-apple-darwin.tar.xz
+            dcg-x86_64-pc-windows-msvc.zip
+            dcg-aarch64-pc-windows-msvc.zip
+          )
+          installers=(install.sh install.ps1)
+
+          verify_release_file() {
+            local artifact="$1"
+            for required in \
+              "$artifact" \
+              "$artifact.sha256" \
+              "$artifact.sigstore.json"
+            do
+              if [[ ! -s "$required" ]]; then
+                echo "::error::release matrix incomplete: missing or empty $required"
+                exit 1
+              fi
+            done
+
+            sha256sum --check --strict "$artifact.sha256"
+            jq --exit-status 'type == "object"' \
+              "$artifact.sigstore.json" >/dev/null
+          }
+
+          for archive in "${archives[@]}"; do
+            verify_release_file "$archive"
+          done
+          for installer in "${installers[@]}"; do
+            verify_release_file "$installer"
+          done
+
+          archive_count="$(
+            find . -maxdepth 1 -type f \
+              \( -name 'dcg-*.tar.xz' -o -name 'dcg-*.zip' \) \
+              -printf '.' | wc -c
+          )"
+          if [[ "$archive_count" -ne "${#archives[@]}" ]]; then
+            echo "::error::expected ${#archives[@]} platform archives, found $archive_count"
+            exit 1
+          fi
+
+          echo "Verified ${#archives[@]} platform archives and ${#installers[@]} installers"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3

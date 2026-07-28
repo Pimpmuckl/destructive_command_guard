@@ -1081,7 +1081,12 @@ fn test_audit_backtracking_requirements() {
         ),
         (
             "careful_company_running_windows.email",
-            HashSet::from(["read-only-data-context"]),
+            // Outlook/CDO activation must be tied to a later `.Send()` while
+            // rejecting quoted constructor examples. The negative lookbehind
+            // and lazy bounded-input traversal therefore intentionally use
+            // fancy-regex; the engine's 100K-step ceiling and the pack's
+            // matching-budget regression bound pathological inputs.
+            HashSet::from(["read-only-data-context", "outlook-com-send"]),
         ),
         (
             "careful_company_running_windows.guardrails",

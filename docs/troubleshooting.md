@@ -60,6 +60,25 @@ slow path with `dcg explain "<command>"`; deadline exhaustion must appear as
 `INDETERMINATE`, never `ALLOW` or `quick-rejected`. Do not reduce the budget
 below the measured full-evaluation latency for the host.
 
+When the exact `careful_company_running_windows` preset ID is enabled, dcg uses
+3000 ms automatically unless config or the environment supplies a value. Check
+`dcg config --format json` for `hook_timeout_ms` and
+`hook_timeout_source`. An existing User-scope `DCG_HOOK_TIMEOUT_MS=3000` is safe
+to leave in place; it produces the same enforcement budget and is reported as
+`configured`.
+
+## A known PowerShell mailer still runs
+
+`dcg scan` inspects source, while the runtime hook ordinarily sees only the
+script-launch command. Add a narrow trusted `[overrides].block` entry for the
+known filename, and separately disable any Task Scheduler entry that launches
+it outside the agent. See
+[Stop a known mailer immediately](careful-company-windows.md#stop-a-known-mailer-immediately).
+
+Use `dcg test --stdin` with a candidate file when testing a denial through an
+already-guarded shell; otherwise the parent hook can correctly block the
+dangerous fixture before the test subprocess starts.
+
 ## Performance concerns
 
 If hook latency is high:

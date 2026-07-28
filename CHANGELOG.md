@@ -13,6 +13,75 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## Unreleased
 
+## [v0.7.3](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.3) -- 2026-07-28 [Release]
+
+### Correctness
+
+- Detect bounded multi-line Outlook and CDO COM mail flows when scanning
+  PowerShell scripts, while requiring executable COM-construction syntax so
+  drafts, calendar access, quoted examples, and unrelated `.Send()` calls stay
+  clean. PowerShell assignment handling is shared with Git analysis, preventing
+  mail-object property assignments from becoming fictional dynamic
+  `git branch` mutations.
+- Treat path-qualified `dcg.exe` spellings case-insensitively during
+  self-inspection, matching native Windows executable resolution.
+- Keep executable Git commands guarded when POSIX control-flow reserved words
+  share their separator-delimited segment, including `if`/`elif` conditions,
+  `then`/`else` bodies, loops, groups, wrappers, branch mutations, and visible
+  Git aliases (#239). Exact quoted spellings, explicitly selected executables,
+  inert argument text, and invalid reserved-word order remain non-executable.
+- Extend the same executable-role analysis to Bash `coproc` commands and
+  `function name` declarations, with bounded structural nesting and
+  fail-closed handling beyond the parser budget.
+- Preserve literal `+` bytes in `scp://` URI paths while continuing to decode
+  percent escapes such as `%20`.
+- Recognize Cmd's leading `@` echo-suppression marker when applying the
+  preset's narrowly scoped direct-`hfdt` exemption; dynamic executables and
+  chained commands remain guarded.
+- Make the Windows history stress gate parse and validate dcg's hook JSON
+  contract and require the post-recovery write to increase the record count.
+
+### Release engineering
+
+- Stage native-Windows self-updates through a detached helper that waits for the
+  running `dcg.exe` to exit before invoking the verified, version-pinned
+  installer. Update progress is retained in the Windows cache log.
+- Make distribution publishing fail closed unless all six Linux, macOS, and
+  Windows archives and both installers have checksum sidecars and non-empty
+  Sigstore bundles. Release automation also refuses to create a tag while the
+  distribution workflow is disabled and explicitly dispatches distribution for
+  automation-created tags, so partial platform releases can no longer pass
+  silently.
+- Pin the third-party Rust toolchain action to an immutable commit, serialize
+  release automation, inspect the exact package-version tag, and let manual
+  runs retry distribution for an existing tag. Release values now cross into
+  shell steps through environment variables rather than interpolated source.
+
+### Windows operations
+
+- Give the `careful_company_running_windows` preset a 3000 ms default hook
+  deadline when no explicit setting is present, expose the effective deadline
+  and source through `dcg config`/`dcg doctor`, and distinguish one dcg hook
+  from unrelated agent hooks in diagnostics.
+- Add `dcg test --stdin` for safely supplying denied fixtures without putting
+  them in the parent command line, and add `dcg scan --with-packs` for
+  non-persistent source-policy checks.
+
+### Dependency hardening
+
+- Upgrade `rust-mcp-sdk` from 0.9 to 1.0.1 for its 1.0 protocol stack, stdio
+  busy-loop fix, and conformance/race fixes while retaining dcg's narrow
+  server/stdio feature set.
+- Adapt `self_update` rc.6's validated bare-SemVer release model to dcg's
+  canonical `vX.Y.Z` GitHub tags so update notices retain working release URLs.
+- Upgrade `ast-grep-core` and `ast-grep-language` together to 0.45 so heredoc
+  parsing uses one compatible AST trait universe.
+- Upgrade `base64` to 0.23 with default features disabled. dcg retains only the
+  scalar `std` engine, keeping the dependency's new unsafe SIMD implementation
+  out of the command-analysis path.
+- Refresh the reviewed Serde, regex, Tokio, Clap, schema, update, glob, and libc
+  patch releases. This includes the regex 1.13.1 match-offset correctness fix.
+
 ## [v0.7.2](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.2) -- 2026-07-27 [Release]
 
 ### Windows transfer correctness and latency

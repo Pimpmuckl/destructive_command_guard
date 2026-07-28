@@ -2197,6 +2197,54 @@ fn decode_cmd_pattern_view(command: &str) -> Cow<'_, str> {
     }
 }
 
+/// Return the executable right-hand side of a simple PowerShell variable
+/// assignment.
+///
+/// Ordinary and scoped variables plus a leading type constraint are handled.
+/// More elaborate lvalues stay conservative and return `None`. Quotes and
+/// backtick escapes are honored so an equals sign in data is not mistaken for
+/// assignment syntax.
+#[must_use]
+pub(crate) fn powershell_assignment_rhs(candidate: &str) -> Option<&str> {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+
+    for (idx, ch) in candidate.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '`' && !in_single {
+            escaped = true;
+            continue;
+        }
+
+        match ch {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '=' if !in_single && !in_double => {
+                let mut lhs = candidate[..idx].trim();
+                lhs = lhs.trim_end_matches(['+', '-', '*', '/', '%', '?']);
+                lhs = lhs.trim_end();
+
+                if let Some(after_type) = lhs.strip_prefix('[').and_then(|rest| {
+                    let close = rest.find(']')?;
+                    Some(rest[close + 1..].trim_start())
+                }) {
+                    lhs = after_type;
+                }
+                if lhs.starts_with('$') && !lhs.bytes().any(|byte| byte.is_ascii_whitespace()) {
+                    return Some(candidate[idx + 1..].trim());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
 /// Tokenize a command while preserving every raw token's byte span.
 ///
 /// POSIX and unknown input deliberately use the established normalizer

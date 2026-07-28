@@ -210,10 +210,6 @@ fn decode_scp_uri_path(path: &str) -> Option<String> {
                 decoded.push(value);
                 index += 3;
             }
-            b'+' => {
-                decoded.push(b' ');
-                index += 1;
-            }
             byte => {
                 decoded.push(byte);
                 index += 1;
@@ -2756,6 +2752,18 @@ mod tests {
         assert_eq!(
             direct_scp_decision("scp report.csv scp://buildbox/drop/report%20name.csv"),
             DirectScpDecision::Safe
+        );
+        assert_eq!(
+            parse_scp_destination("scp://buildbox/drop/report+name.csv")
+                .and_then(|destination| destination.path),
+            Some("drop/report+name.csv".to_string()),
+            "URI-path plus signs are literal bytes, not form-encoded spaces"
+        );
+        assert_eq!(
+            parse_scp_destination("scp://buildbox/drop/report%20name.csv")
+                .and_then(|destination| destination.path),
+            Some("drop/report name.csv".to_string()),
+            "percent-encoded URI path bytes must still decode"
         );
         for destination in [
             "scp://outside.example/drop/%",

@@ -359,6 +359,43 @@ fn scan_package_json_ignores_description() {
     );
 }
 
+#[test]
+fn scan_powershell_detects_multiline_outlook_com_send() {
+    let dir = tempfile::tempdir().unwrap();
+    let mailer = dir.path().join("send-dossier.ps1");
+    std::fs::write(
+        &mailer,
+        r#"$outlook = New-Object -ComObject Outlook.Application
+$mail = $outlook.CreateItem(0)
+$mail.To = 'outside@example.test'
+$mail.Subject = 'Daily dossier'
+$mail.HTMLBody = Get-Content .\dossier.html -Raw
+$mail.Send()
+"#,
+    )
+    .unwrap();
+
+    let output = run_dcg_scan(&[
+        "--paths",
+        mailer.to_str().unwrap(),
+        "--format",
+        "json",
+        "--with-packs",
+        "careful_company_running_windows.email",
+    ]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let findings = json["findings"].as_array().unwrap();
+    assert!(
+        findings.iter().any(|finding| {
+            finding["rule_id"] == "careful_company_running_windows.email:outlook-com-send"
+        }),
+        "multi-line Outlook send must be reported\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 // ============================================================================
 // Terraform Extractor Integration Tests
 // ============================================================================

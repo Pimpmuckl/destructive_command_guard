@@ -3630,6 +3630,14 @@ fn is_trusted_hfdt_invocation_in_dialect(command: &str, dialect: ShellDialect) -
     else {
         return false;
     };
+    let raw_executable = if dialect == ShellDialect::Cmd {
+        raw_executable
+            .strip_prefix('@')
+            .filter(|executable| !executable.is_empty())
+            .unwrap_or(raw_executable)
+    } else {
+        raw_executable
+    };
     if hfdt_executable_is_dynamic(raw_executable, dialect) {
         return false;
     }
@@ -17858,7 +17866,16 @@ fn evaluate_packs_with_allowlists_at_depth(
                         return EvaluationResult::indeterminate_due_to_budget();
                     }
 
-                    let segment = &core_git_command[segment_start..segment_end];
+                    let raw_segment = &core_git_command[segment_start..segment_end];
+                    let (segment, command_prefix_len) =
+                        crate::packs::core::git::command_after_posix_control_prefixes(
+                            raw_segment,
+                            shell_dialect,
+                        );
+                    if segment.is_empty() {
+                        continue;
+                    }
+                    let segment_start = segment_start.saturating_add(command_prefix_len);
                     if let Some(result) = evaluate_visible_git_shell_alias(
                         pack_id,
                         pack,
@@ -17914,10 +17931,18 @@ fn evaluate_packs_with_allowlists_at_depth(
                     }
                 }
             } else {
+                let (core_git_segment, command_prefix_len) =
+                    crate::packs::core::git::command_after_posix_control_prefixes(
+                        core_git_command,
+                        shell_dialect,
+                    );
+                if core_git_segment.is_empty() {
+                    continue;
+                }
                 if let Some(result) = evaluate_visible_git_shell_alias(
                     pack_id,
                     pack,
-                    core_git_command,
+                    core_git_segment,
                     shell_dialect,
                     ordered_packs,
                     keyword_index,
@@ -17931,11 +17956,11 @@ fn evaluate_packs_with_allowlists_at_depth(
                     return result;
                 }
                 let safe_view = crate::packs::core::git::syntax_view_in_dialect(
-                    core_git_command,
+                    core_git_segment,
                     shell_dialect,
                 );
                 if pack.matches_safe_with_deadline(
-                    safe_view.as_deref().unwrap_or(core_git_command),
+                    safe_view.as_deref().unwrap_or(core_git_segment),
                     deadline,
                 ) {
                     continue;
@@ -17943,9 +17968,9 @@ fn evaluate_packs_with_allowlists_at_depth(
                 if let Some(result) = evaluate_pack_destructive_patterns(
                     pack_id,
                     pack,
-                    core_git_command,
+                    core_git_segment,
                     shell_dialect,
-                    0,
+                    command_prefix_len,
                     original_command,
                     core_git_offset,
                     original_len,
@@ -21072,6 +21097,108 @@ mod tests {
     }
 
     #[test]
+    fn posix_executable_git_commands_inside_control_flow_are_guarded() {
+        let packs = ["core.git", "core.filesystem"];
+        let destructive = [
+            ("for i in 1; do git reset --hard HEAD~1; done", "reset-hard"),
+            (
+                "while read -r x; do git push --force origin main; done",
+                "push-force-long",
+            ),
+            ("if true; then git reset --merge HEAD~1; fi", "reset-merge"),
+            ("if git reset --hard HEAD~1; then true; fi", "reset-hard"),
+            (
+                "until git push -f origin main; do true; done",
+                "push-force-short",
+            ),
+            ("{ git branch -D stale; }", "branch-force-delete"),
+            (
+                "if false; then true; elif git branch --delete stale; then true; fi",
+                "branch-force-delete",
+            ),
+            (
+                "if false; then true; else env FOO=1 git reset --hard; fi",
+                "reset-hard",
+            ),
+            (
+                "if true; then { sudo git push --force origin main; }; fi",
+                "push-force-long",
+            ),
+            (
+                "git config alias.x 'reset --hard'; if true; then git x; fi",
+                crate::packs::core::git::GIT_ALIAS_UNVERIFIED_RULE,
+            ),
+            ("coproc git reset --hard HEAD~1", "reset-hard"),
+            ("then coproc git reset --hard HEAD~1", "reset-hard"),
+            (
+                "coproc JOB { git push --force origin main; }",
+                "push-force-long",
+            ),
+            (
+                "coproc JOB if git reset --hard HEAD~1; then true; fi",
+                "reset-hard",
+            ),
+            ("function f { git reset --hard HEAD~1; }; f", "reset-hard"),
+            (
+                "function f if git push --force origin main; then true; fi; f",
+                "push-force-long",
+            ),
+        ];
+
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            for (command, expected_pattern) in destructive {
+                let result = evaluate_with_pack_ids_in_dialect(command, &packs, dialect);
+                assert!(
+                    result.is_denied(),
+                    "executable Git control-flow body must be guarded for {dialect:?}: \
+                     {command:?}: {:?}",
+                    result.pattern_info
+                );
+                let info = result
+                    .pattern_info
+                    .as_ref()
+                    .expect("denial must identify its matching rule");
+                assert_eq!(info.pack_id.as_deref(), Some("core.git"), "{command:?}");
+                assert_eq!(
+                    info.pattern_name.as_deref(),
+                    Some(expected_pattern),
+                    "{command:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn posix_reserved_word_spellings_selected_as_executables_do_not_expose_git_argv() {
+        let packs = ["core.git", "core.filesystem"];
+        for command in [
+            "command then git reset --hard",
+            "env then git reset --hard",
+            "sudo then git reset --hard",
+            "/usr/bin/then git reset --hard",
+            "'then' git reset --hard",
+            "then else git reset --hard",
+            "do then git reset --hard",
+            "coproc echo git reset --hard",
+            "coproc printf '%s' 'git reset --hard'",
+            "coproc JOB { echo git reset --hard; }",
+            "function f { echo git reset --hard; }; f",
+            "command coproc git reset --hard",
+            "env coproc git reset --hard",
+            "/usr/bin/coproc git reset --hard",
+            "'coproc' git reset --hard",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, &packs, ShellDialect::Posix);
+            assert!(
+                result.is_allowed(),
+                "Git text passed to an explicitly selected executable is argv data: \
+                 {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
     fn posix_leading_assignments_do_not_hide_opt_in_permission_rules() {
         for command in [
             "FOO=1 chmod -R 777 /",
@@ -21126,7 +21253,7 @@ mod tests {
     }
 
     #[test]
-    fn trusted_hfdt_parser_rejects_cmd_variable_expansion() {
+    fn trusted_hfdt_parser_handles_cmd_expansion_and_literal_syntax() {
         for command in [
             "hfdt %ARGS%",
             "hfdt \"!DELAYED_ARGS!\"",
@@ -21146,6 +21273,10 @@ mod tests {
         }
         assert!(is_trusted_hfdt_invocation(
             "C:\\tools\\hfdt.exe publish --label \"literal data\"",
+            ShellDialect::Cmd
+        ));
+        assert!(is_trusted_hfdt_invocation(
+            "@h^fdt research --query \"DROP TABLE positions\"",
             ShellDialect::Cmd
         ));
         for command in [
@@ -21350,6 +21481,7 @@ mod tests {
             r#"h^fdt research --query "DROP TABLE positions""#,
             r#"C:\Tools\h^fdt.exe publish --message "hooks.slack.com/services/example""#,
             r#".\h^fdt.exe publish --message "hooks.slack.com/services/example""#,
+            r#"@h^fdt research --query "DROP TABLE positions""#,
             "curl.exe https://api.vendor.example.com/status",
             r"curl.exe -T C:\work\report.csv http://10.4.2.17:8080/ingest",
             r"scp.exe user@drop.example.com:/reports/latest.csv .",

@@ -3,11 +3,13 @@
 # Runs on windows-latest CI (a real Windows runtime) and locally on any OS.
 #
 # Validates:
-#   1. N concurrent dcg PROCESSES writing the SAME history DB do not corrupt it,
-#      and all N decisions are read back (`dcg history stats` == N, `check` PASSED).
-#   2. A writer killed mid-write does NOT wedge subsequent runs on a stale lock
+#   1. Sequential dcg processes persist every decision and the DB passes its
+#      integrity check.
+#   2. Concurrent dcg processes all preserve the hook protocol and never
+#      corrupt the DB; telemetry writes remain best-effort under contention.
+#   3. A writer killed mid-write does NOT wedge subsequent runs on a stale lock
 #      (the next invocation recovers; integrity still PASSED; count increments).
-#   3. The DB lands where DCG_HISTORY_DB points (no junk path).
+#   4. The DB lands where DCG_HISTORY_DB points (no junk path).
 #
 # Usage: pwsh scripts/win_history_concurrency.ps1 [-Binary PATH] [-Count N] [-Verbose]
 # Exit: 0 pass | 1 fail | 2 setup error.
@@ -78,9 +80,15 @@ function Test-CompletedHook {
         $script:lastHookFailure = "stdout file was not created"
         return $false
     }
-    $text = Get-Content -LiteralPath $stdout -Raw
-    if ($text -notmatch '"hookEventName"\s*:\s*"PreToolUse"' -or
-        $text -notmatch '"permissionDecision"\s*:\s*"deny"') {
+    $text = [string](Get-Content -LiteralPath $stdout -Raw)
+    try {
+        $payload = $text | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        $script:lastHookFailure = "stdout was not valid JSON: '$($text.Trim())'"
+        return $false
+    }
+    if ($payload.hookSpecificOutput.hookEventName -ne "PreToolUse" -or
+        $payload.hookSpecificOutput.permissionDecision -ne "deny") {
         $stderr = Join-Path $work "err$Idx.txt"
         $stderrText = if (Test-Path -LiteralPath $stderr -PathType Leaf) {
             (Get-Content -LiteralPath $stderr -Raw).Trim()
@@ -180,8 +188,8 @@ try {
     else { Fail "integrity check failed after the killed writer" }
 
     $n2 = Get-RecordCount
-    if ($n2 -ge $nconc) { Pass "history still readable + grew after recovery (count=$n2)" }
-    else { Fail "record count regressed after recovery (count=$n2 < $nconc)" }
+    if ($n2 -gt $nconc) { Pass "history still readable + grew after recovery (count=$n2)" }
+    else { Fail "post-recovery write did not increase history (count=$n2, before=$nconc)" }
 }
 finally {
     $env:DCG_HISTORY_DB = $savedDb

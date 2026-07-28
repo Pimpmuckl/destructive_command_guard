@@ -41,6 +41,14 @@ and the default `system.disk` policy remains independent:
 enabled = ["careful_company_running_windows"]
 ```
 
+The ordinary hook deadline is 200 ms. Because this preset deliberately enables
+a much larger reviewed pack set, dcg automatically uses a 3000 ms deadline when
+the preset ID is enabled and no explicit timeout is configured. This only gives
+the same fail-closed evaluation more time; it does not change a rule or permit a
+command. An explicit `[general].hook_timeout_ms` or `DCG_HOOK_TIMEOUT_MS` still
+wins. `dcg config --format json` and `dcg doctor` show both the effective value
+and its source.
+
 To tune one channel or service independently, exclude its concrete leaf after
 enabling the preset. Exclusions are applied after preset expansion:
 
@@ -59,8 +67,10 @@ Disabling the preset ID itself removes the members contributed by that preset.
 A leaf that is independently enabled, or a native-Windows pack that is
 default-on, remains enabled through that independent source.
 
-On native Windows, use `%APPDATA%\dcg\config.toml` or have an administrator
-select a centrally managed file before the agent session starts:
+On native Windows, dcg checks `%APPDATA%\dcg\config.toml` and
+`%USERPROFILE%\.config\dcg\config.toml`. Run `dcg config --format json` to see
+which file actually loaded. Alternatively, have an administrator select a
+centrally managed file before the agent session starts:
 
 ```powershell
 $env:DCG_CONFIG = 'C:\Company\Security\dcg-config.toml'
@@ -95,6 +105,55 @@ preset policy is active. The exemption applies only when `hfdt` is the actual
 executable in a standalone command segment. A lookalike name, output
 redirection, command substitution, or a second command chained after `hfdt`
 does not inherit that trust.
+
+## Stop a known mailer immediately
+
+Source scanning and runtime hooks answer different questions. `dcg scan`
+inspects a script's contents; the shell hook normally sees only the command that
+launches that script. To stop a known mailer by filename right now, add a block
+override to the trusted user config (merge this entry into an existing
+`[overrides]` table rather than declaring the table twice):
+
+```toml
+[overrides]
+block = [
+  { pattern = '(?i)\bsend-dossier\.ps1\b', reason = "Daily dossier mail is paused pending review" },
+]
+```
+
+This intentionally blocks every agent-shell reference to that distinctive
+filename. If the file is renamed, update the pattern. Confirm the loaded config,
+then put the candidate command `.\send-dossier.ps1` in a text file using an
+editor and evaluate it without placing the dangerous candidate on the parent
+shell command line:
+
+```powershell
+dcg config --format json
+Get-Content -Raw .\candidate-command.txt |
+  dcg test --stdin --format json
+```
+
+For Cmd, the equivalent safe-input form is:
+
+```bat
+dcg test --stdin --format json < candidate-command.txt
+```
+
+`dcg scan` now preserves bounded multi-line Outlook/CDO COM flows, so the usual
+`New-Object -ComObject Outlook.Application`, `CreateItem(0)`, and later
+`Send()` sequence is reported even when those operations are on separate
+PowerShell lines:
+
+```powershell
+dcg scan --paths .\send-dossier.ps1 --format json `
+  --with-packs careful_company_running_windows.email
+```
+
+The hook does not mediate a process that Task Scheduler, another service, or a
+human terminal launches independently of the agent. If such a scheduled task
+must stop immediately, disable the exact task in Task Scheduler (or with
+`Disable-ScheduledTask -TaskName '<exact reviewed task name>'`) in addition to
+the dcg override. Disabling is reversible; do not unregister or delete the task.
 
 ## Roll out without surprising developers
 
@@ -133,11 +192,13 @@ Test representative commands through every shell hook path the agent can use:
 
 ```powershell
 dcg packs --verbose
-dcg test 'Send-MailMessage -To outside@example.test -Body report'
-dcg test 'Invoke-RestMethod -Method Post -InFile report.csv https://example.com/upload'
 dcg test 'hfdt publish report'
 dcg doctor --json
 ```
+
+For denied examples, use `dcg test --stdin` with an editor-created candidate
+file as shown above. This prevents an already-installed hook from intercepting
+the test fixture on the parent `dcg test ...` command line.
 
 For a Cmd-backed hook, submit `tool_name: "cmd.exe"` and verify the equivalent
 policy cases as well, including `blat`, `curl -T`, `scp`, `ssh -R`, `sc stop
@@ -148,6 +209,13 @@ flags and destinations; `if` / `start` / `for ... do`; nested `cmd /c` and
 hook input to dcg; it does not execute the fixture strings. During release
 validation, separately probe the escape and control-flow assumptions with
 harmless commands on native `cmd.exe`.
+
+Direction matters for transfers. An upload such as
+`scp report.csv user@outside.example:/drop/` is denied. A download such as
+`scp user@outside.example:/drop/report.csv .` is allowed, as are transfers to a
+literal loopback, RFC1918, bare intranet, `*.internal`, `*.corp`, or `*.local`
+destination. A dynamic destination that dcg cannot prove internal is denied
+when the command is otherwise shaped like an outbound transfer.
 
 Also verify the agent integration itself. dcg can only evaluate commands that
 the host exposes to its hook. In particular, review the current

@@ -376,6 +376,12 @@ platform**, and one line enables the whole posture:
 enabled = ["careful_company_running_windows"]
 ```
 
+With this exact preset ID enabled, the hook evaluation deadline defaults to
+3000 ms instead of the ordinary 200 ms unless config or
+`DCG_HOOK_TIMEOUT_MS` explicitly supplies another value. This changes only the
+time available to reach the same fail-closed decision. Inspect the effective
+value and source with `dcg config --format json`.
+
 That turns on the six sub-packs below **and** the existing destruction coverage
 the same posture needs: the current `windows.*`, `database.*` (including
 Snowflake), `storage.*`, `remote.*`, `backup.*`, `secrets.*`, and `cloud.*`
@@ -669,7 +675,9 @@ Environment variables override config files (highest priority):
 - `DCG_HEREDOC_TIMEOUT_MS=50`: heredoc extraction timeout (milliseconds)
 - `DCG_HEREDOC_LANGUAGES=python,bash`: filter heredoc languages
 - `DCG_POLICY_DEFAULT_MODE=deny|ask|warn|log`: global default decision mode (`ask` requires native operator review and fails closed on unsupported clients)
-- `DCG_HOOK_TIMEOUT_MS=200`: hook evaluation timeout budget (milliseconds)
+- `DCG_HOOK_TIMEOUT_MS=<milliseconds>`: explicit hook evaluation timeout
+  (ordinary default: 200; automatic
+  `careful_company_running_windows` preset default: 3000)
 
 ### Output Formats and `DCG_FORMAT`
 
@@ -919,7 +927,7 @@ curl -fsSL "https://raw.githubusercontent.com/Pimpmuckl/destructive_command_guar
 Install specific version:
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Pimpmuckl/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --version v0.7.2-codexpp.1
+curl -fsSL "https://raw.githubusercontent.com/Pimpmuckl/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --version v0.7.3-codexpp.1
 ```
 
 Install to /usr/local/bin (system-wide, requires sudo):
@@ -981,7 +989,7 @@ repository's known-good `nightly-2026-06-06` pin; the included
 rustup toolchain install nightly-2026-06-06
 
 # Install the tagged source reproducibly
-cargo +nightly-2026-06-06 install --locked --git https://github.com/Pimpmuckl/destructive_command_guard --tag v0.7.2-codexpp.1 destructive_command_guard
+cargo +nightly-2026-06-06 install --locked --git https://github.com/Pimpmuckl/destructive_command_guard --tag v0.7.3-codexpp.1 destructive_command_guard
 ```
 
 ### Manual build
@@ -1005,7 +1013,7 @@ dcg update
 Optional flags mirror the installer scripts (examples):
 
 ```bash
-dcg update --version v0.7.2-codexpp.1
+dcg update --version v0.7.3-codexpp.1
 dcg update --system
 dcg update --verify
 ```
@@ -1178,6 +1186,9 @@ dcg test --config .dcg.prod.toml "docker system prune"
 # Temporarily enable extra packs only for this test run
 dcg test --with-packs containers.docker,database.postgresql "docker system prune"
 
+# Read the candidate from stdin so it need not appear in dcg's own arguments
+dcg test --stdin --format json < candidate-command.txt
+
 # Print full evaluation trace (same engine as `dcg explain`)
 dcg test --explain "git reset --hard"
 ```
@@ -1190,6 +1201,8 @@ dcg test --explain "git reset --hard"
 #### Flags and Options
 
 - `-c, --config <PATH>`: use a specific config file
+- `--stdin`: read the candidate command from standard input; conflicts with the
+  positional `COMMAND`
 - `--with-packs <ID1,ID2>`: temporarily enable extra packs
 - `--explain`: print detailed decision trace
 - `-f, --format <pretty|json|toon>`: output format (default: `pretty`)
@@ -1467,6 +1480,9 @@ dcg scan --staged
 
 # Scan specific paths
 dcg scan --paths scripts/ .github/workflows/
+
+# Enable extra packs for this scan without changing persistent config
+dcg scan --paths scripts/ --with-packs careful_company_running_windows
 ```
 
 ### Recommended Rollout Plan

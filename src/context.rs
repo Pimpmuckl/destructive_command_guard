@@ -1094,10 +1094,10 @@ struct PendingSafeFlag<'a> {
 /// ordinary executable spellings and must retain their arguments.
 #[inline]
 #[must_use]
-fn is_shell_command_prefix_reserved_word(word: &str) -> bool {
+pub(crate) fn is_shell_command_prefix_reserved_word(word: &str) -> bool {
     matches!(
         word,
-        "if" | "then" | "elif" | "else" | "while" | "until" | "do" | "{" | "!"
+        "if" | "then" | "elif" | "else" | "while" | "until" | "do" | "coproc" | "{" | "!"
     )
 }
 
@@ -3717,6 +3717,7 @@ mod tests {
             r"while false; do printf '%-50s -> %s\n' a b; done; mv x y",
             r"{ printf '%-50s -> %s\n' a b; }; mv x y",
             r"! printf '%-50s -> %s\n' a b; mv x y",
+            r"coproc printf '%-50s -> %s\n' a b; mv x y",
         ] {
             let sanitized = sanitize_for_pattern_matching(cmd);
             assert!(
@@ -3738,6 +3739,11 @@ mod tests {
             r"sudo then printf '%-50s -> %s\n' a b; mv x y",
             r"/usr/bin/then printf '%-50s -> %s\n' a b; mv x y",
             r"'then' printf '%-50s -> %s\n' a b; mv x y",
+            r"command coproc printf '%-50s -> %s\n' a b; mv x y",
+            r"env coproc printf '%-50s -> %s\n' a b; mv x y",
+            r"sudo coproc printf '%-50s -> %s\n' a b; mv x y",
+            r"/usr/bin/coproc printf '%-50s -> %s\n' a b; mv x y",
+            r"'coproc' printf '%-50s -> %s\n' a b; mv x y",
         ] {
             let sanitized = sanitize_for_pattern_matching(cmd);
             assert!(

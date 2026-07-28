@@ -659,14 +659,7 @@ fn main() {
     // Start evaluation deadline after input size checks (includes evaluation).
     // Enforce a minimum timeout so a zero-valued override cannot force every
     // hook request immediately into the conservative indeterminate path.
-    let deadline = Deadline::new(
-        config
-            .general
-            .hook_timeout_ms
-            .map_or(HOOK_EVALUATION_BUDGET, |ms| {
-                Duration::from_millis(ms.max(destructive_command_guard::perf::MIN_HOOK_TIMEOUT_MS))
-            }),
-    );
+    let deadline = Deadline::new(Duration::from_millis(config.effective_hook_timeout_ms()));
 
     let Some(extracted_command) = hook::extract_command_with_context(&hook_input) else {
         return;

@@ -183,15 +183,17 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // === Outlook COM automation ===
         destructive_pattern!(
             "outlook-com-send",
-            r"(?i)\b(?:outlook\.application|cdo\.message)\b[^\r\n]*\.send\s*\(",
+            r#"(?i)(?:(?:(?<!['"])\bnew-object\b[^\r\n;|&#]*?-comobject\s+['"]?outlook\.application\b['"]?|(?<!['"])\[(?:type|system\.type|runtime\.interopservices\.marshal)\]::(?:getactiveobject|gettypefromprogid)\s*\(\s*['"]outlook\.application['"])[^\r\n]*\.send\s*\(|(?:(?<!['"])\bnew-object\b[^\r\n;|&#]*?-comobject\s+['"]?outlook\.application\b['"]?|(?<!['"])\[(?:type|system\.type|runtime\.interopservices\.marshal)\]::(?:getactiveobject|gettypefromprogid)\s*\(\s*['"]outlook\.application['"])[\s\S]*?\bcreateitem\s*\(\s*(?:0x0|0|(?:\[[^\]\r\n]+\]::)?olmailitem)\s*\)[\s\S]*?\.send\s*\(|(?:(?<!['"])\bnew-object\b[^\r\n;|&#]*?-comobject\s+['"]?cdo\.message\b['"]?|(?<!['"])\[(?:type|system\.type)\]::gettypefromprogid\s*\(\s*['"]cdo\.message['"])[\s\S]*?\.send\s*\()"#,
             "Outlook/CDO COM automation sends mail as the signed-in user through the real mail client.",
             High,
             "`New-Object -ComObject Outlook.Application` plus `.CreateItem(0)` and `.Send()` produces \
              genuine mail from the logged-in mailbox — it appears in Sent Items and passes every \
              sender check, because it really is the user. Both the COM object and a `.Send()` are \
-             required, so obtaining the object to read a calendar, or building a draft and calling \
-             `.Display()`, is not matched. (The evaluator makes a whole-command pass after its \
-             per-segment passes, so the idiomatic semicolon-separated one-liner is still caught.) \
+             required, and a multi-line Outlook flow must also create a mail item, so obtaining the \
+             object to read a calendar, or building a draft and calling `.Display()`, is not matched. \
+             The evaluator's size-limited whole-command pass follows its per-segment passes, and the \
+             PowerShell scan extractor preserves a bounded Outlook creation/send sequence, so both \
+             one-liners and ordinary multi-line `.ps1` mailers are caught. \
              `CDO.Message` — the classic scriptable SMTP COM object — is covered by the same rule, \
              including the `[type]::GetTypeFromProgID(...)` form that avoids `New-Object`.\n\n\
              Safer alternatives:\n\
@@ -348,6 +350,26 @@ mod tests {
             ),
             (
                 "$m = New-Object -ComObject CDO.Message; $m.To = 'x@example.com'; $m.Send()",
+                "outlook-com-send",
+            ),
+            (
+                "$outlook = New-Object -ComObject Outlook.Application\n\
+                 $mail = $outlook.CreateItem(0)\n\
+                 $mail.To = 'x@example.com'\n\
+                 $mail.Subject = 'Daily dossier'\n\
+                 $mail.Send()",
+                "outlook-com-send",
+            ),
+            (
+                "$outlook = [Runtime.InteropServices.Marshal]::GetActiveObject('Outlook.Application')\r\n\
+                 $mail = $outlook.CreateItem(olMailItem)\r\n\
+                 $mail.Send()",
+                "outlook-com-send",
+            ),
+            (
+                "$outlook = New-Object -ComObject 'Outlook.Application'\n\
+                 $mail = $outlook.CreateItem([Microsoft.Office.Interop.Outlook.OlItemType]::olMailItem)\n\
+                 $mail.Send()",
                 "outlook-com-send",
             ),
             (
@@ -509,6 +531,15 @@ mod tests {
             // is not sending.
             "$ol = New-Object -ComObject Outlook.Application; $ns = $ol.GetNamespace('MAPI')",
             "$m = $ol.CreateItem(0); $m.Subject = 'draft'; $m.Display()",
+            "$ol = New-Object -ComObject Outlook.Application\n\
+             $m = $ol.CreateItem(0)\n\
+             $m.Subject = 'draft'\n\
+             $m.Display()",
+            "$ol = New-Object -ComObject Outlook.Application\n\
+             $ns = $ol.GetNamespace('MAPI')\n\
+             $socket.Send($payload)",
+            "Write-Host 'New-Object -ComObject Outlook.Application'; $m = $other.CreateItem(0); $m.Send()",
+            "Write-Host \"[type]::GetTypeFromProgID('Outlook.Application')\"; $m = $other.CreateItem(0); $m.Send()",
             // Auditing forwarding rules is the recommended remediation.
             "Get-InboxRule -Mailbox dev",
             "Get-Mailbox -Identity dev | Select-Object ForwardingSmtpAddress",
@@ -546,6 +577,9 @@ mod tests {
         for command in [
             "Send-MailMessage -To x@example.com -Body aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "curl.exe smtp://smtp.example.com --mail-from a --mail-rcpt b -T c -T d -T e",
+            "$outlook = New-Object -ComObject Outlook.Application\n\
+             $mail = $outlook.CreateItem(0)\n\
+             $mail.Send()",
         ] {
             assert_matches_within_budget(&pack, command);
         }

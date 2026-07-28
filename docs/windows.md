@@ -39,6 +39,13 @@ Update via the built-in updater (re-runs `install.ps1`):
 dcg update
 ```
 
+Windows cannot overwrite the `dcg.exe` process that is currently running.
+`dcg update` therefore verifies and stages the pinned installer, launches a
+detached helper, and returns. The helper waits for the original dcg process to
+exit before replacing the binary. Progress and any installer error are appended
+to `%LOCALAPPDATA%\dcg\update.log` (or the platform cache directory selected by
+Windows when it differs).
+
 Uninstall:
 
 ```powershell
@@ -63,6 +70,11 @@ dcg resolves its own config/state via the `dirs` crate (never hardcoded Unix pat
 
 `~`-prefixed paths in config expand from `%USERPROFILE%` (Windows has no `HOME`),
 and both `~/` and `~\` are accepted.
+
+Use `dcg config --format json` to see every attempted config source, the loaded
+source, enabled packs, and the effective hook deadline. A second
+`PreToolUse` entry in an agent settings file is not necessarily a duplicate:
+`dcg doctor` distinguishes the single dcg-owned hook from unrelated hooks.
 
 ## Default protection on Windows
 
@@ -108,8 +120,17 @@ packs do not enter the reused service categories in company policy without
 review. See [Careful company policy for Windows
 agents](careful-company-windows.md).
 
+The preset receives a 3000 ms default hook deadline when no explicit
+`hook_timeout_ms` or `DCG_HOOK_TIMEOUT_MS` is present. The normal default
+remains 200 ms. This accommodates cold evaluation of the preset's pinned pack
+set on older Windows machines without weakening fail-closed behavior.
+
 `dcg scan` understands PowerShell (`.ps1`/`.psm1`/`.psd1`) and Windows batch
-(`.cmd`/`.bat`) scripts in addition to the cross-platform formats.
+(`.cmd`/`.bat`) scripts in addition to the cross-platform formats. Use
+`--with-packs careful_company_running_windows` for an isolated scan without
+changing persistent config. PowerShell scanning carries a bounded Outlook/CDO
+COM construction through a later mail-item `Send()` instead of treating each
+physical line independently.
 
 ## Per-agent hook coverage on Windows
 
@@ -129,6 +150,13 @@ wire format is recognized on Windows. Hook *configuration* coverage:
 
 ## Limitations (honest)
 
+- **Scheduled or already-running programs**: dcg evaluates shell commands
+  exposed by an agent's hook. It does not interpose on Task Scheduler, Windows
+  services, a separate human terminal, or network calls made later by an
+  already-running process. Use a narrow `[overrides].block` rule to stop an
+  agent from launching a known script, and disable the exact scheduled task
+  separately when execution outside the agent must also stop. See
+  [Stop a known mailer immediately](careful-company-windows.md#stop-a-known-mailer-immediately).
 - **Codex `unified_exec`**: Codex's `PreToolUse` hooks do not intercept the
   `unified_exec` shell path used by **Codex Desktop / `codex exec` on Windows**
   for `command_execution` events. Commands routed that way are not blocked until
@@ -232,8 +260,10 @@ is intentionally not ported.
 - **`dcg` not found after install**: `-EasyMode` updates the User `PATH`; open a
   new terminal (or it is available in the install session). Without `-EasyMode`,
   add `%USERPROFILE%\.local\bin` to `PATH` yourself.
-- **`dcg update` / `dcg rollback`**: these shell out to `powershell` and require
-  it on `PATH`; they may be restricted under AppLocker / Constrained Language Mode.
+- **`dcg update` / `dcg rollback`**: these shell out to `powershell.exe` and
+  require it on `PATH`; they may be restricted under AppLocker / Constrained
+  Language Mode. Update is staged until the running dcg process exits; inspect
+  `%LOCALAPPDATA%\dcg\update.log` if the version does not change.
 - **cosign optional**: install verifies the checksum unconditionally and the
   Sigstore signature only when `cosign` and a trusted release bundle are present.
 - **minisign strict mode**: a present invalid signature always aborts. Use

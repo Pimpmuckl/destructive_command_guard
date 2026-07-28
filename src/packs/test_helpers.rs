@@ -510,15 +510,30 @@ pub fn validate_pack(pack: &Pack) {
 /// This is a sanity check to ensure no regex syntax errors exist.
 #[track_caller]
 pub fn assert_patterns_compile(pack: &Pack) {
-    // Safe patterns
-    for pattern in &pack.safe_patterns {
-        // Just accessing the regex is enough - it's compiled at pack creation
-        let _ = pattern.regex.as_str();
+    for (index, pattern) in pack.safe_patterns.iter().enumerate() {
+        if let Err(error) = crate::packs::regex_engine::CompiledRegex::new(pattern.regex.as_str()) {
+            panic!(
+                "Pack '{}' safe pattern '{}' (index {}) failed to compile: {}\n  Pattern: {}",
+                pack.id,
+                pattern.name,
+                index,
+                error,
+                pattern.regex.as_str()
+            );
+        }
     }
 
-    // Destructive patterns
-    for pattern in &pack.destructive_patterns {
-        let _ = pattern.regex.as_str();
+    for (index, pattern) in pack.destructive_patterns.iter().enumerate() {
+        if let Err(error) = crate::packs::regex_engine::CompiledRegex::new(pattern.regex.as_str()) {
+            panic!(
+                "Pack '{}' destructive pattern '{}' (index {}) failed to compile: {}\n  Pattern: {}",
+                pack.id,
+                pattern.name.unwrap_or("<unnamed>"),
+                index,
+                error,
+                pattern.regex.as_str()
+            );
+        }
     }
 }
 
