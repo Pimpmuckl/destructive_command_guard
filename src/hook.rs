@@ -590,14 +590,14 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
 
     // --- Codex CLI indicators (checked before Claude Code) ---
     // Codex 0.125.0+ shares Claude Code's tool name and most envelope
-    // fields, so we disambiguate via `turn_id`, which the codex source
-    // explicitly documents as "Codex extension: expose the active turn id
-    // to internal turn-scoped hooks" (codex-rs/hooks/src/schema.rs). Claude
-    // Code does NOT send `turn_id`. (We can't use `tool_use_id` for this
-    // because Claude Code's PreToolUse stdin includes it too.) We must
-    // classify Codex separately because its JSON parser is strict
-    // (`deny_unknown_fields`) and would silently drop dcg's standard deny
-    // payload, letting the destructive command through.
+    // fields, so we disambiguate via `turn_id` or the fork's explicit ask
+    // capability marker. The codex source documents `turn_id` as "Codex
+    // extension: expose the active turn id to internal turn-scoped hooks"
+    // (codex-rs/hooks/src/schema.rs). Claude Code does NOT send `turn_id`.
+    // (We can't use `tool_use_id` for this because Claude Code's PreToolUse
+    // stdin includes it too.) We must classify Codex separately because its
+    // JSON parser is strict (`deny_unknown_fields`) and would silently drop
+    // dcg's standard deny payload, letting the destructive command through.
     let is_claude_compatible_shell_tool = matches!(
         tool_name.as_str(),
         "bash" | "launch-process" | "powershell" | "pwsh" | "cmd" | "cmd.exe"
@@ -606,7 +606,9 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
         .turn_id
         .as_deref()
         .is_some_and(|s| !s.trim().is_empty());
-    if is_claude_compatible_shell_tool && has_codex_turn_id {
+    if is_claude_compatible_shell_tool
+        && (has_codex_turn_id || input.permission_decision_ask_supported)
+    {
         return codex_protocol(input);
     }
 

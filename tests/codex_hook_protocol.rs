@@ -439,9 +439,21 @@ fn cold_deadline_never_silently_allows_late_filesystem_rules() {
 
 #[test]
 fn codex_ask_capability_selects_decision() {
-    for (ask_supported, expected) in [(None, "deny"), (Some(false), "deny"), (Some(true), "ask")] {
+    for (turn_id, ask_supported, expected) in [
+        (Some("test-turn"), None, "deny"),
+        (Some("test-turn"), Some(false), "deny"),
+        (Some("test-turn"), Some(true), "ask"),
+        (None, Some(true), "ask"),
+        (Some(""), Some(true), "ask"),
+    ] {
         let mut payload: serde_json::Value =
             serde_json::from_str(&build_codex_payload("git reset --hard capability-test")).unwrap();
+        match turn_id {
+            Some(turn_id) => payload["turn_id"] = turn_id.into(),
+            None => {
+                payload.as_object_mut().unwrap().remove("turn_id");
+            }
+        }
         if let Some(supported) = ask_supported {
             payload["permission_decision_ask_supported"] = supported.into();
         }
@@ -451,7 +463,7 @@ fn codex_ask_capability_selects_decision() {
 
         assert_eq!(
             json["hookSpecificOutput"]["permissionDecision"], expected,
-            "ask_supported={ask_supported:?}\n{outcome}"
+            "turn_id={turn_id:?}, ask_supported={ask_supported:?}\n{outcome}"
         );
     }
 }
