@@ -12,14 +12,18 @@ that Codex reports as failed instead of blocked.
 Codex CLI 0.125.0+ sends the same basic hook payload shape as Claude Code for
 shell commands: `tool_name`, `tool_input.command`, hook event metadata, and a
 tool-use identifier. dcg must therefore avoid treating every Bash hook as
-Codex. The discriminator is Codex's `turn_id` field.
+Codex. The discriminators are Codex's `turn_id` field and Codex++'s explicit
+`permission_decision_ask_supported` marker.
 
 The rule in `src/hook.rs:detect_protocol` is intentionally narrow:
 
 - A shell tool (`Bash`, `bash`, or `launch-process`) with a non-empty `turn_id`
   is treated as `HookProtocol::Codex`.
-- A shell tool with `tool_use_id` but no `turn_id` stays on the
-  Claude-compatible JSON path.
+- A shell tool with an explicit `permission_decision_ask_supported` marker is
+  treated as Codex even if `turn_id` is absent or empty; the marker value then
+  selects `ask` (`true`) or `deny` (`false`).
+- A shell tool with `tool_use_id` but neither `turn_id` nor the capability
+  marker stays on the Claude-compatible JSON path.
 - Non-shell tools do not become Codex just because a `turn_id` field is present.
 - Copilot and Gemini envelope detection runs before the Codex check so their
   protocol-specific handling still wins.
@@ -59,9 +63,11 @@ therefore emits only Codex's documented fields:
 ```
 
 The same dcg binary supports both Codex variants. Codex++ adds
-`"permission_decision_ask_supported": true` to each `PreToolUse` input, so dcg
-returns `"ask"` and Guardian can review it. When the marker is absent or false,
-dcg returns the upstream-supported `"deny"` shown above. No version or executable
+`"permission_decision_ask_supported": true` to each `PreToolUse` input. When dcg
+flags a destructive match or cannot complete safety evaluation, it returns
+`"ask"` so Guardian can review that command. Safe commands remain silent; this
+does not add blanket Guardian review. When the marker is absent or false, dcg
+returns the upstream-supported `"deny"` shown above. No version or executable
 sniffing is involved.
 
 The process exits 0. stderr still contains the human-readable warning for an
@@ -84,7 +90,7 @@ The exit-code split is intentional:
 |------|--------|--------|------|
 | Allow under any protocol | empty | empty | 0 |
 | Claude-compatible deny | JSON denial | warning text | 0 |
-| Codex destructive command | minimal JSON `deny` or advertised `ask` | warning text | 0 |
+| Codex destructive or indeterminate command | minimal JSON `deny` or advertised `ask` | warning text | 0 |
 | Parse/config/runtime error | optional error output | error details | 1 or 2 |
 
 For Codex hook integrations, parse the minimal stdout JSON. Empty stdout with

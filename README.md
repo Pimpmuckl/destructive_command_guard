@@ -15,11 +15,13 @@ A high-performance hook for AI coding agents that blocks destructive commands be
 
 **Supported:** [Claude Code](https://claude.ai/code), [Codex CLI 0.125.0+](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [GitHub Copilot CLI](https://docs.github.com/en/copilot/concepts/agents/coding-agent/about-hooks), [VS Code Copilot Chat](https://code.visualstudio.com/docs/agent-customization/hooks), [Cursor IDE](https://cursor.com), [Hermes Agent](https://github.com/NousResearch/hermes-agent), [Grok (xAI)](https://x.ai/news/grok-build-cli) (native `~/.grok/hooks/` plus Claude compatibility layer), [Antigravity CLI (`agy`)](https://antigravity.google) (native `~/.gemini/config/hooks.json` via `dcg install --agy`), [OpenCode](https://opencode.ai) (via [community plugin](https://github.com/aspiers/ai-config/blob/main/.config/opencode/plugins/dcg-guard.js)), [Pi](https://github.com/earendil-works/pi) (via [extension recipe](docs/pi-integration.md)), [Aider](https://aider.chat/) (limited—git hooks only), [Continue](https://continue.dev) (detection only)
 
-## This fork: ask before destructive Codex commands
+## This fork: ask before dcg-flagged Codex commands
 
-This fork returns `permissionDecision: "ask"` only when Codex++ advertises
-`permission_decision_ask_supported: true`; marker-absent upstream Codex keeps
-the safe `"deny"` response. Everything else remains upstream behavior. See the
+This fork returns `permissionDecision: "ask"` for destructive matches and
+indeterminate evaluations only when Codex++ advertises
+`permission_decision_ask_supported: true`. Safe commands remain silent, so
+Guardian is not called for every command. Marker-absent upstream Codex keeps the
+safe `"deny"` response. Everything else remains upstream behavior. See the
 [Codex integration notes](docs/codex-integration.md) for the exact contract.
 
 <div align="center">

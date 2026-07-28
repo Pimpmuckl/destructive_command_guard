@@ -467,6 +467,18 @@ fn codex_ask_capability_selects_decision() {
             "turn_id={turn_id:?}, ask_supported={ask_supported:?}\n{outcome}"
         );
     }
+
+    let big_command = "echo ".to_string() + &"A".repeat(70 * 1024);
+    let mut payload: serde_json::Value =
+        serde_json::from_str(&build_codex_payload(&big_command)).unwrap();
+    payload["permission_decision_ask_supported"] = true.into();
+    let outcome = run_hook_raw(&serde_json::to_vec(&payload).unwrap(), &[]);
+
+    assert_eq!(
+        outcome.stdout_json()["hookSpecificOutput"]["permissionDecision"],
+        "ask",
+        "an indeterminate Codex++ evaluation must reach Guardian review\n{outcome}"
+    );
 }
 
 #[test]

@@ -1691,8 +1691,10 @@ pub fn output_denial(
 /// An indeterminate result is neither an allow nor a rule-based denial: dcg
 /// did not finish proving the command safe before its evaluation deadline.
 /// Protocols with an explicit review decision receive `ask`; protocols that
-/// cannot represent `ask` receive their documented blocking decision. This
-/// deliberately never emits an explicit allow or an empty response.
+/// cannot represent `ask` receive their documented blocking decision. For
+/// Codex++, indeterminate evaluation is a dcg flag that should reach Guardian
+/// rather than becoming a blanket review of safe commands. This deliberately
+/// never emits an explicit allow or an empty response.
 #[cold]
 #[inline(never)]
 pub fn write_indeterminate_to(

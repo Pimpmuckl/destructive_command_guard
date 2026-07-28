@@ -9,8 +9,10 @@ rules.
 
 - The only maintained product difference is capability-aware Codex hook
   decisions: when Codex++ advertises
-  `permission_decision_ask_supported: true`, destructive commands return
-  `permissionDecision: "ask"`.
+  `permission_decision_ask_supported: true`, commands dcg flags for
+  intervention—including destructive matches and indeterminate evaluations—
+  return `permissionDecision: "ask"` for Guardian review. Safe commands remain
+  silent; do not add blanket Guardian review.
 - When that marker is absent or false, preserve upstream dcg's safe `"deny"`
   behavior. Preserve every non-Codex protocol unchanged.
 - Build, installation, documentation, and release changes are fork-scoped only
