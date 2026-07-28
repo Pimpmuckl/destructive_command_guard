@@ -64,9 +64,9 @@ pub struct HookInput {
     #[serde(alias = "turnId")]
     pub turn_id: Option<String>,
 
-    /// Codex++ capability marker for Guardian-backed `ask` decisions.
-    #[serde(default)]
-    pub permission_decision_ask_supported: bool,
+    /// Codex++ capability marker for Guardian-backed `ask` decisions. Presence
+    /// identifies Codex++; the value selects `ask` (`true`) or `deny` (`false`).
+    pub permission_decision_ask_supported: Option<bool>,
 
     /// Antigravity CLI (`agy`) tool-call envelope. Unlike Claude/Gemini/Grok,
     /// `agy` nests the tool name and arguments under a `toolCall` object:
@@ -607,7 +607,7 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
         .as_deref()
         .is_some_and(|s| !s.trim().is_empty());
     if is_claude_compatible_shell_tool
-        && (has_codex_turn_id || input.permission_decision_ask_supported)
+        && (has_codex_turn_id || input.permission_decision_ask_supported.is_some())
     {
         return codex_protocol(input);
     }
@@ -693,7 +693,7 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
 }
 
 fn codex_protocol(input: &HookInput) -> HookProtocol {
-    if input.permission_decision_ask_supported {
+    if input.permission_decision_ask_supported == Some(true) {
         HookProtocol::CodexAsk
     } else {
         HookProtocol::Codex

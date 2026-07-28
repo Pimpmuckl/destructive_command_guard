@@ -443,6 +443,7 @@ fn codex_ask_capability_selects_decision() {
         (Some("test-turn"), None, "deny"),
         (Some("test-turn"), Some(false), "deny"),
         (Some("test-turn"), Some(true), "ask"),
+        (None, Some(false), "deny"),
         (None, Some(true), "ask"),
         (Some(""), Some(true), "ask"),
     ] {
