@@ -3572,12 +3572,25 @@ fn decode_segment_command_words_in_dialect(command: &str, dialect: ShellDialect)
 /// Tries `PATH_NORMALIZER` first (for unquoted paths), then `QUOTED_PATH_NORMALIZER`
 /// (for quoted paths that may contain spaces).
 fn apply_path_normalizers(base: &str) -> Option<String> {
-    // Try unquoted path normalizer first
-    if let Ok(Cow::Owned(replaced)) = PATH_NORMALIZER.try_replacen(base, 1, "$1") {
-        return Some(replaced);
+    let bytes = base.as_bytes();
+    let can_start_unquoted_path = bytes.first() == Some(&b'/')
+        || matches!(
+            bytes,
+            [drive, b':', separator, ..]
+                if drive.is_ascii_alphabetic() && matches!(separator, b'/' | b'\\')
+        );
+    if can_start_unquoted_path {
+        if let Ok(Cow::Owned(replaced)) = PATH_NORMALIZER.try_replacen(base, 1, "$1") {
+            return Some(replaced);
+        }
+        return None;
     }
-    // Try quoted path normalizer for paths like "C:/Program Files/Git/bin/git"
-    if let Ok(Cow::Owned(replaced)) = QUOTED_PATH_NORMALIZER.try_replacen(base, 1, "$1") {
+    // The quoted normalizer is likewise anchored to `"`. Do not initialize
+    // either comparatively expensive regex automaton for an ordinary bare
+    // command that cannot possibly match.
+    if bytes.first() == Some(&b'"')
+        && let Ok(Cow::Owned(replaced)) = QUOTED_PATH_NORMALIZER.try_replacen(base, 1, "$1")
+    {
         return Some(replaced);
     }
     None

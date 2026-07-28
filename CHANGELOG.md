@@ -13,6 +13,50 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## Unreleased
 
+## [v0.7.2](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.2) -- 2026-07-27 [Release]
+
+### Windows transfer correctness and latency
+
+- Classify literal direct `scp`/`pscp` destinations before compiling the
+  transfer pack's regex corpus. Cmd and PowerShell now retain exact policy
+  outcomes for external, internal, download, local-drive, quoted-path, IPv4,
+  and IPv6 forms, while protected remote paths keep their stable `remote.scp`
+  rule IDs.
+- Apply the same destination policy through Cmd wrappers and PowerShell
+  `Start-Process`, including statically resolvable variables, scoped/braced
+  and type-constrained variable names, literal string concatenation, inline
+  parameter binding, `-ArgumentList` arrays, and statically visible parameter
+  splats. Splat aliases, later field/array/method updates, mutations inside
+  executing blocks, `Set-Variable`, the `Variable:` provider, and PowerShell
+  7.1 explicit-parameter overrides all update the same bounded state model.
+  Comma-, semicolon-, and newline-separated literal arrays retain the same
+  direction-aware result. Dynamic SCP targets or argument lists fail closed
+  only when the remaining command is shaped like an outbound transfer;
+  unrelated dynamic process launches remain allowed.
+- Follow visible PowerShell function definitions, literal parameter defaults,
+  and aliases into invoked function bodies before evaluating a transfer.
+  Module-qualified built-ins and explicit function removal retain PowerShell's
+  real command-resolution behavior.
+- Treat static `Write-Output` and `Write-Host` arguments as inert data without
+  hiding real separators, subexpressions, redirects, or executable consumers.
+  This removes command-shaped-text false positives while preserving recursive
+  checks when the emitted text is later executed.
+- Parse Cmd caret escapes, PowerShell's call operator and stop-parsing token,
+  redirections, URI destinations, IPv4/IPv6 literals, option operands, and
+  Windows drive paths without treating downloads or local copies as uploads.
+- Lexically normalize absolute SCP destination paths before protected-directory
+  checks, closing traversal forms such as `/tmp/../etc/passwd` and protecting
+  Windows system destinations with the same stable `remote.scp` ownership.
+- Add property-based arbitrary-UTF-8 coverage for the shared transfer parser,
+  keeping malformed input bounded and panic-free.
+- Refine the `core.filesystem` candidate gate so the `cp` suffix in `scp` and
+  `pscp` no longer cold-initializes an unrelated large rule set. Candidate pack
+  construction is now ordered and lazy, and incomplete safe `RegexSet` misses
+  no longer recompile the already-checked linear patterns.
+- Avoid compiling absolute-executable path normalizers for ordinary bare
+  commands that cannot match their anchored syntax, and poll the evaluation
+  deadline after lazy pack initialization and before returning a final allow.
+
 ## [v0.7.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.1) -- 2026-07-27 [Release]
 
 ### Windows correctness

@@ -471,6 +471,7 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
+| `scp-destination-unverified` | scp/pscp has a runtime-dependent or malformed destination whose perimeter cannot be verified. | high |
 | `scp-to-remote` | scp with a remote destination copies local files off this machine. | high |
 | `transfer-script-with-visible-put` | An sftp/WinSCP command with a visible put uploads the named file. | high |
 | `sftp-remote-session` | An sftp session to an external host is an interactive transfer channel. | medium |

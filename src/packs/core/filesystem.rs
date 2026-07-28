@@ -1088,6 +1088,50 @@ pub(crate) fn filesystem_semantic_scan_required(command: &str, dialect: ShellDia
             && command.contains(['%', '!', '^']))
 }
 
+/// Refine the global substring index's candidate signal for core.filesystem.
+///
+/// The global index deliberately uses substring matching as a conservative
+/// first pass. That makes its short keywords prone to unrelated hits: most
+/// notably, `cp` appears at the end of both `scp` and `pscp`. Every
+/// core.filesystem command pattern requires the corresponding executable name
+/// at a regex word boundary, while every redirect pattern contains `>`.
+/// Mirroring that necessary lexical condition here preserves a superset of the
+/// pack's matches without cold-initializing the pack for unrelated commands.
+pub(crate) fn filesystem_keyword_candidate(command: &str) -> bool {
+    const COMMAND_WORDS: &[&str] = &[
+        "rm", "find", "unlink", "truncate", "shred", "tar", "dd", "mv", "cp", "ln", "rsync",
+    ];
+
+    command.contains('>')
+        || COMMAND_WORDS
+            .iter()
+            .any(|word| contains_ascii_command_word(command, word))
+}
+
+fn contains_ascii_command_word(command: &str, word: &str) -> bool {
+    let bytes = command.as_bytes();
+    let word_bytes = word.as_bytes();
+
+    if word_bytes.is_empty() || bytes.len() < word_bytes.len() {
+        return false;
+    }
+
+    bytes
+        .windows(word_bytes.len())
+        .enumerate()
+        .any(|(start, candidate)| {
+            candidate.eq_ignore_ascii_case(word_bytes)
+                && (start == 0 || !is_ascii_regex_word(bytes[start - 1]))
+                && bytes
+                    .get(start + word_bytes.len())
+                    .is_none_or(|byte| !is_ascii_regex_word(*byte))
+        })
+}
+
+const fn is_ascii_regex_word(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
 fn powershell_segment_requires_rm_semantic_scan(segment: &str) -> bool {
     let segment = segment.trim_start();
     if segment.starts_with('&') {
@@ -6007,6 +6051,37 @@ mod tests {
             assert!(
                 !filesystem_semantic_scan_required(command, dialect),
                 "inert data or ordinary POSIX syntax must not require a dialect fallback scan: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_filesystem_keyword_candidate_requires_command_word_boundaries() {
+        for command in [
+            "rm -rf ./tree",
+            "/usr/bin/find . -delete",
+            r#""C:\Tools\cp.exe" -a /etc /tmp/etc"#,
+            "echo ready && rsync -a /etc/ /tmp/etc/",
+            "echo data > /etc/passwd",
+            "ECHO data 2> C:\\logs\\error.txt",
+            "CP --help",
+        ] {
+            assert!(
+                filesystem_keyword_candidate(command),
+                "real filesystem command or redirect must remain a candidate: {command}"
+            );
+        }
+
+        for command in [
+            "scp report.csv analyst@external.example:/incoming/",
+            "pscp report.csv analyst@external.example:/incoming/",
+            "winscp.exe /help",
+            "echo xcp",
+            "printf 'carpet'",
+        ] {
+            assert!(
+                !filesystem_keyword_candidate(command),
+                "embedded keyword substring must not initialize core.filesystem: {command}"
             );
         }
     }
