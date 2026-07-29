@@ -903,7 +903,8 @@ pub enum SkipReason {
         null_bytes: usize,
         non_printable_ratio: f32,
     },
-    /// Tier 2 extraction exceeded the time budget (fail-open).
+    /// Tier 2 extraction exceeded the time budget; the evaluator chooses
+    /// bounded fallback or a strict block from configuration.
     Timeout { elapsed_ms: u64, budget_ms: u64 },
     /// Heredoc delimiter not found (unterminated).
     UnterminatedHeredoc { delimiter: String },
@@ -957,13 +958,15 @@ pub enum ExtractionResult {
     NoContent,
     /// Successfully extracted content.
     Extracted(Vec<ExtractedContent>),
-    /// Extraction was skipped (fail-open with reason for observability).
+    /// Extraction was skipped; the evaluator retains reasons for its configured
+    /// bounded-fallback or strict-block decision.
     Skipped(Vec<SkipReason>),
     Partial {
         extracted: Vec<ExtractedContent>,
         skipped: Vec<SkipReason>,
     },
-    /// Extraction failed (timeout, malformed, etc.) - fail open with warning.
+    /// Extraction failed (timeout, malformed, etc.); the evaluator applies its
+    /// configured bounded-fallback or strict-block policy.
     Failed(String),
 }
 

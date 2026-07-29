@@ -238,8 +238,9 @@ platform-sensitive, follow these conventions:
 - **Verify Windows branches from Linux** without a Windows box: `mingw` + the
   `x86_64-pc-windows-gnu` target are installed, so
   `cargo check --target x86_64-pc-windows-gnu --lib` (or `--bin dcg` / `--tests`)
-  compile-checks every `#[cfg(windows)]` path. `pwsh` is also available to run the
-  PowerShell installer/test scripts.
+  compile-checks every `#[cfg(windows)]` path. When `pwsh` is installed, use it
+  to run the PowerShell installer/test scripts; otherwise run those gates on the
+  native Windows release host.
 - **Windows packs.** `src/packs/windows/` holds the native-Windows packs
   (`windows.filesystem`/`windows.system` default-ON on Windows, `windows.misc`/
   `windows.powershell` opt-in). Patterns use inline `(?i)`; keyword arrays
@@ -833,12 +834,18 @@ Automated dependency updates configured in `.github/dependabot.yml`:
 
 When fixes are ready for release, follow this process:
 
+The steps below describe the normal GitHub Actions path. If Actions cannot run
+or a native Windows artifact must be built locally, the more detailed
+**Local/DSR Release and Windows Deployment Runbook** near the end of this file
+is authoritative.
+
 ### 1. Verify CI Passes Locally
 
 ```bash
 cargo fmt --check
+cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
-cargo test --lib
+cargo test
 ```
 
 ### 2. Commit Changes
@@ -855,7 +862,10 @@ Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>"
 
 ### 3. Bump Version (if needed)
 
-The version in `Cargo.toml` determines the release tag. If the current version already has a failed release, you can reuse it. Otherwise bump appropriately:
+The version in `Cargo.toml` determines the release tag. A version may be reused
+after a failed *local, pre-tag* attempt. Once its tag has been pushed or a
+release has been published, treat that version as immutable and bump to a new
+patch version instead of moving the tag or replacing signed assets.
 
 - **Patch** (0.2.10 -> 0.2.11): Bug fixes, no new features
 - **Minor** (0.2.x -> 0.3.0): New features, backward compatible
@@ -888,10 +898,12 @@ gh release view v0.2.13  # Check assets were uploaded
 ```
 
 Expected assets per release:
-- `dcg-{target}.tar.xz` - Binary archive
-- `dcg-{target}.tar.xz.sha256` - Checksum
-- `dcg-{target}.tar.xz.sigstore.json` - Sigstore signature bundle
-- `install.sh`, `install.ps1` - Install scripts
+- `dcg-{target}.tar.xz` (Unix) or `.zip` (Windows) - Binary archive
+- `<archive>.sha256` - Mandatory per-artifact checksum
+- `<archive>.sigstore.json` - Sigstore signature bundle
+- `install.sh`, `install.ps1`, and their checksum/Sigstore sidecars
+- Manual DSR releases additionally include minisign signatures, SLSA
+  provenance, a build manifest, and the pinned public verification keys
 
 ### Troubleshooting Failed Releases
 
@@ -899,11 +911,12 @@ If CI fails:
 1. Check workflow run: `gh run list --workflow=dist.yml --limit=5`
 2. View failed job: `gh run view <run-id>`
 3. Fix issues locally, commit, and push again
-4. The same version tag will be updated on successful build
+4. If no public tag or release exists yet, retry the same version; otherwise
+   create a new patch release. Never force-move a public release tag.
 
 Common failures:
 - **Clippy errors**: Fix lints, ensure `cargo clippy -- -D warnings` passes
-- **Test failures**: Run `cargo test --lib` to reproduce
+- **Test failures**: Run `cargo test` to reproduce
 - **Format errors**: Run `cargo fmt` to fix
 
 ---
@@ -1345,6 +1358,306 @@ cass robot-docs guide
 stdout is data-only, stderr is diagnostics; exit code 0 means success.
 
 Treat cass as a way to avoid re-solving problems other agents already handled.
+
+---
+
+## Local/DSR Release and Windows Deployment Runbook
+
+Use this fallback only when GitHub Actions cannot perform the release, when a
+native-host build is explicitly required, or when the user directs you to use
+DSR. It refines the shorter release checklist above. Do not jump straight to
+`dsr fallback`: keep source freezing, build, packaging, signing, publication,
+and public verification as separately inspectable stages.
+
+### Non-Negotiable Release Invariants
+
+1. **One immutable source identity.** The local `HEAD`, peeled release tag,
+   remote `main`, compatibility branch, build checkout, build manifest, and
+   published release must all name the same commit.
+2. **Frozen bytes before signatures.** Finish archive layout and names before
+   generating checksums, SLSA provenance, minisign signatures, or Sigstore
+   bundles. Any byte or filename change invalidates downstream metadata and
+   requires regenerating and reverifying it.
+3. **Integrity is not authenticity.** SHA256 is mandatory, but it does not
+   authenticate the publisher. Manual releases require the DSR minisign trust
+   path and the pinned local-release cosign trust path. Workflow releases use
+   GitHub Actions OIDC for Sigstore.
+4. **No destructive synchronization or cleanup.** Assume an automatic source
+   mirror may delete files until its dry-run proves otherwise. Never bypass dcg
+   to clean a checkout, output directory, key copy, or failed release. Rule 1
+   still applies to temporary files and directories.
+5. **A partial matrix must be deliberate.** A working Windows artifact does not
+   prove that every advertised target exists. Define the expected target/asset
+   matrix before building and either satisfy it or explicitly treat the release
+   as an emergency partial release with tested source-install fallback.
+
+### 1. Decide the Path and Freeze the Source
+
+First inspect Actions rather than waiting blindly:
+
+```bash
+gh run list --limit 20
+dsr check Dicklesworthstone/destructive_command_guard
+```
+
+If the manual path is justified, run all release gates *before* tagging:
+
+```bash
+cargo fmt --check
+cargo check --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo test
+cargo check --target x86_64-pc-windows-gnu --lib
+cargo build --release
+./scripts/e2e_test.sh --verbose
+pwsh -NoProfile -File ./scripts/e2e_test.ps1 -Verbose
+```
+
+Run any additional gates relevant to the changed surface. A release candidate
+with code changes receives the full suite; a crate-scoped or `--lib` run is not
+a release substitute. Both E2E scripts discover the release binary through
+`CARGO_TARGET_DIR` and reject a stale in-repository binary. If `--binary` /
+`-Binary` is supplied explicitly, pass an absolute path: the suites change
+directories while testing isolated configurations. If local PowerShell is
+unavailable, run the PowerShell suite against the native release candidate on
+the Windows build host before publication.
+
+Confirm the worktree contains only intentional release content, commit it, then
+create an annotated tag. Never force an existing public tag:
+
+```bash
+VERSION=vX.Y.Z
+git status --short
+git tag -a "$VERSION" -m "Release $VERSION"
+git push origin main
+git push origin main:master
+git push origin "$VERSION"
+```
+
+Choose exactly one owner for the tag and release. If the local path owns them,
+do not also let `release-automation` create the same tag in parallel.
+
+Record and compare the identities instead of trusting labels:
+
+```bash
+HEAD_SHA=$(git rev-parse HEAD)
+TAG_SHA=$(git rev-parse "${VERSION}^{commit}")
+test "$HEAD_SHA" = "$TAG_SHA"
+git ls-remote origin refs/heads/main refs/heads/master "refs/tags/$VERSION" "refs/tags/$VERSION^{}"
+```
+
+For an annotated tag, compare against the peeled `^{}`
+entry—not the tag-object SHA. If any identity differs, stop before building.
+Do not “repair” a published tag; make a patch release.
+
+### 2. Preflight DSR and the Native Windows Host
+
+Validate configuration, target naming, quality commands, host health, disk
+space, and the exact build plan:
+
+```bash
+dsr repos validate --repo destructive_command_guard
+dsr quality --tool destructive_command_guard --dry-run
+dsr health all --no-cache
+dsr build destructive_command_guard \
+  --version "${VERSION#v}" \
+  --target windows/amd64 \
+  --dry-run
+```
+
+The installer asset name, DSR `artifact_naming`, target triple, archive format,
+and release upload name must agree. A naming mismatch can silently trigger a
+source build instead of installing the native artifact.
+
+Treat DSR's automatic remote source sync as deletion-capable. Under this
+repository's no-deletion rule, do not sync into an existing checkout. For a
+native build:
+
+1. Create a brand-new checkout path on the Windows host at the exact tag.
+2. Verify that checkout's `HEAD` equals `TAG_SHA` and that its worktree is
+   clean.
+3. Temporarily point DSR's host source mapping at that fresh checkout.
+4. Use a brand-new output path and run the build with `--no-sync`:
+
+   ```bash
+   dsr build destructive_command_guard \
+     --version "${VERSION#v}" \
+     --target windows/amd64 \
+     --no-sync \
+     --output-dir <brand-new-output-directory>
+   ```
+
+5. Restore the previous DSR host mapping immediately after collection, even
+   when the build or artifact collection fails.
+
+Do not remove the staged checkout or output directory without the user's
+written permission. Record the native host, target triple, commit SHA, Rust
+toolchain, build duration, and collected executable SHA256 in the release
+notes/manifest. Monitor a long native build instead of starting a competing
+build because it appears quiet.
+
+### 3. Package the Native Artifact Correctly
+
+DSR may successfully collect `dcg.exe` even when the coordinator lacks a ZIP
+tool. That is a packaging failure, not a compile failure. In that case, package
+the collected executable on Windows with PowerShell `Compress-Archive`.
+
+The Windows release ZIP must contain exactly one root entry named `dcg.exe`.
+Before signing:
+
+- Extract the ZIP into a new inspection directory.
+- Hash the extracted `dcg.exe`.
+- Confirm that hash equals the collected native PE hash recorded by DSR.
+- Run the extracted binary and confirm its version matches `VERSION`.
+- Confirm it is the native MSVC release build—not a GNU compile-check artifact,
+  debug binary, stale binary, or installer smoke fixture.
+
+Never rename arbitrary bytes to make them look like a ZIP, and never package a
+different binary merely because it has the expected filename.
+
+### 4. Freeze, Checksum, and Sign the Complete Asset Set
+
+Write down the expected assets before signing. Depending on release scope this
+includes archives, standalone binaries, installers, the build manifest,
+per-file `.sha256` sidecars, `SHA256SUMS`, SLSA `.intoto.jsonl` provenance,
+`.minisig` files, `.sigstore.json` bundles, and public verification keys.
+
+The order is strict:
+
+1. Finalize payload bytes and filenames.
+2. Generate per-file SHA256 sidecars and the aggregate checksum manifest.
+3. Generate and verify SLSA provenance against the frozen payload.
+4. Sign publishable payloads and metadata with DSR minisign.
+5. Generate key-based cosign bundles for the local-release trust path.
+6. Independently verify every signature and bundle.
+
+Use DSR's configured private keys directly from its protected secret location.
+Private keys and password material must remain mode `600` and must never be
+copied into the repository, release directory, generic temporary directory, or
+remote build checkout. Publish only public keys and their fingerprints. If
+duplicate secret material is discovered, stop and follow Rule 1; do not set
+`DCG_BYPASS` or otherwise evade a blocked cleanup command.
+
+Before publication, confirm that:
+
+- `install.sh`, `install.ps1`, and `README.md` agree on the current minisign
+  public key and local cosign public-key fingerprint.
+- A retired key is accepted only for the exact historical release that used
+  it, never as an unbounded fallback.
+- The cosign verifier meets the installer's patched-version floor
+  (2.6.2+ on v2 or 3.0.4+ on v3); unknown, development, and prerelease version
+  strings fail closed for signature verification.
+
+Once signing begins, treat the directory as immutable. If a checksum generator,
+uploader, or packaging tool wants to rewrite `SHA256SUMS`, a sidecar, or an
+archive, stop and restart the checksum/signature stages from the newly frozen
+bytes.
+
+### 5. Verify Locally and on the Native Windows Machine
+
+Perform positive and negative tests before uploading:
+
+- SHA256, minisign, cosign, and SLSA verification all succeed independently.
+- A valid artifact paired with the wrong minisign signature fails.
+- A valid artifact paired with the wrong Sigstore bundle fails.
+- A modified artifact fails every applicable integrity/authenticity check.
+- `install.ps1` installs the local artifact into a fresh destination with
+  `-RequireMinisign -Verify -NoConfigure -Force`, using explicit local
+  artifact/checksum/signature/bundle inputs.
+- The installed binary hash equals the signed payload hash, reports the
+  expected version, and passes the installer self-test.
+
+Run the installer twice in a hermetic Windows home and confirm hook
+configuration is idempotent: one dcg-owned hook per supported integration,
+coexisting hooks preserved, valid JSON without a UTF-8 BOM, and no stale dcg
+entry. Run `dcg doctor` and `dcg config --format json`; do not guess config
+paths, enabled packs, timeout sources, or whether two visually similar hook
+entries are actually duplicates. On native Windows the canonical user config is
+`%APPDATA%\dcg\config.toml`; the legacy `~/.config/dcg/config.toml` may also be
+honored, so use the config report to identify the file that actually won.
+
+For the `careful_company_running_windows` preset, verify the effective 3000 ms
+default hook budget on a cold Windows process and confirm all six preset
+sub-packs plus the curated transitive members are active. Then test
+representative allow and deny cases through both PowerShell and `cmd.exe` hook
+payloads, including outbound mail/upload blocks and the structural `hfdt`
+exception (plain `hfdt` allowed; chaining, redirection, and substitution are not
+implicitly trusted). Exercise committed `.ps1`, `.cmd`, and `.bat` fixtures with
+`dcg scan` rather than placing an intentionally blocked test string on the
+guarded operator shell's own command line.
+
+Windows PowerShell 5.1 has two diagnostic traps:
+
+- Successful native programs such as cosign and `dcg --version` may write to
+  stderr. With `$ErrorActionPreference = 'Stop'` and merged streams, PowerShell
+  can wrap this as `NativeCommandError`. Temporarily make native stderr
+  non-terminating and decide success from the native process exit code.
+- `$LASTEXITCODE` can be stale after invoking a PowerShell script in-process.
+  For installer acceptance, launch a child PowerShell process, wait for it, and
+  inspect that process object's `ExitCode`.
+
+Older dcg versions could not replace their own running `dcg.exe`. The current
+updater has a deferred Windows swap path, but every release must retain the
+real-Windows running-binary update/rollback test. When recovering an older
+installation that lacks the fix, run the release installer directly.
+
+### 6. Inspect the Upload Plan, Then Publish
+
+Never assume an uploader is byte-preserving or complete. Run its dry-run/upload
+plan before signing when possible, and compare the selected filenames with the
+frozen expected-asset list.
+
+An observed DSR failure mode is regenerating aggregate checksum metadata during
+release assembly while omitting installers or `.sigstore.json` bundles from the
+selected upload set. If the current `dsr release` plan would mutate signed
+metadata or omit required files, do not use it for publication. DSR can still
+provide the native build, manifest, minisign signatures, and SLSA provenance;
+publish the frozen files with an explicit, enumerated `gh release create` /
+`gh release upload` invocation instead.
+
+Prefer assembling assets on a draft release. Never use `--clobber` on a signed
+asset and never replace an asset behind an existing public URL. If published
+bytes are wrong, withdraw the bad release as directed by the user and issue a
+new patch version.
+
+If a local release is now authoritative, inspect queued GitHub workflows. Cancel
+only `dist` / release-automation runs that could race to create or replace the
+same release. Do not cancel unrelated CI, coverage, or benchmark runs.
+
+### 7. Verify the Published Release From Scratch
+
+Download the release into a new local directory and verify it without relying
+on build-directory state:
+
+1. Compare the public asset names with the frozen expected-asset list.
+2. Verify the aggregate and per-file SHA256 data.
+3. Verify every minisign signature using the published/pinned public key.
+4. Verify every Sigstore bundle against the correct local-key or Actions-OIDC
+   trust root.
+5. Verify every SLSA subject digest against its public artifact.
+6. Confirm the release is public, non-draft, and has the intended prerelease
+   status.
+
+Then run the installer from the *public release URL* on the native Windows host
+into a fresh destination. Pin `-Version`, require minisign, enable `-Verify`,
+and confirm the installed hash, version, self-test, `dcg doctor`, effective
+config, hook idempotency, and representative PowerShell/`cmd.exe` policy
+behavior. A local-file install does not substitute for this public-path test.
+
+Finally verify the repository invariants again:
+
+```bash
+git status --short
+git rev-parse HEAD
+git rev-parse "${VERSION}^{commit}"
+git ls-remote origin refs/heads/main refs/heads/master "refs/tags/$VERSION" "refs/tags/$VERSION^{}"
+gh release view "$VERSION"
+```
+
+The release is complete only when the source identities agree, the worktree is
+clean, all intended assets are publicly downloadable and independently
+verifiable, and a fresh native Windows installation succeeds from the public
+release.
 
 ---
 

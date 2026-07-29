@@ -222,11 +222,11 @@ Add to `~/.claude/settings.json`:
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "Bash|PowerShell",
         "hooks": [
           {
             "type": "command",
-            "command": "dcg"
+            "command": "/absolute/path/to/dcg"
           }
         ]
       }
@@ -234,6 +234,11 @@ Add to `~/.claude/settings.json`:
   }
 }
 ```
+
+Replace `/absolute/path/to/dcg` with the exact resolved binary path. Do not use
+bare `dcg`: non-interactive hook shells may not inherit the interactive
+`PATH`. On native Windows, use `install.ps1` so the hook receives the
+PowerShell-safe absolute command and explicit shell selection.
 
 **Important:** Restart Claude Code after adding the hook.
 

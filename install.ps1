@@ -49,9 +49,21 @@ Param(
 
 $ErrorActionPreference = "Stop"
 
-# Long-lived release trust root. This is intentionally embedded rather than
-# caller-configurable; the corresponding minisign key ID is 36B847D11BA5A0D0.
-$script:DcgMinisignPublicKey = "RWTQoKUb0Ue4NsqTpPWnABCrIU0+m25zsMlbv6UcRClQ7jmRP3A7NmTB"
+# Embedded release trust roots. New releases use the DSR-managed key. The
+# retired key remains valid only for v0.6.7, the sole historical release whose
+# installable archives were signed with it.
+$script:DcgMinisignPublicKey = "RWSoYi6NXJWzaRs1mJmOwwXrZfPWcq6MXnQlNMLBYKzlIQTLwuVQG6uO"
+$script:DcgMinisignKeyId = "69B3955C8D2E62A8"
+$script:DcgLegacyMinisignPublicKey = "RWTQoKUb0Ue4NsqTpPWnABCrIU0+m25zsMlbv6UcRClQ7jmRP3A7NmTB"
+$script:DcgLegacyMinisignKeyId = "36B847D11BA5A0D0"
+# Pinned self-managed cosign key for DSR/manual releases. GitHub Actions OIDC
+# remains a separately accepted trust path for workflow-built releases.
+$script:DcgCosignReleasePublicKey = @"
+-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAExiRXKgfQ5rG9l5Bxd4CEefEwmhxA
+5QzBI7X6X3RC4HWHwk5hRC9eVUkC8JEqV1eYxY5G3rHaxDs3yJ01IjUY5g==
+-----END PUBLIC KEY-----
+"@
 
 # Ensure TLS 1.2+ for GitHub downloads. Windows PowerShell 5.1 can still default
 # to TLS 1.0/1.1, which GitHub rejects; harmless on PowerShell 7 (already modern).
@@ -1148,8 +1160,16 @@ function Invoke-DcgMinisignVerification {
     [string]$ArtifactSource,
     [string]$SignatureSource,
     [string]$TempDirectory,
+    [string]$ReleaseVersion = "",
     [switch]$Require
   )
+
+  $minisignPublicKey = $script:DcgMinisignPublicKey
+  $minisignKeyId = $script:DcgMinisignKeyId
+  if ($ReleaseVersion -in @("v0.6.7", "0.6.7")) {
+    $minisignPublicKey = $script:DcgLegacyMinisignPublicKey
+    $minisignKeyId = $script:DcgLegacyMinisignKeyId
+  }
 
   if ([string]::IsNullOrWhiteSpace($SignatureSource)) {
     $SignatureSource = "$ArtifactSource.minisig"
@@ -1177,17 +1197,126 @@ function Invoke-DcgMinisignVerification {
   }
 
   try {
-    & $minisign -Vm $ArtifactPath -x $signatureFile -P $script:DcgMinisignPublicKey
+    & $minisign -Vm $ArtifactPath -x $signatureFile -P $minisignPublicKey
     $verificationSucceeded = $?
     $verificationExitCode = $LASTEXITCODE
     if ((-not $verificationSucceeded) -or ($verificationExitCode -ne 0)) {
       throw "minisign exited with status $verificationExitCode"
     }
   } catch {
-    throw "Minisign verification failed (expected key ID 36B847D11BA5A0D0): $($_.Exception.Message)"
+    throw "Minisign verification failed (expected key ID ${minisignKeyId}): $($_.Exception.Message)"
   }
 
-  Write-Ok "Signature verified (minisign key 36B847D11BA5A0D0)"
+  Write-Ok "Signature verified (minisign key $minisignKeyId)"
+}
+
+function Test-DcgPatchedCosignVersion {
+  # CVE-2026-22703 is repaired in 2.6.2 and 3.0.4. Reject unknown/development
+  # version strings rather than trusting a potentially vulnerable verifier.
+  param([string]$VersionJson)
+
+  if ($VersionJson -notmatch '"gitVersion"\s*:\s*"v([0-9]+)\.([0-9]+)\.([0-9]+)"') {
+    return $false
+  }
+  $major = [int]$Matches[1]
+  $minor = [int]$Matches[2]
+  $patch = [int]$Matches[3]
+
+  if ($major -gt 3) { return $true }
+  if ($major -eq 3) {
+    return (($minor -gt 0) -or (($minor -eq 0) -and ($patch -ge 4)))
+  }
+  if ($major -eq 2) {
+    return (($minor -gt 6) -or (($minor -eq 6) -and ($patch -ge 2)))
+  }
+  return $false
+}
+
+function Invoke-DcgSigstoreVerification {
+  # Verify either a DSR/manual key-signed bundle or a GitHub Actions OIDC
+  # bundle. A missing bundle/tool remains best-effort; a present bundle that
+  # fails both pinned trust paths is fatal.
+  param(
+    [string]$ArtifactPath,
+    [string]$BundleSource,
+    [string]$TempDirectory,
+    [string]$IdentityRegex,
+    [string]$OidcIssuer
+  )
+
+  $cosign = Get-Command cosign -CommandType Application -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+  if (-not $cosign) {
+    Write-Warn "cosign not found; skipping signature verification (install cosign for stronger authenticity checks)"
+    return
+  }
+
+  $bundleFile = Join-Path $TempDirectory (Get-PathLeaf $BundleSource)
+  Write-Info "Fetching sigstore bundle from $BundleSource"
+  try {
+    Copy-OrDownloadToFile -Source $BundleSource -OutFile $bundleFile
+  } catch {
+    Write-Warn "Sigstore bundle not found; skipping signature verification"
+    return
+  }
+
+  $versionJson = (& $cosign.Source version --json 2>&1 | Out-String)
+  if (($LASTEXITCODE -ne 0) -or (-not (Test-DcgPatchedCosignVersion -VersionJson $versionJson))) {
+    Write-Warn "cosign is missing required bundle-verification security fixes (need >=2.6.2 or >=3.0.4); skipping signature verification (checksum already verified)"
+    return
+  }
+
+  $cosignHelp = (& $cosign.Source verify-blob --help 2>&1 | Out-String)
+  $bundleFormatArgs = @()
+  if ($cosignHelp -match '--new-bundle-format') {
+    $bundleFormatArgs += '--new-bundle-format'
+  }
+
+  $publicKeyFile = Join-Path $TempDirectory "dcg-cosign-release.pub"
+  Write-Utf8NoBomText -Path $publicKeyFile -Text ($script:DcgCosignReleasePublicKey.Trim() + "`n")
+
+  $localKeyArgs = @("verify-blob") + $bundleFormatArgs + @(
+    "--bundle", $bundleFile,
+    "--key", $publicKeyFile,
+    $ArtifactPath
+  )
+  # Windows PowerShell 5.1 turns native stderr into ErrorRecord objects when
+  # streams are merged. Cosign writes "Verified OK" to stderr even on success,
+  # so temporarily make those records non-terminating and trust the native exit
+  # code. The captured text remains available for a genuine failure diagnostic.
+  $savedErrorActionPreference = $ErrorActionPreference
+  try {
+    $ErrorActionPreference = "Continue"
+    $localKeyOutput = (& $cosign.Source @localKeyArgs 2>&1 | Out-String)
+    $localKeyExitCode = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+  }
+  if ($localKeyExitCode -eq 0) {
+    Write-Ok "Signature verified (cosign local release key)"
+    return
+  }
+
+  $oidcArgs = @("verify-blob") + $bundleFormatArgs + @(
+    "--bundle", $bundleFile,
+    "--certificate-identity-regexp", $IdentityRegex,
+    "--certificate-oidc-issuer", $OidcIssuer,
+    $ArtifactPath
+  )
+  try {
+    $ErrorActionPreference = "Continue"
+    $oidcOutput = (& $cosign.Source @oidcArgs 2>&1 | Out-String)
+    $oidcExitCode = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+  }
+  if ($oidcExitCode -ne 0) {
+    $details = (($localKeyOutput.Trim(), $oidcOutput.Trim()) |
+      Where-Object { $_ } | Select-Object -First 2) -join " | "
+    throw "Sigstore bundle failed verification under both pinned release trust roots: $details"
+  }
+
+  Write-Ok "Signature verified (cosign GitHub Actions identity)"
 }
 
 function Convert-ContentToText {
@@ -1660,6 +1789,7 @@ try {
     -ArtifactSource $url `
     -SignatureSource $MinisignSignatureUrl `
     -TempDirectory $tmp `
+    -ReleaseVersion $Version `
     -Require:$RequireMinisign
 } catch {
   Write-Err $_.Exception.Message
@@ -1667,47 +1797,17 @@ try {
 }
 
 # Verify Sigstore/cosign bundle (best-effort)
-if (Get-Command cosign -ErrorAction SilentlyContinue) {
-  if (-not $SigstoreBundleUrl) { $SigstoreBundleUrl = "$url.sigstore.json" }
-  $bundleFile = Join-Path $tmp (Get-PathLeaf $SigstoreBundleUrl)
-  Write-Info "Fetching sigstore bundle from $SigstoreBundleUrl"
-  try {
-    Copy-OrDownloadToFile -Source $SigstoreBundleUrl -OutFile $bundleFile
-  } catch {
-    Write-Warn "Sigstore bundle not found; skipping signature verification"
-    $bundleFile = $null
-  }
-  if ($bundleFile) {
-    # When a release provides the modern Sigstore protobuf bundle (v0.3, cert
-    # under verificationMaterial.certificate), cosign can only parse that shape when
-    # --new-bundle-format is passed; the flag was introduced in cosign v2.4.0
-    # (sigstore/cosign#3796). An older cosign on PATH dies with
-    # "unknown flag: --new-bundle-format" (exit 1) and cannot verify a v0.3
-    # bundle at all even without the flag (it would fall back to the legacy
-    # shape and fail with "bundle does not contain cert for verification,
-    # please provide public key" -- issue #140).
-    #
-    # Signature verification is best-effort (the SHA256 checksum is already
-    # verified and required above; the cosign-not-found and bundle-not-found
-    # branches warn-and-skip rather than abort). So probe whether this cosign
-    # supports the flag: if not, warn and skip instead of aborting the install
-    # on an honest old client. A cosign that supports the flag is the only one
-    # that can meaningfully verify the bundle, and for it a non-zero exit is a
-    # real verification failure we still abort on.
-    $cosignHelp = (& cosign verify-blob --help 2>&1 | Out-String)
-    if ($cosignHelp -notmatch '--new-bundle-format') {
-      Write-Warn "cosign is too old to verify the modern Sigstore bundle (needs >= 2.4.0 for --new-bundle-format); skipping signature verification (checksum already verified)"
-    } else {
-      & cosign verify-blob --new-bundle-format --bundle $bundleFile --certificate-identity-regexp $CosignIdentityRegex --certificate-oidc-issuer $CosignOidcIssuer $zipFile | Out-Null
-      if ($LASTEXITCODE -ne 0) {
-        Write-Err "Signature verification failed"
-        exit 1
-      }
-      Write-Ok "Signature verified (cosign)"
-    }
-  }
-} else {
-  Write-Warn "cosign not found; skipping signature verification (install cosign for stronger authenticity checks)"
+if (-not $SigstoreBundleUrl) { $SigstoreBundleUrl = "$url.sigstore.json" }
+try {
+  Invoke-DcgSigstoreVerification `
+    -ArtifactPath $zipFile `
+    -BundleSource $SigstoreBundleUrl `
+    -TempDirectory $tmp `
+    -IdentityRegex $CosignIdentityRegex `
+    -OidcIssuer $CosignOidcIssuer
+} catch {
+  Write-Err $_.Exception.Message
+  exit 1
 }
 
 # Extract

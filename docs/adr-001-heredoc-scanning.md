@@ -2,7 +2,7 @@
 
 ## Status
 
-**Accepted** (2026-01-08)
+**Accepted** (2026-01-08); bounded-failure semantics amended (2026-07-28)
 
 ## Context
 
@@ -25,7 +25,9 @@ The outer command (`cat <<EOF | bash`) doesn't match any destructive pattern, bu
 2. **False Positives**: Must not block legitimate heredocs (deployment scripts, SQL migrations, config generation)
 3. **Dependencies**: Minimize binary size impact; avoid external process dependencies
 4. **Maintenance**: Pattern library must be extensible without core code changes
-5. **Fail-Open**: In hook mode, timeouts/parse errors must ALLOW (not block) to avoid breaking user workflows
+5. **Bounded Failure**: Tier-local extraction/parse failures use the configured
+   bounded fallback. Exhaustion of the outer evaluation deadline is
+   indeterminate and must never be interpreted as proof that a command is safe.
 
 ### Options Considered
 
@@ -183,18 +185,17 @@ rules = ["heredoc.python.subprocess_rm_rf"]
 
 ### Error Handling
 
-**All tiers follow fail-open semantics in hook mode:**
+Tier-local failures and the outer hook deadline have separate contracts:
 
-| Error | Behavior | Diagnostic |
-|-------|----------|------------|
-| Tier 1 regex error | ALLOW | Log + mark for review |
-| Tier 2 extraction timeout | ALLOW | Emit `heredoc_extraction_timeout` marker |
-| Tier 2 malformed heredoc | ALLOW | Emit `heredoc_parse_error` marker |
-| Tier 3 AST parse error | ALLOW | Emit `ast_parse_error` marker |
-| Tier 3 timeout | ALLOW | Emit `ast_timeout` marker |
-| Unknown language | ALLOW | Emit `unknown_language` marker |
+| Condition | Default behavior | Strict/configured behavior |
+|-----------|------------------|----------------------------|
+| Tier 2 extraction timeout or malformed heredoc | Run the bounded fallback scanner; allow only when it finds no high-risk signal | `fallback_on_timeout = false` or `fallback_on_parse_error = false` blocks |
+| Tier 3 AST parse/analysis failure or unknown language | Run bounded non-AST/fallback analysis; allow only when it finds no high-risk signal | Strict fallback settings block where applicable |
+| Outer evaluation deadline exhausted | Return `Indeterminate` | Review-capable clients ask; other clients block |
 
-Rationale: A hung or crashed hook is worse than a missed detection. Diagnostics enable `dcg explain` to surface issues for review.
+Rationale: Local parser failures should degrade to bounded analysis rather than
+hang the hook. Conversely, elapsed outer-budget time is not evidence of safety,
+so incomplete evaluation must remain visibly indeterminate.
 
 ## Consequences
 
@@ -203,7 +204,8 @@ Rationale: A hung or crashed hook is worse than a missed detection. Diagnostics 
 1. **No process spawn overhead**: ast-grep-core is embedded, avoiding 10-50ms CLI latency
 2. **Structural matching**: AST patterns avoid false positives from comments/strings
 3. **Extensible**: Pattern library can grow without core code changes
-4. **Fail-safe**: Fail-open design prevents blocking legitimate workflows
+4. **Fail-safe**: Bounded fallback avoids blocking ordinary workflows while
+   retaining high-risk scanning
 5. **Explainable**: Stable rule IDs enable precise allowlisting
 
 ### Drawbacks
@@ -274,7 +276,9 @@ Note: `pack_aware_quick_reject()` returns `true` if safe to skip (no keywords),
 
 ### Error Handling Patterns
 
-- All heredoc parse/timeouts are **fail-open** in hook mode.
+- Heredoc parse/extraction failures use the configured bounded fallback.
+- The absolute wall-clock evaluation deadline returns `Indeterminate`; it is
+  independent of the tier-local fallback switches.
 - Diagnostics should be emitted with enough context for `dcg explain` or logs.
 
 ### Testing

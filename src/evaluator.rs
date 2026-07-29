@@ -9,7 +9,7 @@
 //!
 //! 1. **Config block overrides** - Explicit block patterns deny before allow patterns
 //! 2. **Config allow overrides** - Explicit allow patterns permit non-blocked commands
-//! 3. **Heredoc/inline scripts** - Extract + AST-scan embedded code (fail-open)
+//! 3. **Heredoc/inline scripts** - Extract + AST-scan embedded code with bounded fallback
 //! 4. **Quick rejection** - Skip pack evaluation if no relevant keywords present
 //! 5. **Context sanitization** - Mask known-safe string arguments (reduce false positives)
 //! 6. **Command normalization** - Strip absolute paths from git/rm binaries
@@ -1970,7 +1970,7 @@ fn evaluate_visible_powershell_alias_invocations(
             nested_command_depth + 1,
             inherited_automated_stdin,
         );
-        if result.is_denied() || result.skipped_due_to_budget {
+        if result.is_denied() || nested_evaluation_incomplete(&result) {
             return Some(result);
         }
     }
@@ -2209,7 +2209,7 @@ fn evaluate_visible_powershell_function_invocations(
             nested_command_depth + 1,
             inherited_automated_stdin,
         );
-        if result.is_denied() || result.skipped_due_to_budget {
+        if result.is_denied() || nested_evaluation_incomplete(&result) {
             return Some(result);
         }
 
@@ -3104,7 +3104,7 @@ fn evaluate_visible_powershell_start_process_invocations(
                 nested_command_depth + 1,
                 inherited_automated_stdin,
             );
-            if result.is_denied() || result.skipped_due_to_budget {
+            if result.is_denied() || nested_evaluation_incomplete(&result) {
                 return Some(result);
             }
             resolved_splat_invocation = true;
@@ -3152,7 +3152,7 @@ fn evaluate_visible_powershell_start_process_invocations(
             nested_command_depth + 1,
             inherited_automated_stdin,
         );
-        if result.is_denied() || result.skipped_due_to_budget {
+        if result.is_denied() || nested_evaluation_incomplete(&result) {
             return Some(result);
         }
     }
@@ -3474,6 +3474,9 @@ fn evaluate_visible_powershell_scriptblock_invocations(
                     nested_command_depth + 1,
                     inherited_automated_stdin,
                 );
+                if nested_evaluation_incomplete(&result) {
+                    return Some(result);
+                }
                 if result.is_denied() {
                     if let Some(info) = result.pattern_info.as_mut() {
                         info.reason = format!(
@@ -3483,9 +3486,6 @@ fn evaluate_visible_powershell_scriptblock_invocations(
                         info.matched_span = None;
                         info.matched_text_preview = None;
                     }
-                    return Some(result);
-                }
-                if result.skipped_due_to_budget {
                     return Some(result);
                 }
             }
@@ -5344,11 +5344,8 @@ fn evaluate_windows_launcher_envelopes(
             nested_command_depth + 1,
             inherited_automated_stdin,
         );
-        if result.skipped_due_to_budget {
-            return Some(EvaluationResult::denied_by_legacy(&format!(
-                "{} payload exceeded dcg's static-analysis deadline",
-                envelope.launcher
-            )));
+        if nested_evaluation_incomplete(&result) {
+            return Some(result);
         }
         if result.is_denied() {
             if let Some(info) = result.pattern_info.as_mut() {
@@ -5644,11 +5641,8 @@ fn evaluate_obfuscated_posix_inline_launchers(
             nested_command_depth + 1,
             envelope_automated_stdin,
         );
-        if result.skipped_due_to_budget {
-            return Some(EvaluationResult::denied_by_legacy(&format!(
-                "{} payload exceeded dcg's static-analysis deadline",
-                envelope.launcher
-            )));
+        if nested_evaluation_incomplete(&result) {
+            return Some(result);
         }
         if result.is_denied() {
             if let Some(info) = result.pattern_info.as_mut() {
@@ -9782,10 +9776,8 @@ fn evaluate_executable_text_sinks(
             nested_command_depth + 1,
             inherited_automated_stdin,
         );
-        if result.skipped_due_to_budget {
-            return Some(EvaluationResult::denied_by_legacy(
-                "executable text source analysis exceeded dcg's deadline",
-            ));
+        if nested_evaluation_incomplete(&result) {
+            return Some(result);
         }
         if result.is_denied() {
             if let Some(info) = result.pattern_info.as_mut() {
@@ -9986,10 +9978,8 @@ fn evaluate_command_substitutions(
             nested_command_depth + 1,
             substitution_automated_stdin,
         );
-        if result.skipped_due_to_budget {
-            return Some(EvaluationResult::denied_by_legacy(
-                "command-substitution analysis exceeded dcg's deadline",
-            ));
+        if nested_evaluation_incomplete(&result) {
+            return Some(result);
         }
         if result.is_denied() {
             if let Some(info) = result.pattern_info.as_mut() {
@@ -10704,7 +10694,7 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
         return EvaluationResult::indeterminate_due_to_budget();
     }
 
-    // Step 3: Heredoc / inline-script detection (Tier 1/2/3, fail-open).
+    // Step 3: Heredoc / inline-script detection (Tier 1/2/3, bounded fallback).
     let mut precomputed_sanitized = None;
     let mut heredoc_allowlist_hit: Option<(PatternMatch, AllowlistLayer, String)> = None;
 
@@ -14350,7 +14340,7 @@ fn evaluate_sed_shell_sources(
                     nested_command_depth + 1,
                     inherited_automated_stdin,
                 );
-                if result.skipped_due_to_budget {
+                if nested_evaluation_incomplete(&result) {
                     return Some(result);
                 }
                 if result.is_denied() {
@@ -16833,7 +16823,7 @@ fn evaluate_indirect_inputs_for_pack(
                         )
                     },
                 );
-                if result.is_denied() || result.skipped_due_to_budget {
+                if result.is_denied() || nested_evaluation_incomplete(&result) {
                     return Some(result);
                 }
             }
@@ -18665,15 +18655,8 @@ fn evaluate_visible_git_shell_alias(
         embedded_shell_depth + 1,
         context.inherited_automated_stdin,
     );
-    if result.skipped_due_to_budget {
-        return evaluate_named_pack_rule(
-            pack_id,
-            pack,
-            crate::packs::core::git::GIT_ALIAS_UNVERIFIED_RULE,
-            allowlists,
-            project_path,
-            first_allowlist_hit,
-        );
+    if nested_evaluation_incomplete(&result) {
+        return Some(result);
     }
     if result.is_denied() {
         if let Some(info) = result.pattern_info.as_mut() {
@@ -18776,15 +18759,8 @@ fn evaluate_cloudflare_workers_pack(
                     embedded_shell_depth + 1,
                     context.inherited_automated_stdin,
                 );
-                if result.skipped_due_to_budget {
-                    return evaluate_named_pack_rule(
-                        pack_id,
-                        pack,
-                        crate::packs::cdn::cloudflare_workers::WRANGLER_UNVERIFIED_RULE,
-                        allowlists,
-                        project_path,
-                        first_allowlist_hit,
-                    );
+                if nested_evaluation_incomplete(&result) {
+                    return Some(result);
                 }
                 if result.is_denied() {
                     if let Some(info) = result.pattern_info.as_mut() {
@@ -19732,7 +19708,7 @@ where
     let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
     let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
 
-    // Step 3: Heredoc / inline-script detection (Tier 1/2/3, fail-open).
+    // Step 3: Heredoc / inline-script detection (Tier 1/2/3, bounded fallback).
     // See `evaluate_command` for detailed rationale.
     let heredoc_settings = config.heredoc_settings();
     let mut precomputed_sanitized = None;
@@ -25700,6 +25676,45 @@ mod tests {
             assert!(nested_evaluation_incomplete(&flagged_allow));
 
             assert!(!nested_evaluation_incomplete(&EvaluationResult::allowed()));
+        }
+
+        /// A nested deadline must retain its indeterminate provenance instead
+        /// of being rewritten as a fictional destructive-pattern match.
+        #[test]
+        fn command_substitution_deadline_remains_indeterminate() {
+            let compiled_overrides = default_compiled_overrides();
+            let allowlists = default_allowlists();
+            let heredoc_settings = test_heredoc_settings();
+            let enabled_keywords: Vec<&str> = vec!["git", "rm"];
+            let ordered_packs: Vec<String> = vec!["core.git".to_string()];
+            let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+            let deadline = Deadline::new(Duration::ZERO);
+            let mut first_allowlist_hit = None;
+
+            let result = evaluate_command_substitutions(
+                "echo $(git status)",
+                ShellDialect::Posix,
+                0,
+                &enabled_keywords,
+                &ordered_packs,
+                keyword_index.as_ref(),
+                &compiled_overrides,
+                &allowlists,
+                &heredoc_settings,
+                None,
+                None,
+                Some(&deadline),
+                &mut first_allowlist_hit,
+                false,
+            )
+            .expect("command substitution should produce a nested result");
+
+            assert!(result.is_indeterminate());
+            assert!(result.skipped_due_to_budget);
+            assert!(
+                result.pattern_info.is_none(),
+                "deadline exhaustion must not claim a destructive-pattern match"
+            );
         }
 
         /// Safe pattern matching must respect deadline — a burst of backtracking

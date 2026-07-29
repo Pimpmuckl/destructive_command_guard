@@ -76,11 +76,15 @@ The corpus MUST include edge cases:
    - A matched allowlist entry bypasses only the specific matched rule.
    - Allowlisting does not suppress evaluation of other packs/patterns.
 
-4) Fail-open behavior is mandatory.
-   - Hook input parse errors, oversized inputs, or exceeded deadlines must
-     allow execution (no deny output).
-   - Heredoc extraction/AST errors fail open by default unless strict
-     settings explicitly override.
+4) Bounded-failure behavior is mandatory.
+   - Malformed or oversized raw hook envelopes allow with an audit warning by
+     default; `general.fail_closed = true` denies attacker-controlled parse
+     failures. Transient stdin I/O errors always fail open.
+   - An oversized extracted command or an exhausted evaluation deadline is
+     indeterminate, never allow: review-capable clients ask and other clients
+     block.
+   - Heredoc extraction/AST errors run the bounded fallback by default unless
+     strict settings explicitly require a block.
 
 5) Word-boundary keyword gating is stable.
    - Quick-reject uses keyword detection over executable spans.

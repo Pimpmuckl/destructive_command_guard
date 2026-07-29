@@ -116,10 +116,37 @@ try {
     $minisignArgs = Get-Content -Raw -LiteralPath $env:DCG_MINISIGN_ARGS_FILE
     Check ($minisignArgs -match '(?:^|\s)-Vm(?:\s|$)') "passes verify-message mode"
     Check ($minisignArgs -match '(?:^|\s)-P(?:\s|$)') "passes an explicit public key"
-    Check ($minisignArgs -match 'RWTQoKUb0Ue4NsqTpPWnABCrIU0\+m25zsMlbv6UcRClQ7jmRP3A7NmTB') `
+    Check ($minisignArgs -match 'RWSoYi6NXJWzaRs1mJmOwwXrZfPWcq6MXnQlNMLBYKzlIQTLwuVQG6uO') `
         "uses the embedded release key"
 
-    Write-Host "Test 10: a present invalid minisign signature is always fatal"
+    Write-Host "Test 10: the retired minisign key is scoped to v0.6.7"
+    $legacyThrew = $false
+    try {
+        Invoke-DcgMinisignVerification -ArtifactPath $zip -ArtifactSource $zip `
+            -SignatureSource $signature -TempDirectory $tmp -ReleaseVersion "v0.6.7" -Require
+    } catch { $legacyThrew = $true }
+    Check (-not $legacyThrew) "legacy release verification succeeds"
+    $legacyArgs = Get-Content -Raw -LiteralPath $env:DCG_MINISIGN_ARGS_FILE
+    Check ($legacyArgs -match 'RWTQoKUb0Ue4NsqTpPWnABCrIU0\+m25zsMlbv6UcRClQ7jmRP3A7NmTB') `
+        "uses the retired key only for v0.6.7"
+
+    Write-Host "Test 11: patched cosign version floors reject vulnerable builds"
+    Check (-not (Test-DcgPatchedCosignVersion -VersionJson '{"gitVersion":"v2.6.1"}')) `
+        "rejects cosign 2.6.1"
+    Check (Test-DcgPatchedCosignVersion -VersionJson '{"gitVersion":"v2.6.2"}') `
+        "accepts cosign 2.6.2"
+    Check (-not (Test-DcgPatchedCosignVersion -VersionJson '{"gitVersion":"v3.0.3"}')) `
+        "rejects cosign 3.0.3"
+    Check (Test-DcgPatchedCosignVersion -VersionJson '{"gitVersion":"v3.0.4"}') `
+        "accepts cosign 3.0.4"
+    Check (Test-DcgPatchedCosignVersion -VersionJson '{"gitVersion":"v3.1.2"}') `
+        "accepts newer cosign 3.x"
+    Check (-not (Test-DcgPatchedCosignVersion -VersionJson '{"gitVersion":"v3.0.4-rc.1"}')) `
+        "rejects prerelease builds at the patched floor"
+    Check (-not (Test-DcgPatchedCosignVersion -VersionJson '{"gitVersion":"devel"}')) `
+        "rejects unknown development builds"
+
+    Write-Host "Test 12: a present invalid minisign signature is always fatal"
     Set-MinisignApplicationMock -Directory $mockBin -ExitCode 1 | Out-Null
     $invalidThrew = $false
     try {
@@ -128,7 +155,7 @@ try {
     } catch { $invalidThrew = $true }
     Check $invalidThrew "invalid signature fails even without -RequireMinisign"
 
-    Write-Host "Test 11: strict mode rejects a function shim when no external verifier exists"
+    Write-Host "Test 13: strict mode rejects a function shim when no external verifier exists"
     $emptyPath = Join-Path $tmp "empty-path"
     New-Item -ItemType Directory -Path $emptyPath | Out-Null
     $env:PATH = $emptyPath

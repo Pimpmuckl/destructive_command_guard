@@ -215,6 +215,29 @@ MOCKEOF
     grep -Fxq -- "-Vm" "$MINISIGN_ARGS_FILE"
     grep -Fxq -- "$artifact" "$MINISIGN_ARGS_FILE"
     grep -Fxq -- "-P" "$MINISIGN_ARGS_FILE"
+    grep -Fxq -- "RWSoYi6NXJWzaRs1mJmOwwXrZfPWcq6MXnQlNMLBYKzlIQTLwuVQG6uO" "$MINISIGN_ARGS_FILE"
+}
+
+@test "verify_minisign_signature: legacy key is scoped to v0.6.7" {
+    TMP="$TEST_TMPDIR/minisign-legacy"
+    mkdir -p "$TMP"
+    local artifact="$TMP/dcg.tar.xz"
+    local signature="$TMP/release.minisig"
+    printf 'artifact' > "$artifact"
+    printf 'signature' > "$signature"
+    export MINISIGN_ARGS_FILE="$TMP/minisign.args"
+    cat > "$TEST_TMPDIR/bin/minisign" << 'MOCKEOF'
+#!/bin/bash
+printf '%s\n' "$@" > "$MINISIGN_ARGS_FILE"
+exit 0
+MOCKEOF
+    chmod +x "$TEST_TMPDIR/bin/minisign"
+    MINISIGN_SIGNATURE_URL="file://$signature"
+    REQUIRE_MINISIGN=1
+    VERSION="v0.6.7"
+
+    run verify_minisign_signature "$artifact" "https://example.invalid/dcg.tar.xz"
+    [ "$status" -eq 0 ]
     grep -Fxq -- "RWTQoKUb0Ue4NsqTpPWnABCrIU0+m25zsMlbv6UcRClQ7jmRP3A7NmTB" "$MINISIGN_ARGS_FILE"
 }
 
@@ -292,6 +315,72 @@ MOCKEOF
     run verify_minisign_signature "$artifact" "https://example.invalid/dcg.tar.xz"
     [ "$status" -ne 0 ]
     [[ "$output" == *"Required minisign signature"* ]]
+}
+
+@test "cosign_version_is_patched: enforces repaired release floors" {
+    local mock_cosign="$TEST_TMPDIR/bin/cosign"
+    cat > "$mock_cosign" << 'MOCKEOF'
+#!/bin/bash
+printf '{"gitVersion":"%s"}\n' "$MOCK_COSIGN_VERSION"
+MOCKEOF
+    chmod +x "$mock_cosign"
+
+    export MOCK_COSIGN_VERSION="v2.6.1"
+    run cosign_version_is_patched "$mock_cosign"
+    [ "$status" -ne 0 ]
+    MOCK_COSIGN_VERSION="v2.6.2"
+    run cosign_version_is_patched "$mock_cosign"
+    [ "$status" -eq 0 ]
+    MOCK_COSIGN_VERSION="v3.0.3"
+    run cosign_version_is_patched "$mock_cosign"
+    [ "$status" -ne 0 ]
+    MOCK_COSIGN_VERSION="v3.0.4"
+    run cosign_version_is_patched "$mock_cosign"
+    [ "$status" -eq 0 ]
+    MOCK_COSIGN_VERSION="v3.1.2"
+    run cosign_version_is_patched "$mock_cosign"
+    [ "$status" -eq 0 ]
+    MOCK_COSIGN_VERSION="v3.0.4-rc.1"
+    run cosign_version_is_patched "$mock_cosign"
+    [ "$status" -ne 0 ]
+    MOCK_COSIGN_VERSION="devel"
+    run cosign_version_is_patched "$mock_cosign"
+    [ "$status" -ne 0 ]
+}
+
+@test "verify_sigstore_bundle: prefers the pinned local release key" {
+    TMP="$TEST_TMPDIR/sigstore-work"
+    mkdir -p "$TMP"
+    local artifact="$TMP/dcg.tar.xz"
+    local bundle="$TEST_TMPDIR/release.sigstore.json"
+    printf 'artifact' > "$artifact"
+    printf '{}' > "$bundle"
+    export COSIGN_ARGS_FILE="$TMP/cosign.args"
+    cat > "$TEST_TMPDIR/bin/cosign" << 'MOCKEOF'
+#!/bin/bash
+if [ "${1:-}" = "version" ]; then
+  printf '{"gitVersion":"v3.1.2"}\n'
+  exit 0
+fi
+if [ "${1:-}" = "verify-blob" ] && [ "${2:-}" = "--help" ]; then
+  printf '%s\n' 'Usage: cosign verify-blob --bundle FILE --key FILE'
+  exit 0
+fi
+printf '%s\n' "$@" > "$COSIGN_ARGS_FILE"
+case " $* " in
+  *" --key "*) exit 0 ;;
+  *) exit 1 ;;
+esac
+MOCKEOF
+    chmod +x "$TEST_TMPDIR/bin/cosign"
+    SIGSTORE_BUNDLE_URL="file://$bundle"
+
+    run verify_sigstore_bundle "$artifact" "https://example.invalid/dcg.tar.xz"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"cosign local release key"* ]]
+    grep -Fxq -- "--key" "$COSIGN_ARGS_FILE"
+    grep -Fxq -- "$TMP/dcg-cosign-release.pub" "$COSIGN_ARGS_FILE"
+    grep -Fq -- "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcD" "$TMP/dcg-cosign-release.pub"
 }
 
 # ============================================================================

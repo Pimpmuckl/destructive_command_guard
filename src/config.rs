@@ -985,8 +985,8 @@ pub(crate) fn explicitly_trusts_project_policy(start_dir: &Path) -> bool {
 /// Heredoc and inline-script scanning configuration.
 ///
 /// This configuration controls Tier 1/2/3 heredoc scanning behavior. Because the
-/// hook is performance- and UX-sensitive, defaults are conservative and fail-open
-/// on extraction/parse errors.
+/// hook is performance- and UX-sensitive, extraction/parse errors use a bounded
+/// fallback scanner by default.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct HeredocConfig {
@@ -1021,10 +1021,12 @@ pub struct HeredocConfig {
     /// Special value "all" scans all languages (the default if omitted).
     pub languages: Option<Vec<String>>,
 
-    /// Fail-open when AST parsing fails for embedded code.
+    /// Use bounded fallback scanning when AST parsing fails for embedded code.
+    /// When false, block on the incomplete analysis instead.
     pub fallback_on_parse_error: Option<bool>,
 
-    /// Fail-open when extraction/parsing exceeds the timeout budget.
+    /// Use bounded fallback scanning when extraction/parsing exceeds its timeout.
+    /// When false, block on the incomplete analysis instead.
     pub fallback_on_timeout: Option<bool>,
 
     /// Content-based allowlist for heredocs (patterns, hashes, commands).
@@ -1702,11 +1704,13 @@ pub struct GeneralConfig {
     pub verbose: bool,
 
     /// Hook evaluation budget override in milliseconds.
-    /// When set, overrides the default hook evaluation budget.
+    /// When set, overrides the default hook evaluation budget. Values below
+    /// 10 milliseconds are clamped to the minimum safe evaluation window.
     pub hook_timeout_ms: Option<u64>,
 
     /// Maximum bytes to read from stdin in hook mode.
-    /// Commands exceeding this limit are allowed (fail-open) with a warning.
+    /// Oversized hook envelopes are allowed with an audit warning by default;
+    /// `fail_closed` blocks them because their size is attacker-controlled.
     /// Default: 262144 (256 KiB).
     pub max_hook_input_bytes: Option<usize>,
 
@@ -5019,7 +5023,9 @@ verbose = false
 # Protects against Claude Code overwriting settings.json mid-session.
 # self_heal_hook = true
 
-# Hook evaluation budget override (milliseconds)
+# Hook evaluation wall-clock budget override (milliseconds).
+# Exhaustion is indeterminate: review-capable hooks ask; other hooks block.
+# Values below 10ms are clamped to the minimum safe evaluation window.
 # hook_timeout_ms = 200
 
 #─────────────────────────────────────────────────────────────
@@ -5258,7 +5264,8 @@ max_heredocs = 10
 # Optional language filter (scan only these languages). Omit for "all".
 # languages = ["python", "bash", "javascript", "typescript", "ruby", "perl"]
 
-# Graceful degradation (hook defaults are fail-open).
+# Bounded fallback for embedded-code parse/extraction failures.
+# The fallback still scans for high-risk operations before allowing.
 fallback_on_parse_error = true
 fallback_on_timeout = true
 

@@ -40,9 +40,19 @@ CHECKSUM="${CHECKSUM:-}"
 CHECKSUM_URL="${CHECKSUM_URL:-}"
 SIGSTORE_BUNDLE_URL="${SIGSTORE_BUNDLE_URL:-}"
 MINISIGN_SIGNATURE_URL="${MINISIGN_SIGNATURE_URL:-}"
-# This is the release trust root, not a caller-configurable setting. Its
-# minisign key ID is 36B847D11BA5A0D0.
-readonly MINISIGN_PUBLIC_KEY="RWTQoKUb0Ue4NsqTpPWnABCrIU0+m25zsMlbv6UcRClQ7jmRP3A7NmTB"
+# These are release trust roots, not caller-configurable settings. New releases
+# use the DSR-managed key. The retired key remains valid only for v0.6.7, the
+# sole historical release whose installable archives were signed with it.
+readonly MINISIGN_PUBLIC_KEY="RWSoYi6NXJWzaRs1mJmOwwXrZfPWcq6MXnQlNMLBYKzlIQTLwuVQG6uO"
+readonly MINISIGN_KEY_ID="69B3955C8D2E62A8"
+readonly LEGACY_MINISIGN_PUBLIC_KEY="RWTQoKUb0Ue4NsqTpPWnABCrIU0+m25zsMlbv6UcRClQ7jmRP3A7NmTB"
+readonly LEGACY_MINISIGN_KEY_ID="36B847D11BA5A0D0"
+# Pinned self-managed cosign key for DSR/manual releases. GitHub Actions OIDC
+# remains a separately accepted trust path for workflow-built releases.
+readonly COSIGN_RELEASE_PUBLIC_KEY='-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAExiRXKgfQ5rG9l5Bxd4CEefEwmhxA
+5QzBI7X6X3RC4HWHwk5hRC9eVUkC8JEqV1eYxY5G3rHaxDs3yJ01IjUY5g==
+-----END PUBLIC KEY-----'
 COSIGN_IDENTITY_RE="${COSIGN_IDENTITY_RE:-^https://github.com/${OWNER}/${REPO}/.github/workflows/dist.yml@refs/tags/.*$}"
 COSIGN_OIDC_ISSUER="${COSIGN_OIDC_ISSUER:-https://token.actions.githubusercontent.com}"
 ARTIFACT_URL="${ARTIFACT_URL:-}"
@@ -764,7 +774,7 @@ maybe_add_shell_check() {
 # dcg: warn if hook was silently removed from Claude Code settings
 if command -v dcg &>/dev/null && command -v jq &>/dev/null; then
   if [ -f "$HOME/.claude/settings.json" ] && \
-     ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | test("dcg$"))' \
+     ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | test("dcg\"?$"))' \
        "$HOME/.claude/settings.json" &>/dev/null; then
     printf '\033[1;33m[dcg] Hook missing from ~/.claude/settings.json — run: dcg install\033[0m\n'
   fi
@@ -1045,8 +1055,17 @@ verify_minisign_signature() {
   local file="$1"
   local artifact_url="$2"
   local minisign_bin=""
+  local minisign_public_key="$MINISIGN_PUBLIC_KEY"
+  local minisign_key_id="$MINISIGN_KEY_ID"
   local signature_url="${MINISIGN_SIGNATURE_URL:-${artifact_url}.minisig}"
   local signature_file="$TMP/artifact.minisig"
+
+  case "${VERSION:-}" in
+    v0.6.7|0.6.7)
+      minisign_public_key="$LEGACY_MINISIGN_PUBLIC_KEY"
+      minisign_key_id="$LEGACY_MINISIGN_KEY_ID"
+      ;;
+  esac
 
   info "Fetching minisign signature from ${signature_url}"
   if ! curl -fsSL "$signature_url" -o "$signature_file"; then
@@ -1070,13 +1089,44 @@ verify_minisign_signature() {
     return 0
   fi
 
-  if ! "$minisign_bin" -Vm "$file" -x "$signature_file" -P "$MINISIGN_PUBLIC_KEY"; then
-    err "Minisign verification failed (expected key ID 36B847D11BA5A0D0)"
+  if ! "$minisign_bin" -Vm "$file" -x "$signature_file" -P "$minisign_public_key"; then
+    err "Minisign verification failed (expected key ID ${minisign_key_id})"
     return 1
   fi
 
-  ok "Signature verified (minisign key 36B847D11BA5A0D0)"
+  ok "Signature verified (minisign key ${minisign_key_id})"
   return 0
+}
+
+# Return success only for cosign releases that contain the repaired bundle
+# verification logic from CVE-2026-22703 (>=2.6.2 or >=3.0.4).
+cosign_version_is_patched() {
+  local cosign_bin="$1"
+  local version_json=""
+  local version=""
+  local major=""
+  local minor=""
+  local patch=""
+
+  version_json=$("$cosign_bin" version --json 2>/dev/null) || return 1
+  version=$(printf '%s\n' "$version_json" |
+    sed -nE 's/.*"gitVersion"[[:space:]]*:[[:space:]]*"v([0-9]+)\.([0-9]+)\.([0-9]+)".*/\1.\2.\3/p' |
+    head -n 1)
+  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  IFS=. read -r major minor patch <<< "$version"
+
+  if (( major > 3 )); then
+    return 0
+  fi
+  if (( major == 3 )); then
+    (( minor > 0 || (minor == 0 && patch >= 4) ))
+    return
+  fi
+  if (( major == 2 )); then
+    (( minor > 6 || (minor == 6 && patch >= 2) ))
+    return
+  fi
+  return 1
 }
 
 # Verify Sigstore/cosign bundle for a file (best-effort).
@@ -1085,8 +1135,10 @@ verify_minisign_signature() {
 verify_sigstore_bundle() {
   local file="$1"
   local artifact_url="$2"
+  local cosign_bin=""
 
-  if ! command -v cosign &>/dev/null; then
+  cosign_bin=$(type -P cosign 2>/dev/null || true)
+  if [ -z "$cosign_bin" ] || [ ! -x "$cosign_bin" ]; then
     warn "cosign not found; skipping signature verification (install cosign for stronger authenticity checks)"
     return 0
   fi
@@ -1104,51 +1156,41 @@ verify_sigstore_bundle() {
     return 0
   fi
 
-  # When a release publishes a Sigstore bundle, current release tooling emits
-  # the modern Sigstore protobuf bundle
-  # (mediaType "application/vnd.dev.sigstore.bundle.v0.3+json", with the
-  # signing cert under verificationMaterial.certificate). cosign only knows
-  # how to parse that bundle shape from --bundle when --new-bundle-format is
-  # passed; that flag was introduced in cosign v2.4.0 (PR sigstore/cosign#3796).
-  #
-  # Two failure modes have to be kept distinct (issue #140):
-  #   1. A cosign that DOES understand the modern bundle but the signature
-  #      genuinely does not verify -> a real tamper/corruption signal -> abort.
-  #   2. A cosign too old to know --new-bundle-format (< 2.4.0). Passing the
-  #      flag makes it die with "unknown flag: --new-bundle-format" (exit 1),
-  #      and even without the flag it cannot parse a v0.3 protobuf bundle at all
-  #      (it would fall back to the legacy shape and fail with "bundle does not
-  #      contain cert for verification, please provide public key"). Such a
-  #      client simply cannot verify this bundle no matter what we pass.
-  #
-  # The earlier form of this function unconditionally passed --new-bundle-format
-  # and treated ANY non-zero cosign exit as fatal, so an honest user whose only
-  # sin was an old cosign on PATH had their install / `dcg update` aborted on the
-  # "unknown flag" error. That is strictly worse than the pre-#140 behaviour.
-  #
-  # Signature verification is best-effort here (the SHA256 checksum is already
-  # verified and required just above the call site; the same "cosign not found"
-  # and "bundle not found" branches above warn-and-skip rather than abort). So:
-  # only pass --new-bundle-format when this cosign actually supports it, and if
-  # it does not, warn and skip rather than fail the whole install. A cosign that
-  # supports the flag is the only one that can meaningfully verify the bundle,
-  # and for that one a non-zero exit is a real failure we still abort on.
-  local nbf_flag="--new-bundle-format"
-  if ! cosign verify-blob --help 2>/dev/null | grep -q -- "$nbf_flag"; then
-    warn "cosign is too old to verify the modern Sigstore bundle (needs >= 2.4.0 for ${nbf_flag}); skipping signature verification (checksum already verified)"
+  if ! cosign_version_is_patched "$cosign_bin"; then
+    warn "cosign is missing required bundle-verification security fixes (need >=2.6.2 or >=3.0.4); skipping signature verification (checksum already verified)"
     return 0
   fi
 
-  if ! cosign verify-blob \
-    "$nbf_flag" \
+  local -a bundle_format_args=()
+  if "$cosign_bin" verify-blob --help 2>/dev/null | grep -q -- "--new-bundle-format"; then
+    bundle_format_args+=(--new-bundle-format)
+  fi
+
+  local cosign_public_key_file="$TMP/dcg-cosign-release.pub"
+  printf '%s\n' "$COSIGN_RELEASE_PUBLIC_KEY" > "$cosign_public_key_file"
+
+  # Manual/DSR releases use the pinned self-managed key. Workflow releases use
+  # a Fulcio certificate bound to this repository's dist.yml identity.
+  if "$cosign_bin" verify-blob \
+    "${bundle_format_args[@]}" \
+    --bundle "$bundle_file" \
+    --key "$cosign_public_key_file" \
+    "$file" >/dev/null 2>&1; then
+    ok "Signature verified (cosign local release key)"
+    return 0
+  fi
+
+  if ! "$cosign_bin" verify-blob \
+    "${bundle_format_args[@]}" \
     --bundle "$bundle_file" \
     --certificate-identity-regexp "$COSIGN_IDENTITY_RE" \
     --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
     "$file"; then
+    err "Sigstore bundle failed verification under both pinned release trust roots"
     return 1
   fi
 
-  ok "Signature verified (cosign)"
+  ok "Signature verified (cosign GitHub Actions identity)"
   return 0
 }
 

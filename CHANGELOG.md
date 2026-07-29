@@ -13,6 +13,83 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## Unreleased
 
+## [v0.7.8](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.8) -- 2026-07-28 [Release]
+
+### Evaluation deadlines
+
+- Preserve `Indeterminate` when a nested command substitution, inline
+  interpreter, Windows launcher, Git shell alias, or Wrangler runner exhausts
+  the absolute evaluation deadline. Review-capable hooks now ask for approval
+  instead of misreporting timeout exhaustion as a destructive-pattern match;
+  other hooks continue to block conservatively.
+- Add `dcg test --enforce-budget` so operators can reproduce the live hook's
+  effective wall-clock evaluation budget, including pack and allowlist setup.
+- Reconcile the heredoc ADR, canonical corpus invariants, generated
+  configuration comments, and README around raw-envelope fail-open behavior,
+  bounded embedded-code fallback, and fail-closed indeterminate deadlines.
+
+## [v0.7.7](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.7) -- 2026-07-28 [Release]
+
+### Hook-path fail-closed hardening
+
+- Register Claude Code, Grok, and Antigravity hooks with the resolved absolute
+  path of the running dcg executable instead of relying on an interactive
+  shell's `PATH`. `dcg install`, `dcg setup`, and self-heal now migrate legacy
+  bare `dcg` entries while preserving coexisting hooks.
+- Quote Unix executable paths containing shell metacharacters and PowerShell
+  paths containing apostrophes without losing idempotent install/uninstall
+  detection. Executable-resolution and non-UTF-8 path errors now fail closed
+  instead of falling back to an inert hook.
+- Make `dcg doctor` report PATH-dependent hook commands as broken and repair
+  them with `--fix`; document absolute-path requirements for manual hook
+  configuration.
+
+## [v0.7.6](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.6) -- 2026-07-28 [Release]
+
+### Cross-platform release availability
+
+- Restore the complete six-target release matrix: Linux x86_64 musl, Linux
+  ARM64 GNU, macOS Intel, macOS Apple Silicon, Windows x64, and Windows ARM64.
+- Publish mandatory checksums plus independently verifiable minisign, Sigstore,
+  and SLSA provenance for the complete artifact set.
+- Document a fail-closed local/DSR release procedure for periods when GitHub
+  Actions cannot schedule the normal distribution workflow.
+
+## [v0.7.5](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.5) -- 2026-07-28 [Release]
+
+### Local release authenticity
+
+- Rotate manual-release minisign trust to the active DSR-managed key
+  `69B3955C8D2E62A8`. The retired `36B847D11BA5A0D0` trust root is constrained
+  to v0.6.7, the only historical release with signed installable archives.
+- Accept locally generated Sigstore bundles signed by a pinned self-managed
+  cosign key while retaining the GitHub Actions OIDC trust path for workflow
+  releases. When a patched cosign verifier is available, a present bundle must
+  verify under one of those two roots.
+- Refuse Sigstore verification with cosign releases affected by
+  CVE-2026-22703, require 2.6.2+/3.0.4+, and resolve a real external cosign
+  executable rather than a shell or PowerShell function shim.
+- Publish local DSR builds with mandatory SHA256 sidecars, minisign signatures,
+  signed SLSA provenance, and Sigstore bundles so a throttled Actions queue no
+  longer prevents a fully authenticated release.
+
+## [v0.7.4](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.4) -- 2026-07-28 [Release]
+
+### Windows updater
+
+- Launch the post-exit update worker through `Win32_Process.Create`, so it
+  survives shells and remote execution hosts that terminate ordinary detached
+  children when the initiating command exits. Job-breakaway and detached
+  process launches remain ordered compatibility fallbacks when CIM is
+  unavailable.
+- Preserve installer arguments under Windows PowerShell 5.1 by explicitly
+  enumerating the JSON array. Pinned `-Version`, `-Verify`, `-Dest`,
+  `-EasyMode`, and `-NoConfigure` values now reach `install.ps1` as distinct
+  arguments instead of collapsing into one ignored string.
+- Make the update worker append its own UTF-8 progress log rather than relying
+  on inherited standard handles, and support `dcg update --no-configure`
+  (`--binary-only`) on Windows as documented.
+
 ## [v0.7.3](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.3) -- 2026-07-28 [Release]
 
 ### Correctness

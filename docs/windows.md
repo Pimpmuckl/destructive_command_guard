@@ -28,9 +28,11 @@ The installer auto-selects `dcg-x86_64-pc-windows-msvc.zip` or
 the x64 artifact under Windows-on-ARM emulation if an older release has no
 native ARM64 asset. It **verifies the SHA256 checksum** (required), verifies a
 present `.minisig` against the embedded release key (key ID
-`36B847D11BA5A0D0`) when `minisign` is on `PATH`, and independently verifies a
-**Sigstore/cosign** signature when `cosign` and a trusted bundle are available.
-A present but invalid minisign signature is always fatal; by default a missing
+`69B3955C8D2E62A8`) when `minisign` is on `PATH`, and independently verifies a
+**Sigstore/cosign** signature against the pinned local-release key or GitHub
+Actions OIDC identity when a patched `cosign` and trusted bundle are available.
+The retired minisign key `36B847D11BA5A0D0` is accepted only for v0.6.7. A
+present but invalid minisign signature is always fatal; by default a missing
 sidecar/tool warns and continues unless `-RequireMinisign` is supplied.
 
 Update via the built-in updater (re-runs `install.ps1`):
@@ -41,10 +43,12 @@ dcg update
 
 Windows cannot overwrite the `dcg.exe` process that is currently running.
 `dcg update` therefore verifies and stages the pinned installer, launches a
-detached helper, and returns. The helper waits for the original dcg process to
-exit before replacing the binary. Progress and any installer error are appended
+worker through Windows process management, and returns. The worker survives
+shell/process-job teardown, waits for the original dcg process to exit, and only
+then replaces the binary. Progress and any installer error are appended as UTF-8
 to `%LOCALAPPDATA%\dcg\update.log` (or the platform cache directory selected by
-Windows when it differs).
+Windows when it differs). Use `dcg update --verify --no-configure` to update only
+the binary while preserving all existing agent-hook wiring.
 
 Uninstall:
 
@@ -261,14 +265,18 @@ is intentionally not ported.
   new terminal (or it is available in the install session). Without `-EasyMode`,
   add `%USERPROFILE%\.local\bin` to `PATH` yourself.
 - **`dcg update` / `dcg rollback`**: these shell out to `powershell.exe` and
-  require it on `PATH`; they may be restricted under AppLocker / Constrained
-  Language Mode. Update is staged until the running dcg process exits; inspect
-  `%LOCALAPPDATA%\dcg\update.log` if the version does not change.
+  require it on `PATH`; update also uses the built-in CIM cmdlets to create a
+  worker outside the initiating shell's process job. AppLocker, disabled WMI,
+  or Constrained Language Mode may force the detached-process fallback. Update
+  is staged until the running dcg process exits; inspect
+  `%LOCALAPPDATA%\dcg\update.log` if the version does not change. Add
+  `--no-configure` when hook files are managed separately.
 - **cosign optional**: install verifies the checksum unconditionally and the
-  Sigstore signature only when `cosign` and a trusted release bundle are present.
+  Sigstore signature only when a trusted release bundle and cosign 2.6.2+ or
+  3.0.4+ are present. Vulnerable/unknown cosign versions are not trusted.
 - **minisign strict mode**: a present invalid signature always aborts. Use
   `-RequireMinisign` to also abort when the `.minisig` sidecar or verifier is
-  unavailable; the embedded key ID is `36B847D11BA5A0D0`.
+  unavailable; the current embedded key ID is `69B3955C8D2E62A8`.
 - **Plain output**: `NO_COLOR=1`, `DCG_NO_COLOR=1`, or piping to a file disables
   all color/escape output.
 

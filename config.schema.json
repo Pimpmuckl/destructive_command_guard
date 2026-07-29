@@ -230,7 +230,7 @@
           "default": false
         },
         "hook_timeout_ms": {
-          "description": "Hook evaluation budget override in milliseconds.\nWhen set, overrides the default hook evaluation budget.",
+          "description": "Hook evaluation budget override in milliseconds.\nWhen set, overrides the default hook evaluation budget. Values below\n10 milliseconds are clamped to the minimum safe evaluation window.",
           "type": [
             "integer",
             "null"
@@ -240,7 +240,7 @@
           "default": null
         },
         "max_hook_input_bytes": {
-          "description": "Maximum bytes to read from stdin in hook mode.\nCommands exceeding this limit are allowed (fail-open) with a warning.\nDefault: 262144 (256 KiB).",
+          "description": "Maximum bytes to read from stdin in hook mode.\nOversized hook envelopes are allowed with an audit warning by default;\n`fail_closed` blocks them because their size is attacker-controlled.\nDefault: 262144 (256 KiB).",
           "type": [
             "integer",
             "null"
@@ -623,7 +623,7 @@
       }
     },
     "HeredocConfig": {
-      "description": "Heredoc and inline-script scanning configuration.\n\nThis configuration controls Tier 1/2/3 heredoc scanning behavior. Because the\nhook is performance- and UX-sensitive, defaults are conservative and fail-open\non extraction/parse errors.",
+      "description": "Heredoc and inline-script scanning configuration.\n\nThis configuration controls Tier 1/2/3 heredoc scanning behavior. Because the\nhook is performance- and UX-sensitive, extraction/parse errors use a bounded\nfallback scanner by default.",
       "type": "object",
       "properties": {
         "enabled": {
@@ -686,7 +686,7 @@
           "default": null
         },
         "fallback_on_parse_error": {
-          "description": "Fail-open when AST parsing fails for embedded code.",
+          "description": "Use bounded fallback scanning when AST parsing fails for embedded code.\nWhen false, block on the incomplete analysis instead.",
           "type": [
             "boolean",
             "null"
@@ -694,7 +694,7 @@
           "default": null
         },
         "fallback_on_timeout": {
-          "description": "Fail-open when extraction/parsing exceeds the timeout budget.",
+          "description": "Use bounded fallback scanning when extraction/parsing exceeds its timeout.\nWhen false, block on the incomplete analysis instead.",
           "type": [
             "boolean",
             "null"

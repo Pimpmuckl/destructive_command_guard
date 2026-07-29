@@ -35,6 +35,7 @@ use crate::pending_exceptions::{
     AllowOnceEntry, AllowOnceScopeKind, AllowOnceStore, PendingExceptionRecord,
     PendingExceptionStore,
 };
+use crate::perf::Deadline;
 use crate::suggest::{
     AllowlistSuggestion, CommandEntryInfo, ConfidenceTier, RiskLevel, filter_by_confidence,
     filter_by_risk, generate_enhanced_suggestions,
@@ -455,6 +456,10 @@ pub enum Command {
             value_name = "LANGS"
         )]
         heredoc_languages: Option<Vec<String>>,
+
+        /// Apply the live hook's wall-clock evaluation deadline
+        #[arg(long, conflicts_with = "explain")]
+        enforce_budget: bool,
 
         /// Bypass a soft block from the graduated response system
         #[arg(long)]
@@ -2161,6 +2166,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             no_heredoc_scan,
             heredoc_timeout_ms,
             heredoc_languages,
+            enforce_budget,
             force,
         }) => {
             // Robot mode forces JSON output
@@ -2209,6 +2215,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     no_heredoc_scan,
                     heredoc_timeout_ms,
                     heredoc_languages,
+                    enforce_budget,
                     force,
                 );
                 // Exit with code 1 if command would be blocked (for CI/robot mode scripting)
@@ -4082,9 +4089,10 @@ fn test_command(
     no_heredoc_scan: bool,
     heredoc_timeout_ms: Option<u64>,
     heredoc_languages: Option<Vec<String>>,
+    enforce_budget: bool,
     force: bool,
 ) -> bool {
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     // NOTE: quiet mode is handled AFTER evaluation (see below) so the returned
     // decision — and therefore the process exit code — still reflects whether
@@ -4121,21 +4129,46 @@ fn test_command(
         effective_config.heredoc.languages = Some(langs);
     }
 
-    // Get enabled packs and collect keywords for quick rejection
-    let mut enabled_packs = effective_config.enabled_pack_ids();
-    let mut enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
     let heredoc_settings = effective_config.heredoc_settings();
 
     // Compile overrides once (not per-command)
     let compiled_overrides = effective_config.overrides.compile();
 
-    // Load allowlists (project/user/system) for parity with hook mode.
-    // This is a small file read and only affects decisions when a rule matches.
-    let allowlists = load_default_allowlists();
-
     // Load external packs from custom_paths (glob + tilde expansion).
     let external_paths = effective_config.packs.expand_custom_paths();
     let external_store = load_external_packs(&external_paths);
+
+    // Detect the current AI coding agent for agent-specific profiles.
+    let detection = detect_agent_with_details();
+    let trust_level = effective_config.trust_level_for_agent(&detection.agent);
+    let agent_info = AgentInfo {
+        detected: detection.agent.config_key().to_string(),
+        trust_level: format!("{:?}", trust_level).to_lowercase(),
+        detection_method: match detection.method {
+            DetectionMethod::Environment => "environment_variable".to_string(),
+            DetectionMethod::Explicit => "explicit".to_string(),
+            DetectionMethod::Process => "process".to_string(),
+            DetectionMethod::None => "none".to_string(),
+        },
+    };
+
+    // Hook mode starts its deadline after config-derived setup, agent detection,
+    // external-pack loading, and hook-input reading. The CLI already has the
+    // candidate command, so begin at the equivalent boundary: pack expansion,
+    // allowlist loading, and evaluation consume the effective wall-clock budget.
+    let evaluation_deadline = enforce_budget.then(|| {
+        Deadline::new(Duration::from_millis(
+            effective_config.effective_hook_timeout_ms(),
+        ))
+    });
+
+    // Get enabled packs and collect keywords for quick rejection.
+    let mut enabled_packs = effective_config.enabled_pack_ids();
+    let mut enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
+
+    // Load allowlists (project/user/system) for parity with hook mode.
+    // This is a small file read and only affects decisions when a rule matches.
+    let allowlists = load_default_allowlists();
 
     // Auto-enable external packs and merge their keywords.
     for id in external_store.pack_ids() {
@@ -4157,20 +4190,6 @@ fn test_command(
         REGISTRY.build_enabled_keyword_index(&ordered_packs)
     };
 
-    // Detect the current AI coding agent for agent-specific profiles
-    let detection = detect_agent_with_details();
-    let trust_level = effective_config.trust_level_for_agent(&detection.agent);
-    let agent_info = AgentInfo {
-        detected: detection.agent.config_key().to_string(),
-        trust_level: format!("{:?}", trust_level).to_lowercase(),
-        detection_method: match detection.method {
-            DetectionMethod::Environment => "environment_variable".to_string(),
-            DetectionMethod::Explicit => "explicit".to_string(),
-            DetectionMethod::Process => "process".to_string(),
-            DetectionMethod::None => "none".to_string(),
-        },
-    };
-
     // Use shared evaluator for consistent behavior with hook mode
     let project_path = std::env::current_dir().ok();
     let start = Instant::now();
@@ -4184,7 +4203,7 @@ fn test_command(
         &heredoc_settings,
         None,                    // allow_once_audit
         project_path.as_deref(), // project_path scopes path-aware allowlist entries (#186)
-        None,                    // deadline
+        evaluation_deadline.as_ref(),
     );
 
     // NOTE: External packs from custom_paths are now checked in evaluate_command()
@@ -5610,10 +5629,13 @@ fn show_config(config: &Config, sources: &[ConfigSourceOutcome]) {
     println!("  Max body lines: {}", heredoc.limits.max_body_lines);
     println!("  Max heredocs: {}", heredoc.limits.max_heredocs);
     println!(
-        "  Fail-open on parse error: {}",
+        "  Bounded fallback on parse error: {}",
         heredoc.fallback_on_parse_error
     );
-    println!("  Fail-open on timeout: {}", heredoc.fallback_on_timeout);
+    println!(
+        "  Bounded fallback on timeout: {}",
+        heredoc.fallback_on_timeout
+    );
 
     let lang_label = |lang: crate::heredoc::ScriptLanguage| -> &'static str {
         match lang {
@@ -9607,7 +9629,17 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
             "  Found {} dcg hook entries (expected 1)",
             hook_diag.dcg_hook_count
         );
-        println!("  → Run 'dcg install --force' to reconcile duplicates safely");
+        if fix {
+            println!("  Attempting to reconcile hooks...");
+            if install_hook(true, false).is_ok() {
+                println!("  {}", "Fixed!".green());
+                fixed += 1;
+            } else {
+                println!("  {}", "Failed to fix".red());
+            }
+        } else {
+            println!("  → Run 'dcg install --force' to reconcile duplicates safely");
+        }
     } else if !hook_diag.wrong_matcher_hooks.is_empty() {
         println!("{}", "MISCONFIGURED".red());
         println!(
@@ -9615,19 +9647,49 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
             hook_diag.wrong_matcher_hooks
         );
         println!("  → dcg must match both Claude shell tools ({CLAUDE_SHELL_MATCHER})");
-        println!("  → Run 'dcg install --force' to migrate safely");
+        if fix {
+            println!("  Attempting to migrate the hook...");
+            if install_hook(true, false).is_ok() {
+                println!("  {}", "Fixed!".green());
+                fixed += 1;
+            } else {
+                println!("  {}", "Failed to fix".red());
+            }
+        } else {
+            println!("  → Run 'dcg install --force' to migrate safely");
+        }
     } else if !hook_diag.misconfigured_hooks.is_empty() {
         println!("{}", "MISCONFIGURED".red());
         for hook in &hook_diag.misconfigured_hooks {
             println!("  Hook cannot synchronously enforce a block: {hook}");
         }
-        println!("  → Run 'dcg install --force' to replace the hook safely");
+        if fix {
+            println!("  Attempting to replace the hook...");
+            if install_hook(true, false).is_ok() {
+                println!("  {}", "Fixed!".green());
+                fixed += 1;
+            } else {
+                println!("  {}", "Failed to fix".red());
+            }
+        } else {
+            println!("  → Run 'dcg install --force' to replace the hook safely");
+        }
     } else if !hook_diag.missing_executable_hooks.is_empty() {
         println!("{}", "BROKEN".red());
         for path in &hook_diag.missing_executable_hooks {
             println!("  Hook points to missing executable: {path}");
         }
-        println!("  → Run 'dcg install --force' to replace the broken entry");
+        if fix {
+            println!("  Attempting to replace the broken entry...");
+            if install_hook(true, false).is_ok() {
+                println!("  {}", "Fixed!".green());
+                fixed += 1;
+            } else {
+                println!("  {}", "Failed to fix".red());
+            }
+        } else {
+            println!("  → Run 'dcg install --force' to replace the broken entry");
+        }
     } else {
         println!("{}", "OK".green());
         println!(
@@ -10059,6 +10121,15 @@ fn collect_doctor_report(
     let hook_diag = diagnose_hook_wiring();
     issues += hook_diagnostics_issue_count(&hook_diag);
     let mut hook_fixed = false;
+    let hook_repair = if fix
+        && hook_diag.settings_exists
+        && hook_diag.settings_error.is_none()
+        && hook_diag.has_issues()
+    {
+        Some(install_hook_silent(true))
+    } else {
+        None
+    };
     let (status, message, remediation) = if !hook_diag.settings_exists {
         (
             DoctorCheckStatus::Skipped,
@@ -10071,36 +10142,34 @@ fn collect_doctor_report(
             format!("Settings error: {err}"),
             Some("Fix settings.json or reinstall Claude Code".to_string()),
         )
-    } else if hook_diag.dcg_hook_count == 0 {
-        if fix {
-            match install_hook_silent(false) {
-                Ok(true) => {
-                    fixed += 1;
-                    hook_fixed = true;
-                    (
-                        DoctorCheckStatus::Ok,
-                        "Hook registered successfully".to_string(),
-                        None,
-                    )
-                }
-                Ok(false) => (
-                    DoctorCheckStatus::Error,
-                    "Hook not registered (no changes made)".to_string(),
-                    Some("Run 'dcg install' to register the hook".to_string()),
-                ),
-                Err(e) => (
-                    DoctorCheckStatus::Error,
-                    format!("Failed to register hook: {e}"),
-                    Some("Run 'dcg install' to register the hook".to_string()),
-                ),
+    } else if let Some(repair) = hook_repair {
+        match repair {
+            Ok(true) => {
+                fixed += 1;
+                hook_fixed = true;
+                (
+                    DoctorCheckStatus::Ok,
+                    "Hook repaired with the current absolute dcg executable path".to_string(),
+                    None,
+                )
             }
-        } else {
-            (
+            Ok(false) => (
                 DoctorCheckStatus::Error,
-                "dcg hook not registered".to_string(),
-                Some("Run 'dcg install' to register the hook".to_string()),
-            )
+                "Hook repair made no changes".to_string(),
+                Some("Run 'dcg install --force' to replace the hook safely".to_string()),
+            ),
+            Err(error) => (
+                DoctorCheckStatus::Error,
+                format!("Failed to repair hook: {error}"),
+                Some("Run 'dcg install --force' to replace the hook safely".to_string()),
+            ),
         }
+    } else if hook_diag.dcg_hook_count == 0 {
+        (
+            DoctorCheckStatus::Error,
+            "dcg hook not registered".to_string(),
+            Some("Run 'dcg install' to register the hook".to_string()),
+        )
     } else if hook_diag.dcg_hook_count > 1 {
         (
             DoctorCheckStatus::Warning,
@@ -10471,34 +10540,113 @@ const CLAUDE_SHELL_MATCHER: &str = "Bash|PowerShell";
 const LEGACY_CLAUDE_SHELL_MATCHER: &str = "Bash";
 const ANTIGRAVITY_SHELL_MATCHER: &str = "Bash";
 
-fn claude_dcg_hook() -> serde_json::Value {
+fn current_dcg_executable() -> std::io::Result<std::path::PathBuf> {
+    let executable = std::env::current_exe().map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("could not resolve the running dcg executable: {error}"),
+        )
+    })?;
+    if !executable.is_absolute() {
+        return Err(std::io::Error::other(format!(
+            "running dcg executable path is not absolute: {}",
+            executable.display()
+        )));
+    }
+    if !executable.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "running dcg executable path is not a regular file: {}",
+                executable.display()
+            ),
+        ));
+    }
+    Ok(executable)
+}
+
+#[cfg(unix)]
+fn posix_quote_hook_program(program: &str) -> String {
+    if program.chars().all(|character| {
+        character.is_ascii_alphanumeric()
+            || matches!(
+                character,
+                '/' | '_' | '-' | '.' | ':' | '+' | ',' | '@' | '%'
+            )
+    }) {
+        return program.to_string();
+    }
+
+    let mut quoted = String::with_capacity(program.len() + 2);
+    quoted.push('"');
+    for character in program.chars() {
+        if matches!(character, '\\' | '"' | '$' | '`') {
+            quoted.push('\\');
+        }
+        quoted.push(character);
+    }
+    quoted.push('"');
+    quoted
+}
+
+fn claude_dcg_hook_for_executable(
+    executable: &std::path::Path,
+) -> std::io::Result<serde_json::Value> {
+    let command = hook_command_for_executable(executable)?;
+
     #[cfg(windows)]
     {
-        let executable = std::env::current_exe()
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| "dcg.exe".to_string());
-        let escaped = executable.replace('\'', "''");
-        serde_json::json!({
+        Ok(serde_json::json!({
             "type": "command",
-            "command": format!("& '{escaped}'"),
+            "command": command,
             "shell": "powershell"
-        })
+        }))
     }
 
     #[cfg(not(windows))]
     {
-        serde_json::json!({
+        Ok(serde_json::json!({
             "type": "command",
-            "command": "dcg"
-        })
+            "command": command
+        }))
     }
 }
 
-fn antigravity_dcg_hook() -> serde_json::Value {
-    serde_json::json!({
-        "type": "command",
-        "command": "dcg"
-    })
+fn hook_command_for_executable(executable: &std::path::Path) -> std::io::Result<String> {
+    if !executable.is_absolute() {
+        return Err(std::io::Error::other(format!(
+            "dcg hook executable path is not absolute: {}",
+            executable.display()
+        )));
+    }
+    let executable = executable.to_str().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "dcg hook executable path is not valid UTF-8: {}",
+                executable.display()
+            ),
+        )
+    })?;
+
+    #[cfg(windows)]
+    {
+        let escaped = executable.replace('\'', "''");
+        Ok(format!("& '{escaped}'"))
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(posix_quote_hook_program(executable))
+    }
+}
+
+fn claude_dcg_hook() -> std::io::Result<serde_json::Value> {
+    claude_dcg_hook_for_executable(&current_dcg_executable()?)
+}
+
+fn antigravity_dcg_hook() -> std::io::Result<serde_json::Value> {
+    claude_dcg_hook_for_executable(&current_dcg_executable()?)
 }
 
 fn quoted_hook_program(command: &str) -> Option<String> {
@@ -10525,6 +10673,18 @@ fn quoted_hook_program(command: &str) -> Option<String> {
             index += escaped.len_utf8();
             continue;
         }
+        if quote == b'"' && character == '\\' {
+            let next_index = index + character.len_utf8();
+            let Some(escaped) = command[next_index..].chars().next() else {
+                program.push(character);
+                break;
+            };
+            if matches!(escaped, '\\' | '"' | '$' | '`') {
+                program.push(escaped);
+                index = next_index + escaped.len_utf8();
+                continue;
+            }
+        }
         program.push(character);
         index += character.len_utf8();
     }
@@ -10548,6 +10708,10 @@ fn is_dcg_program_basename(program: &str) -> bool {
         })
         .unwrap_or(basename);
     stem.eq_ignore_ascii_case("dcg")
+        || (std::path::Path::new(program).is_absolute()
+            && std::env::current_exe()
+                .ok()
+                .is_some_and(|current| current == std::path::Path::new(program)))
 }
 
 fn dcg_command_program(cmd: &str) -> Option<String> {
@@ -10607,10 +10771,12 @@ fn is_dcg_command(cmd: &str) -> bool {
     dcg_command_program(cmd).is_some()
 }
 
+#[cfg(test)]
 fn is_dcg_hook_entry(entry: &serde_json::Value) -> bool {
     is_dcg_hook_entry_for_matcher(entry, CLAUDE_SHELL_MATCHER)
 }
 
+#[cfg(test)]
 fn is_dcg_hook_entry_for_matcher(entry: &serde_json::Value, matcher: &str) -> bool {
     entry
         .get("matcher")
@@ -10626,6 +10792,21 @@ fn is_dcg_hook_entry_for_matcher(entry: &serde_json::Value, matcher: &str) -> bo
                         .is_some_and(is_dcg_command)
                 })
             })
+}
+
+fn is_exact_hook_entry_for_matcher(
+    entry: &serde_json::Value,
+    matcher: &str,
+    desired_hook: &serde_json::Value,
+) -> bool {
+    entry
+        .get("matcher")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|entry_matcher| entry_matcher == matcher)
+        && entry
+            .get("hooks")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|hooks| hooks.iter().any(|hook| hook == desired_hook))
 }
 
 fn remove_dcg_hooks_from_pre_tool_use(pre_tool_use: &mut Vec<serde_json::Value>) -> bool {
@@ -10820,12 +11001,13 @@ fn install_dcg_hook_into_settings(
     settings: &mut serde_json::Value,
     force: bool,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    let desired_hook = claude_dcg_hook()?;
     install_dcg_hook_for_matcher(
         settings,
         force,
         CLAUDE_SHELL_MATCHER,
         &[LEGACY_CLAUDE_SHELL_MATCHER],
-        claude_dcg_hook(),
+        desired_hook,
     )
 }
 
@@ -10833,12 +11015,13 @@ fn install_antigravity_hook_into_settings(
     settings: &mut serde_json::Value,
     force: bool,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    let desired_hook = antigravity_dcg_hook()?;
     install_dcg_hook_for_matcher(
         settings,
         force,
         ANTIGRAVITY_SHELL_MATCHER,
         &[],
-        antigravity_dcg_hook(),
+        desired_hook,
     )
 }
 
@@ -10927,19 +11110,18 @@ fn install_hook(force: bool, project: bool) -> Result<(), Box<dyn std::error::Er
 ///
 /// Resolves the dcg binary path via `current_exe()` so the installed hook
 /// always points at the same executable that was used to install it
-/// (matching Claude's installer behavior). Falls back to bare `"dcg"` when
-/// the exe path is unavailable — Grok will then resolve it via PATH.
+/// (matching Claude's installer behavior). Resolution errors are fatal rather
+/// than falling back to PATH, because agent hook environments do not reliably
+/// inherit interactive-shell PATH entries.
 ///
 /// The `matcher: "Bash"` field uses Grok's documented Claude-compat alias
 /// which Grok internally rewrites to `run_terminal_cmd` before dispatching.
 /// Timeout matches dcg's hook fast-path budget (well under 5s in practice).
-fn build_grok_hook_config() -> serde_json::Value {
-    let dcg_cmd = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.to_str().map(str::to_string))
-        .unwrap_or_else(|| "dcg".to_string());
+fn build_grok_hook_config() -> std::io::Result<serde_json::Value> {
+    let executable = current_dcg_executable()?;
+    let dcg_cmd = hook_command_for_executable(&executable)?;
 
-    serde_json::json!({
+    Ok(serde_json::json!({
         "description": "dcg (Destructive Command Guard) — blocks rm -rf, git reset --hard, force pushes, DROP DATABASE, kubectl delete, and similar destructive commands before Grok's run_terminal_cmd tool can execute them.",
         "hooks": {
             "PreToolUse": [
@@ -10955,7 +11137,7 @@ fn build_grok_hook_config() -> serde_json::Value {
                 }
             ]
         }
-    })
+    }))
 }
 
 /// Install the dcg hook into Grok's hook directory.
@@ -10990,7 +11172,7 @@ fn install_grok_hook(force: bool, project: bool) -> Result<(), Box<dyn std::erro
         std::fs::create_dir_all(parent)?;
     }
 
-    let body = build_grok_hook_config();
+    let body = build_grok_hook_config()?;
     let content = serde_json::to_string_pretty(&body)?;
     std::fs::write(&hook_path, content)?;
 
@@ -11024,8 +11206,8 @@ fn install_grok_hook(force: bool, project: bool) -> Result<(), Box<dyn std::erro
 /// `~/.gemini/config/hooks.json` (canonical post-migration path; the legacy
 /// `~/.gemini/antigravity-cli/hooks.json` is symlinked to it). The file uses
 /// the same `{"hooks":{"PreToolUse":[{"matcher":...,"hooks":[{"type":
-/// "command","command":"dcg"}]}]}}` shape as Claude's `settings.json`, while
-/// retaining agy's Bash-only matcher. When dcg returns a block decision
+/// "command","command":"/absolute/path/to/dcg"}]}]}}` shape as Claude's
+/// `settings.json`, while retaining agy's Bash-only matcher. When dcg returns a block decision
 /// (stdout `{"decision":"block",...}`), `agy` aborts its `run_command` tool.
 ///
 /// With `--project`, writes to `<repo>/.gemini/config/hooks.json` instead.
@@ -11122,7 +11304,7 @@ const DCG_SHELL_CHECK_SNIPPET: &str = r#"
 # dcg: warn if hook was silently removed from Claude Code settings
 if command -v dcg &>/dev/null && command -v jq &>/dev/null; then
   if [ -f "$HOME/.claude/settings.json" ] && \
-     ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | test("dcg$"))' \
+     ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | test("dcg\"?$"))' \
        "$HOME/.claude/settings.json" &>/dev/null; then
     printf '\033[1;33m[dcg] Hook missing from ~/.claude/settings.json — run: dcg install\033[0m\n'
   fi
@@ -11723,39 +11905,74 @@ fn self_update_unix(update: UpdateCommand) -> Result<(), Box<dyn std::error::Err
 }
 
 const WINDOWS_UPDATE_RUNNER: &str = r#"[CmdletBinding()]
-param(
-  [Parameter(Mandatory = $true)][UInt32]$ParentProcessId,
-  [Parameter(Mandatory = $true)][string]$InstallerPath,
-  [Parameter(Mandatory = $true)][string]$InstallerArgumentsPath,
-  [Parameter(Mandatory = $true)][string]$CleanupDirectory
-)
+param()
 
 $ErrorActionPreference = 'Stop'
 $exitCode = 1
+$configurationPath = Join-Path $PSScriptRoot 'runner-config.json'
+$configuration = Get-Content -LiteralPath $configurationPath -Raw | ConvertFrom-Json
+$parentProcessId = [UInt32]$configuration.parent_process_id
+$installerPath = [string]$configuration.installer_path
+$cleanupDirectory = [string]$configuration.cleanup_directory
+$logPath = [string]$configuration.log_path
+
+# Windows PowerShell 5.1 returns a JSON array as one Object[] pipeline object.
+# Casting that object directly to [string[]] produces one flattened string such
+# as "-Version v0.7.3 -Verify". Explicit pipeline enumeration preserves argv.
+[string[]]$installerArguments = @(
+  $configuration.installer_arguments | ForEach-Object { [string]$_ }
+)
+
+function Add-DcgUpdateLog {
+  param(
+    [Parameter(Mandatory = $true)]
+    [AllowEmptyString()]
+    [string]$Message
+  )
+  $line = $Message + [Environment]::NewLine
+  [IO.File]::AppendAllText($logPath, $line, [Text.UTF8Encoding]::new($false))
+}
+
 try {
-  $parentProcess = Get-Process -Id $ParentProcessId -ErrorAction SilentlyContinue
+  Add-DcgUpdateLog "dcg update worker started at $([DateTime]::UtcNow.ToString('o'))."
+  $parentProcess = if ($parentProcessId -le [UInt32][Int32]::MaxValue) {
+    Get-Process -Id ([Int32]$parentProcessId) -ErrorAction SilentlyContinue
+  } else {
+    $null
+  }
   if ($null -ne $parentProcess) {
     $parentProcess | Wait-Process -ErrorAction SilentlyContinue
   }
 
-  [string[]]$installerArguments = @(
-    Get-Content -LiteralPath $InstallerArgumentsPath -Raw |
-      ConvertFrom-Json
-  )
-  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $InstallerPath @installerArguments
+  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installerPath @installerArguments 2>&1 |
+    ForEach-Object { Add-DcgUpdateLog ([string]$_) }
   $exitCode = $LASTEXITCODE
   if ($exitCode -eq 0) {
-    Write-Output 'dcg update completed successfully.'
+    Add-DcgUpdateLog 'dcg update completed successfully.'
   } else {
-    Write-Error "dcg update installer exited with code $exitCode."
+    Add-DcgUpdateLog "dcg update installer exited with code $exitCode."
   }
 } catch {
-  Write-Error "dcg update failed: $($_.Exception.Message)"
+  Add-DcgUpdateLog "dcg update failed: $($_.Exception.Message)"
   $exitCode = 1
 } finally {
-  Remove-Item -LiteralPath $CleanupDirectory -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $cleanupDirectory -Recurse -Force -ErrorAction SilentlyContinue
 }
 exit $exitCode
+"#;
+
+const WINDOWS_UPDATE_CIM_LAUNCHER: &str = r#"$ErrorActionPreference = 'Stop'
+$commandLine = $env:DCG_UPDATE_WORKER_COMMAND
+if ([string]::IsNullOrWhiteSpace($commandLine)) {
+  throw 'DCG_UPDATE_WORKER_COMMAND is empty'
+}
+$created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+  CommandLine = $commandLine
+}
+if ([UInt32]$created.ReturnValue -ne 0) {
+  throw "Win32_Process.Create failed with code $($created.ReturnValue)"
+}
+Write-Output ([string]$created.ProcessId)
 "#;
 
 fn windows_update_log_path() -> std::path::PathBuf {
@@ -11765,16 +11982,144 @@ fn windows_update_log_path() -> std::path::PathBuf {
         .join("update.log")
 }
 
-fn self_update_windows(update: UpdateCommand) -> Result<(), Box<dyn std::error::Error>> {
-    if update.system
-        || update.from_source
-        || update.quiet
-        || update.no_gum
-        || update.force
-        || update.no_configure
+fn windows_update_installer_arguments(update: &UpdateCommand, normalized_tag: &str) -> Vec<String> {
+    let mut args = vec!["-Version".to_string(), normalized_tag.to_string()];
+    if let Some(dest) = &update.dest {
+        args.push("-Dest".to_string());
+        args.push(dest.to_string_lossy().into_owned());
+    }
+    if update.easy_mode {
+        args.push("-EasyMode".to_string());
+    }
+    if update.verify {
+        args.push("-Verify".to_string());
+    }
+    if update.no_configure {
+        args.push("-NoConfigure".to_string());
+    }
+    args
+}
+
+fn windows_update_worker_command_line(
+    runner_path: &std::path::Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let runner = runner_path
+        .to_str()
+        .ok_or("Windows update runner path is not valid Unicode")?;
+    if runner.contains('"') {
+        return Err("Windows update runner path contains an invalid quote".into());
+    }
+    Ok(format!(
+        "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{runner}\""
+    ))
+}
+
+fn launch_windows_update_worker_via_cim(
+    worker_command_line: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let output = std::process::Command::new("powershell.exe")
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-Command")
+        .arg(WINDOWS_UPDATE_CIM_LAUNCHER)
+        .env("DCG_UPDATE_WORKER_COMMAND", worker_command_line)
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Err(format!(
+        "Win32_Process.Create could not launch the update worker (status {}): {}{}",
+        output.status,
+        stdout.trim(),
+        stderr.trim()
+    )
+    .into())
+}
+
+fn launch_windows_update_worker_direct(
+    runner_path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    fn runner_command(runner_path: &std::path::Path) -> std::process::Command {
+        let mut runner = std::process::Command::new("powershell.exe");
+        runner
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-File")
+            .arg(runner_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        runner
+    }
+
+    #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt as _;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        // CREATE_BREAKAWAY_FROM_JOB is ignored when combined with
+        // DETACHED_PROCESS. Try a real job breakaway first, then fall back to
+        // the original detached launch when the host job disallows breakaway.
+        let mut breakaway = runner_command(runner_path);
+        breakaway.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB);
+        match breakaway.spawn() {
+            Ok(_) => return Ok(()),
+            Err(breakaway_error) => {
+                let mut detached = runner_command(runner_path);
+                detached.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+                detached.spawn().map_err(|detached_error| {
+                    format!(
+                        "job-breakaway worker failed ({breakaway_error}); \
+                         detached worker failed ({detached_error})"
+                    )
+                })?;
+                return Ok(());
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        runner_command(runner_path).spawn()?;
+        Ok(())
+    }
+}
+
+fn launch_windows_update_worker(
+    runner_path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let worker_command_line = windows_update_worker_command_line(runner_path)?;
+    match launch_windows_update_worker_via_cim(&worker_command_line) {
+        Ok(()) => Ok(()),
+        Err(cim_error) => {
+            eprintln!(
+                "dcg update: resilient Win32_Process launch failed ({cim_error}); \
+                 falling back to a detached worker."
+            );
+            launch_windows_update_worker_direct(runner_path).map_err(|direct_error| {
+                format!(
+                    "Failed to launch Windows update worker via Win32_Process ({cim_error}) \
+                     or direct process creation ({direct_error})"
+                )
+                .into()
+            })
+        }
+    }
+}
+
+fn self_update_windows(update: UpdateCommand) -> Result<(), Box<dyn std::error::Error>> {
+    if update.system || update.from_source || update.quiet || update.no_gum || update.force {
         return Err(
-            "Windows updater supports only --version, --dest, --easy-mode, and --verify.".into(),
+            "Windows updater supports only --version, --dest, --easy-mode, --verify, and \
+             --no-configure."
+                .into(),
         );
     }
 
@@ -11791,64 +12136,28 @@ fn self_update_windows(update: UpdateCommand) -> Result<(), Box<dyn std::error::
 
     eprintln!("dcg update: downloading and verifying install.ps1 from {normalized_tag}.");
 
-    let mut args: Vec<String> = Vec::new();
-
-    args.push("-Version".to_string());
-    args.push(normalized_tag.clone());
-    if let Some(dest) = update.dest {
-        args.push("-Dest".to_string());
-        args.push(dest.to_string_lossy().into_owned());
-    }
-    if update.easy_mode {
-        args.push("-EasyMode".to_string());
-    }
-    if update.verify {
-        args.push("-Verify".to_string());
-    }
+    let args = windows_update_installer_arguments(&update, &normalized_tag);
 
     let (temp_dir, script_path) =
         download_verified_installer(&script_url, &sha_url, "install.ps1")?;
     let runner_path = temp_dir.path().join("run-update-after-exit.ps1");
-    let arguments_path = temp_dir.path().join("installer-arguments.json");
+    let configuration_path = temp_dir.path().join("runner-config.json");
     std::fs::write(&runner_path, WINDOWS_UPDATE_RUNNER)?;
-    std::fs::write(&arguments_path, serde_json::to_vec(&args)?)?;
 
     let log_path = windows_update_log_path();
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
-    let stderr_log = log.try_clone()?;
+    let configuration = serde_json::json!({
+        "parent_process_id": std::process::id(),
+        "installer_path": script_path,
+        "installer_arguments": args,
+        "cleanup_directory": temp_dir.path(),
+        "log_path": log_path,
+    });
+    std::fs::write(&configuration_path, serde_json::to_vec(&configuration)?)?;
 
-    let mut runner = std::process::Command::new("powershell.exe");
-    runner
-        .arg("-NoProfile")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-File")
-        .arg(&runner_path)
-        .arg("-ParentProcessId")
-        .arg(std::process::id().to_string())
-        .arg("-InstallerPath")
-        .arg(&script_path)
-        .arg("-InstallerArgumentsPath")
-        .arg(&arguments_path)
-        .arg("-CleanupDirectory")
-        .arg(temp_dir.path())
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::from(log))
-        .stderr(std::process::Stdio::from(stderr_log));
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt as _;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        runner.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-    }
-    runner.spawn()?;
+    launch_windows_update_worker(&runner_path)?;
     let _persisted_temp_dir = temp_dir.persist();
 
     eprintln!(
@@ -11984,23 +12293,30 @@ fn check_hook_registered() -> Result<bool, Box<dyn std::error::Error>> {
 
     let content = std::fs::read_to_string(&settings_path)?;
     let settings: serde_json::Value = serde_json::from_str(&content)?;
+    let desired_hook = claude_dcg_hook()?;
 
     let registered = settings
         .get("hooks")
         .and_then(|h| h.get("PreToolUse"))
         .and_then(|arr| arr.as_array())
-        .is_some_and(|a| a.iter().any(is_dcg_hook_entry));
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                is_exact_hook_entry_for_matcher(entry, CLAUDE_SHELL_MATCHER, &desired_hook)
+            })
+        });
 
     Ok(registered)
 }
 
-/// Ensure the DCG hook is registered in `~/.claude/settings.json`.
+/// Ensure the DCG hook is registered in `~/.claude/settings.json` with the
+/// current absolute executable path.
 ///
 /// This is the self-healing mechanism that protects against Claude Code
-/// silently overwriting `settings.json` mid-session (removing the DCG hook).
+/// silently overwriting `settings.json` mid-session (removing the DCG hook),
+/// and against older PATH-dependent hook entries.
 ///
-/// Called on every hook invocation when `general.self_heal_hook` is enabled.
-/// If the hook entry is missing, it is silently re-registered and a warning
+/// Called on every hook invocation when `general.self_heal_hook` is enabled. If
+/// the hook entry is missing or stale, it is silently repaired and a warning
 /// is emitted to stderr.
 ///
 /// Design constraints:
@@ -12028,29 +12344,34 @@ fn ensure_hook_registered_inner() -> Result<(), Box<dyn std::error::Error>> {
 
     let content = std::fs::read_to_string(&settings_path)?;
     let mut settings: serde_json::Value = serde_json::from_str(&content)?;
+    let desired_hook = claude_dcg_hook()?;
 
     let is_registered = settings
         .get("hooks")
         .and_then(|h| h.get("PreToolUse"))
         .and_then(|arr| arr.as_array())
-        .is_some_and(|a| a.iter().any(is_dcg_hook_entry));
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                is_exact_hook_entry_for_matcher(entry, CLAUDE_SHELL_MATCHER, &desired_hook)
+            })
+        });
 
     if is_registered {
         // Fast path: hook is present, nothing to do.
         return Ok(());
     }
 
-    // Hook was removed — re-register it.
+    // Hook was removed or still uses a stale/PATH-dependent command — repair it.
     let changed = install_dcg_hook_into_settings(&mut settings, false)?;
     if changed {
         let new_content = serde_json::to_string_pretty(&settings)?;
         std::fs::write(&settings_path, new_content)?;
         eprintln!(
-            "[dcg] \x1b[1;33mWarning: DCG hook was missing from {} — re-registered automatically.\x1b[0m",
+            "[dcg] \x1b[1;33mWarning: DCG hook was missing or stale in {} — repaired automatically.\x1b[0m",
             settings_path.display()
         );
         eprintln!(
-            "[dcg] \x1b[1;33mThis usually means Claude Code overwrote settings.json mid-session.\x1b[0m"
+            "[dcg] \x1b[1;33mThis can mean Claude Code rewrote settings.json or an older hook relied on PATH.\x1b[0m"
         );
     }
 
@@ -12149,6 +12470,7 @@ fn diagnose_hook_wiring() -> HookDiagnostics {
         diag.settings_valid = false;
         return diag;
     };
+    let desired_hook = claude_dcg_hook();
 
     // Analyze each entry
     for entry in entries {
@@ -12189,6 +12511,20 @@ fn diagnose_hook_wiring() -> HookDiagnostics {
                             "{cmd} (expected a synchronous command hook with the platform-safe shell)"
                         ));
                     }
+                    match &desired_hook {
+                        Ok(expected) if hook != expected => {
+                            diag.misconfigured_hooks.push(format!(
+                                "{cmd} (hook does not invoke this dcg executable with \
+                                 platform-safe quoting)"
+                            ));
+                        }
+                        Err(error) => {
+                            diag.misconfigured_hooks.push(format!(
+                                "{cmd} (could not resolve the running dcg executable: {error})"
+                            ));
+                        }
+                        Ok(_) => {}
+                    }
 
                     // Resolve the executable token rather than testing the
                     // entire wrapper string (`& 'C:\...\dcg.exe'`). This also
@@ -12196,7 +12532,12 @@ fn diagnose_hook_wiring() -> HookDiagnostics {
                     // containing spaces.
                     if let Some(program) = dcg_command_program(cmd) {
                         let path = std::path::Path::new(&program);
-                        if path.is_absolute() && !path.exists() {
+                        if !path.is_absolute() {
+                            diag.misconfigured_hooks.push(format!(
+                                "{cmd} (the hook executable must be an absolute path; \
+                                 agent hook shells do not inherit the interactive PATH)"
+                            ));
+                        } else if !path.is_file() {
                             diag.missing_executable_hooks.push(program);
                         }
                     }
@@ -15240,12 +15581,10 @@ mod tests {
     }
 
     fn make_dcg_entry() -> serde_json::Value {
+        let hook = claude_dcg_hook().expect("current executable resolves");
         serde_json::json!({
             "matcher": CLAUDE_SHELL_MATCHER,
-            "hooks": [{
-                "type": "command",
-                "command": "dcg"
-            }]
+            "hooks": [hook]
         })
     }
 
@@ -15264,9 +15603,11 @@ mod tests {
 
     #[test]
     fn claude_hook_command_is_platform_safe() {
-        let hook = claude_dcg_hook();
+        let executable = current_dcg_executable().expect("current executable");
+        let hook = claude_dcg_hook().expect("hook generation");
         let command = hook["command"].as_str().expect("hook command");
-        assert!(is_dcg_command(command));
+        let parsed_program = dcg_command_program(command).expect("dcg program");
+        assert_eq!(std::path::Path::new(&parsed_program), executable);
 
         #[cfg(windows)]
         {
@@ -15276,9 +15617,40 @@ mod tests {
 
         #[cfg(not(windows))]
         {
-            assert_eq!(command, "dcg");
+            assert_ne!(command, "dcg");
             assert!(hook.get("shell").is_none());
         }
+    }
+
+    #[test]
+    fn grok_hook_command_is_platform_safe() {
+        let executable = current_dcg_executable().expect("current executable");
+        let config = build_grok_hook_config().expect("Grok hook generation");
+        let command = config["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("Grok hook command");
+        let parsed_program = dcg_command_program(command).expect("dcg program");
+        assert_eq!(std::path::Path::new(&parsed_program), executable);
+        assert_ne!(command, "dcg");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_hook_quoting_round_trips_shell_metacharacters() {
+        let executable =
+            std::path::Path::new("/tmp/space dollar$ backtick` quote\" slash\\ apostrophe'/dcg");
+        let hook = claude_dcg_hook_for_executable(executable).expect("hook generation");
+        let command = hook["command"].as_str().expect("hook command");
+        assert_eq!(dcg_command_program(command).as_deref(), executable.to_str());
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &format!("set -- {command}; printf %s \"$1\"")])
+            .output()
+            .expect("run /bin/sh");
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("UTF-8 shell output"),
+            executable.to_str().expect("UTF-8 fixture")
+        );
     }
 
     #[test]
@@ -15334,6 +15706,37 @@ mod tests {
     }
 
     #[test]
+    fn install_into_settings_replaces_bare_dcg_without_force() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": CLAUDE_SHELL_MATCHER,
+                    "hooks": [
+                        { "type": "command", "command": "dcg" },
+                        { "type": "command", "command": "coexisting-hook" }
+                    ]
+                }]
+            }
+        });
+
+        let changed = install_dcg_hook_into_settings(&mut settings, false)
+            .expect("bare hook migration succeeds");
+        assert!(changed, "a PATH-dependent hook must be migrated");
+
+        let entry = &settings["hooks"]["PreToolUse"][0];
+        assert_eq!(entry["hooks"][0], claude_dcg_hook().expect("desired hook"));
+        assert_eq!(entry["hooks"][1]["command"], "coexisting-hook");
+
+        let command = entry["hooks"][0]["command"].as_str().expect("hook command");
+        let program = dcg_command_program(command).expect("dcg executable");
+        assert!(std::path::Path::new(&program).is_absolute());
+
+        let changed_again =
+            install_dcg_hook_into_settings(&mut settings, false).expect("second install succeeds");
+        assert!(!changed_again, "absolute hook migration must be idempotent");
+    }
+
+    #[test]
     fn install_into_settings_migrates_legacy_bash_hook_without_widening_siblings() {
         let mut settings = serde_json::json!({
             "hooks": {
@@ -15357,7 +15760,7 @@ mod tests {
             1
         );
         assert_eq!(pre[0]["matcher"], CLAUDE_SHELL_MATCHER);
-        assert_eq!(pre[0]["hooks"][0]["command"], "dcg");
+        assert_eq!(pre[0]["hooks"][0], claude_dcg_hook().expect("desired hook"));
 
         let legacy = pre
             .iter()
@@ -15422,7 +15825,7 @@ mod tests {
 
         let entry = &settings["hooks"]["PreToolUse"][0];
         assert_eq!(entry["customField"], "preserve");
-        assert_eq!(entry["hooks"][0]["command"], "dcg");
+        assert_eq!(entry["hooks"][0], claude_dcg_hook().expect("desired hook"));
         assert_eq!(entry["hooks"][1]["command"], "other-hook");
     }
 
@@ -15975,7 +16378,101 @@ mod tests {
         assert!(wait < install);
         assert!(WINDOWS_UPDATE_RUNNER.contains("if ($null -ne $parentProcess)"));
         assert!(WINDOWS_UPDATE_RUNNER.contains("ConvertFrom-Json"));
-        assert!(WINDOWS_UPDATE_RUNNER.contains("Remove-Item -LiteralPath $CleanupDirectory"));
+        assert!(
+            WINDOWS_UPDATE_RUNNER
+                .contains("$configuration.installer_arguments | ForEach-Object { [string]$_ }"),
+            "PowerShell 5.1 JSON arrays must be explicitly enumerated into argv"
+        );
+        assert!(
+            WINDOWS_UPDATE_RUNNER.contains("[AllowEmptyString()]"),
+            "installer output may contain blank lines"
+        );
+        assert!(WINDOWS_UPDATE_RUNNER.contains("Remove-Item -LiteralPath $cleanupDirectory"));
+        assert!(WINDOWS_UPDATE_RUNNER.contains("dcg update completed successfully."));
+    }
+
+    #[test]
+    fn windows_update_uses_cim_worker_that_survives_parent_jobs() {
+        assert!(WINDOWS_UPDATE_CIM_LAUNCHER.contains("Invoke-CimMethod"));
+        assert!(WINDOWS_UPDATE_CIM_LAUNCHER.contains("Win32_Process"));
+        assert!(WINDOWS_UPDATE_CIM_LAUNCHER.contains("MethodName Create"));
+        assert!(WINDOWS_UPDATE_CIM_LAUNCHER.contains("ReturnValue"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_update_runner_parses_in_windows_powershell() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = temp.path().join("run-update-after-exit.ps1");
+        std::fs::write(&runner, WINDOWS_UPDATE_RUNNER).unwrap();
+        let parser_probe = r#"$tokens = $null
+$errors = $null
+[Management.Automation.Language.Parser]::ParseFile(
+  $env:DCG_UPDATE_RUNNER_PARSE_PATH,
+  [ref]$tokens,
+  [ref]$errors
+) | Out-Null
+if ($errors.Count -ne 0) {
+  $errors | ForEach-Object { Write-Error ([string]$_) }
+  exit 1
+}"#;
+        let output = std::process::Command::new("powershell.exe")
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-Command")
+            .arg(parser_probe)
+            .env("DCG_UPDATE_RUNNER_PARSE_PATH", &runner)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "runner parse failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn windows_update_worker_command_quotes_paths_with_spaces() {
+        let runner = std::path::Path::new(r"C:\Users\Jane Doe\AppData\Local\Temp\dcg\runner.ps1");
+        assert_eq!(
+            windows_update_worker_command_line(runner).unwrap(),
+            r#"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "C:\Users\Jane Doe\AppData\Local\Temp\dcg\runner.ps1""#
+        );
+        assert!(
+            windows_update_worker_command_line(std::path::Path::new(
+                "C:\\invalid\"path\\runner.ps1"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn windows_update_preserves_installer_argv_and_no_configure() {
+        let cli = Cli::parse_from([
+            "dcg",
+            "update",
+            "--version",
+            "v0.7.3",
+            "--dest",
+            r"C:\Program Files\dcg",
+            "--verify",
+            "--no-configure",
+        ]);
+        let Some(Command::Update(update)) = cli.command else {
+            unreachable!("Expected Update command");
+        };
+        assert_eq!(
+            windows_update_installer_arguments(&update, "v0.7.3"),
+            vec![
+                "-Version",
+                "v0.7.3",
+                "-Dest",
+                r"C:\Program Files\dcg",
+                "-Verify",
+                "-NoConfigure",
+            ]
+        );
     }
 
     #[test]
@@ -16123,8 +16620,10 @@ mod tests {
         let entry = &pre_tool_use[0];
         assert_eq!(entry["matcher"], "Bash");
         let cmd = &entry["hooks"][0];
-        assert_eq!(cmd["type"], "command");
-        assert_eq!(cmd["command"], "dcg");
+        assert_eq!(
+            cmd,
+            &antigravity_dcg_hook().expect("desired Antigravity hook")
+        );
 
         // The written entry must be recognized as a dcg hook (idempotency).
         assert!(is_dcg_hook_entry_for_matcher(
@@ -17651,9 +18150,43 @@ exclude = ["target/**"]
     }
 
     #[test]
+    fn test_cli_parse_test_with_enforced_hook_budget() {
+        let cli = Cli::try_parse_from([
+            "dcg",
+            "test",
+            "--enforce-budget",
+            "--format",
+            "json",
+            "git status",
+        ])
+        .expect("parse");
+        if let Some(Command::TestCommand {
+            command,
+            enforce_budget,
+            ..
+        }) = cli.command
+        {
+            assert_eq!(command.as_deref(), Some("git status"));
+            assert!(enforce_budget);
+        } else {
+            unreachable!("Expected TestCommand");
+        }
+        assert!(
+            Cli::try_parse_from(["dcg", "test", "--enforce-budget", "--explain", "git status"])
+                .is_err()
+        );
+    }
+
+    #[test]
     fn test_cli_parse_test_without_force_flag() {
         let cli = Cli::try_parse_from(["dcg", "test", "git status"]).expect("parse");
-        if let Some(Command::TestCommand { force, .. }) = cli.command {
+        if let Some(Command::TestCommand {
+            enforce_budget,
+            force,
+            ..
+        }) = cli.command
+        {
+            assert!(!enforce_budget);
             assert!(!force);
         } else {
             unreachable!("Expected TestCommand");
@@ -18364,14 +18897,7 @@ exclude = ["target/**"]
         // Test the JSON parsing logic by calling the internal helpers
         let settings = serde_json::json!({
             "hooks": {
-                "PreToolUse": [
-                    {
-                        "matcher": CLAUDE_SHELL_MATCHER,
-                        "hooks": [
-                            { "type": "command", "command": "dcg" }
-                        ]
-                    }
-                ]
+                "PreToolUse": [make_dcg_entry()]
             }
         });
 
@@ -18795,10 +19321,7 @@ exclude = ["target/**"]
     fn self_heal_noop_when_hook_present() {
         let mut settings = serde_json::json!({
             "hooks": {
-                "PreToolUse": [{
-                    "matcher": CLAUDE_SHELL_MATCHER,
-                    "hooks": [{"type": "command", "command": "dcg"}]
-                }]
+                "PreToolUse": [make_dcg_entry()]
             }
         });
 

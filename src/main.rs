@@ -1038,23 +1038,11 @@ fn print_help() {
     eprintln!();
     eprintln!(
         "    {}",
-        "╭──────────────────────────────────────────────────────────────╮".bright_black()
+        "Hook commands must use the resolved absolute dcg executable path.".white()
     );
     eprintln!(
-        "    {} {} {}",
-        "│".bright_black(),
-        r#"{"hooks":{"PreToolUse":[{"matcher":"Bash|PowerShell","#.white(),
-        "│".bright_black()
-    );
-    eprintln!(
-        "    {}   {} {}",
-        "│".bright_black(),
-        r#""hooks":[{"type":"command","command":"dcg"}]}]}}"#.white(),
-        "│".bright_black()
-    );
-    eprintln!(
-        "    {}",
-        "╰──────────────────────────────────────────────────────────────╯".bright_black()
+        "    Run {} to install or repair it safely.",
+        "dcg install".green()
     );
     eprintln!();
 

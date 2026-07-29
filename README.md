@@ -720,7 +720,7 @@ An automatically discovered `.dcg.toml` is intentionally **not** a normal
 precedence layer. A repository is untrusted when it is first cloned, so its
 config may only add enforcement: enable built-in packs, add `deny` policy
 entries, opt into `general.fail_closed`, enable
-heredoc scanning, or turn off heredoc fail-open fallbacks. Settings that grant
+heredoc scanning, or turn off heredoc bounded fallbacks. Settings that grant
 trust or reduce coverage — including allow overrides, pack disables, custom
 pack paths, custom regex overrides (including block regexes), resource limits,
 language filters, agent profiles, and nested project overrides — are ignored
@@ -874,12 +874,21 @@ This fallback is specific to embedded-code extraction. It is not used for a raw
 hook envelope that could not be parsed, and it does not turn a deadline or an
 oversized extracted command into an allow.
 
-**Absolute Timeout**:
+**Absolute Evaluation Deadline**:
 
 To prevent any single command from blocking indefinitely, dcg enforces an
-absolute maximum processing time of **200ms**. Exhausting that budget produces
-an explicit indeterminate result, which requests operator review where the hook
-protocol supports it and otherwise blocks.
+end-to-end evaluation deadline. The ordinary default is **200ms**; the
+`careful_company_running_windows` preset defaults to **3000ms**, and an
+explicit `general.hook_timeout_ms` or `DCG_HOOK_TIMEOUT_MS` overrides either
+default (values below **10ms** are clamped to that safety minimum). Exhausting
+that budget produces an explicit indeterminate result, which requests operator
+review where the hook protocol supports it and otherwise blocks.
+
+The deadline intentionally uses monotonic wall-clock time. A CPU-time budget
+would stop advancing while dcg was descheduled or waiting on a bounded
+operation, so it could not guarantee hook latency. On a heavily loaded host,
+increase `hook_timeout_ms` and use `dcg test --enforce-budget` to exercise the
+same evaluator-side budget outside a live hook.
 
 ## Installation
 
@@ -927,7 +936,7 @@ curl -fsSL "https://raw.githubusercontent.com/Pimpmuckl/destructive_command_guar
 Install specific version:
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Pimpmuckl/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --version v0.7.3-codexpp.1
+curl -fsSL "https://raw.githubusercontent.com/Pimpmuckl/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --version v0.7.8-codexpp.1
 ```
 
 Install to /usr/local/bin (system-wide, requires sudo):
@@ -953,11 +962,14 @@ curl -fsSL "https://raw.githubusercontent.com/Pimpmuckl/destructive_command_guar
 The installer verifies each adjacent `.minisig` with the embedded release public
 key when `minisign` is available. A present but invalid signature is always fatal;
 `--require-minisign` also makes a missing sidecar or verifier fatal. The pinned key
-ID is `36B847D11BA5A0D0`. Trusted Sigstore cosign bundles are checked independently
-when available (manual releases may omit an Actions-OIDC bundle), and the SHA256
-checksum remains mandatory. The installer falls back to building from source if
-no prebuilt is available and removes the legacy Python predecessor
-(`git_safety_guard.py`) if present.
+ID for current releases is `69B3955C8D2E62A8`; the retired
+`36B847D11BA5A0D0` key is accepted only when installing v0.6.7. Trusted Sigstore
+cosign bundles are checked independently against either the pinned local-release
+public key or the repository's GitHub Actions OIDC identity, and the SHA256
+checksum remains mandatory. Cosign versions affected by CVE-2026-22703 are not
+trusted. The installer falls back to building from source if no prebuilt is
+available and removes the legacy Python predecessor (`git_safety_guard.py`) if
+present.
 
 <details>
 <summary>Agent-specific notes</summary>
@@ -989,7 +1001,7 @@ repository's known-good `nightly-2026-06-06` pin; the included
 rustup toolchain install nightly-2026-06-06
 
 # Install the tagged source reproducibly
-cargo +nightly-2026-06-06 install --locked --git https://github.com/Pimpmuckl/destructive_command_guard --tag v0.7.3-codexpp.1 destructive_command_guard
+cargo +nightly-2026-06-06 install --locked --git https://github.com/Pimpmuckl/destructive_command_guard --tag v0.7.8-codexpp.1 destructive_command_guard
 ```
 
 ### Manual build
@@ -1013,9 +1025,10 @@ dcg update
 Optional flags mirror the installer scripts (examples):
 
 ```bash
-dcg update --version v0.7.3-codexpp.1
+dcg update --version v0.7.8-codexpp.1
 dcg update --system
 dcg update --verify
+dcg update --verify --no-configure  # binary only; preserve existing hook wiring
 ```
 
 You can always re-run `install.sh` / `install.ps1` directly if preferred.
@@ -1080,7 +1093,7 @@ Add to `~/.claude/settings.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "dcg"
+            "command": "/absolute/path/to/dcg"
           }
         ]
       }
@@ -1088,6 +1101,12 @@ Add to `~/.claude/settings.json`:
   }
 }
 ```
+
+Replace `/absolute/path/to/dcg` with the exact output of `command -v dcg`.
+Never register a safety hook as bare `dcg`: agent hooks run under a
+non-interactive shell whose `PATH` may omit `~/.local/bin`, causing the hook to
+fail open. On native Windows, let `install.ps1` write the PowerShell-safe
+absolute invocation (`& 'C:\...\dcg.exe'` plus `"shell": "powershell"`).
 
 Claude Code exposes separate `Bash` and `PowerShell` shell tools on Windows, so
 the combined matcher is required for complete shell coverage. The native
@@ -1113,7 +1132,7 @@ merges this automatically, but the manual configuration lives at
         "hooks": [
           {
             "type": "command",
-            "command": "dcg"
+            "command": "/absolute/path/to/dcg"
           }
         ]
       }
@@ -1140,7 +1159,7 @@ Add to `~/.gemini/settings.json`:
           {
             "name": "dcg",
             "type": "command",
-            "command": "dcg",
+            "command": "/absolute/path/to/dcg",
             "timeout": 5000
           }
         ]
@@ -1189,6 +1208,9 @@ dcg test --with-packs containers.docker,database.postgresql "docker system prune
 # Read the candidate from stdin so it need not appear in dcg's own arguments
 dcg test --stdin --format json < candidate-command.txt
 
+# Apply the same wall-clock evaluation budget as the live hook
+dcg test --enforce-budget --config .dcg.prod.toml "git status"
+
 # Print full evaluation trace (same engine as `dcg explain`)
 dcg test --explain "git reset --hard"
 ```
@@ -1211,6 +1233,8 @@ dcg test --explain "git reset --hard"
 - `--no-heredoc-scan`: force-disable heredoc/inline-script scanning
 - `--heredoc-timeout <MS>`: override heredoc extraction timeout budget
 - `--heredoc-languages <LANG1,LANG2>`: limit heredoc AST scanning languages
+- `--enforce-budget`: apply the effective live-hook wall-clock deadline
+  (`general.hook_timeout_ms`, `DCG_HOOK_TIMEOUT_MS`, or the applicable default)
 
 #### Output Formats
 
@@ -2069,10 +2093,12 @@ dcg operates under strict latency constraints - every shell command passes throu
 | 5 | Language detect | < 20μs | > 50μs | > 200μs |
 | 6 | Full heredoc pipeline | < 5ms | > 15ms | > 20ms |
 
-Hook mode also has an absolute 200ms deadline. If that deadline is exhausted,
-dcg returns an explicit indeterminate decision: clients that support operator
-review receive `ask`, and clients without that state receive a blocking
-decision. A timeout never becomes a silent allow.
+Hook mode also has an absolute wall-clock evaluation deadline (ordinary
+default: 200ms; configurable). If that deadline is exhausted, dcg returns an
+explicit indeterminate decision: clients that support operator review receive
+`ask`, and clients without that state receive a blocking decision. A timeout
+never becomes a silent allow. Use `dcg test --enforce-budget` to apply the
+effective hook budget during a diagnostic test.
 
 **Bounded Evaluation Behavior**:
 
@@ -2463,7 +2489,7 @@ dcg setup --shell-check # Non-interactive — adds the check automatically
 # dcg: warn if hook was silently removed from Claude Code settings
 if command -v dcg &>/dev/null && command -v jq &>/dev/null; then
   if [ -f "$HOME/.claude/settings.json" ] && \
-     ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | test("dcg$"))' \
+     ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | test("dcg\"?$"))' \
        "$HOME/.claude/settings.json" &>/dev/null; then
     printf '\033[1;33m[dcg] Hook missing from ~/.claude/settings.json — run: dcg install\033[0m\n'
   fi
@@ -2701,8 +2727,11 @@ Triggered on version tags (`v*`):
 
 - Builds optimized binaries for 6 platforms:
   - Linux x86_64, statically linked with musl (`x86_64-unknown-linux-musl`)
+  - Linux ARM64 (`aarch64-unknown-linux-gnu`)
+  - macOS Intel (`x86_64-apple-darwin`)
   - macOS Apple Silicon (`aarch64-apple-darwin`)
   - Windows x64 (`x86_64-pc-windows-msvc`)
+  - Windows ARM64 (`aarch64-pc-windows-msvc`)
 - Creates `.tar.xz` archives (Unix) or `.zip` (Windows)
 - Generates SHA256 checksums for verification
 - Publishes to GitHub Releases with auto-generated release notes
