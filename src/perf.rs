@@ -27,7 +27,7 @@
 //!
 //! # Absolute Maximum
 //!
-//! Hook evaluation exceeding 200ms returns an explicit indeterminate decision;
+//! Hook evaluation exceeding 1000ms returns an explicit indeterminate decision;
 //! it never turns incomplete analysis into a silent allow.
 //! This ensures dcg never blocks a user's workflow indefinitely.
 
@@ -155,7 +155,9 @@ impl Deadline {
     /// Check if the deadline has been exceeded.
     #[must_use]
     pub fn is_exceeded(&self) -> bool {
-        self.start.elapsed() > self.max_duration
+        // `>=` so a zero-duration deadline is exceeded immediately even when
+        // the monotonic clock has not advanced between construction and check.
+        self.start.elapsed() >= self.max_duration
     }
 
     /// Get the remaining time before the deadline, or None if exceeded.
@@ -275,14 +277,20 @@ pub const FULL_HEREDOC_PIPELINE: Budget = Budget::from_ms(
 
 /// Absolute maximum time available to hook safety evaluation.
 /// Exhaustion produces an explicit indeterminate result rather than an allow.
-pub const ABSOLUTE_MAX: Duration = Duration::from_millis(200);
+pub const ABSOLUTE_MAX: Duration = Duration::from_millis(1_000);
 
 /// Hook evaluation time budget in milliseconds.
 ///
-/// Typical commands should complete in <10ms, but heredoc/inline-script
-/// analysis may take longer on pathological inputs. Exhaustion is surfaced as
-/// indeterminate so clients can request review or block conservatively.
-pub const HOOK_EVALUATION_BUDGET_MS: u64 = 200;
+/// Typical commands complete in well under 50ms, but a one-shot hook process
+/// pays lazy pattern compilation for every keyword-matched pack, and loaded
+/// hosts can multiply that cost. The previous 200ms default was exceeded
+/// *deterministically* by ordinary single-construct commands on fast hardware
+/// (#245, #248), turning routine agent commands into fail-closed review
+/// prompts. The deadline exists to catch pathological hangs (#189), which sit
+/// orders of magnitude above normal evaluation, so 1000ms preserves that
+/// backstop with real headroom. Exhaustion is still surfaced as indeterminate
+/// so clients can request review or block conservatively — never allow.
+pub const HOOK_EVALUATION_BUDGET_MS: u64 = 1_000;
 
 /// Hook evaluation time budget as a Duration.
 pub const HOOK_EVALUATION_BUDGET: Duration = Duration::from_millis(HOOK_EVALUATION_BUDGET_MS);
@@ -290,9 +298,9 @@ pub const HOOK_EVALUATION_BUDGET: Duration = Duration::from_millis(HOOK_EVALUATI
 /// Default hook budget when the broad Windows company preset is enabled.
 ///
 /// That preset activates enough packs that cold process startup and lazy
-/// pattern compilation can exceed 200ms on older Windows workstations. The
-/// larger budget lets the same fail-closed evaluation finish; it does not
-/// change any allow/deny rule.
+/// pattern compilation can exceed the ordinary 1000ms budget on older Windows
+/// workstations. The larger budget lets the same fail-closed evaluation
+/// finish; it does not change any allow/deny rule.
 pub const CAREFUL_COMPANY_HOOK_EVALUATION_BUDGET_MS: u64 = 3_000;
 
 /// Check whether a duration exceeds the absolute hook evaluation budget.
@@ -313,7 +321,7 @@ pub const FAST_PATH_BUDGET_US: u64 = 500;
 ///
 /// This mirrors the absolute hook deadline, not the Tier 6 benchmark panic
 /// threshold. Tier-specific heredoc budgets are defined above.
-pub const SLOW_PATH_BUDGET_MS: u64 = 200;
+pub const SLOW_PATH_BUDGET_MS: u64 = 1_000;
 
 /// Minimum hook evaluation timeout in milliseconds.
 ///
@@ -321,7 +329,7 @@ pub const SLOW_PATH_BUDGET_MS: u64 = 200;
 /// every request immediately into the indeterminate review/block path.
 ///
 /// 10ms is enough for the fast path (quick-reject + safe pattern matching)
-/// while being well below the default 200ms budget.
+/// while being well below the default 1000ms budget.
 pub const MIN_HOOK_TIMEOUT_MS: u64 = 10;
 
 #[cfg(test)]
@@ -358,9 +366,9 @@ mod tests {
 
     #[test]
     fn fail_open_threshold() {
-        assert!(!exceeds_absolute_budget(Duration::from_millis(199)));
-        assert!(!exceeds_absolute_budget(Duration::from_millis(200)));
-        assert!(exceeds_absolute_budget(Duration::from_millis(201)));
+        assert!(!exceeds_absolute_budget(Duration::from_millis(999)));
+        assert!(!exceeds_absolute_budget(Duration::from_millis(1_000)));
+        assert!(exceeds_absolute_budget(Duration::from_millis(1_001)));
     }
 
     #[test]
@@ -459,7 +467,7 @@ mod tests {
             "- Pattern match: < 1ms panic",
             "- Heredoc extract: < 2ms panic",
             "- Full heredoc pipeline: < 20ms panic",
-            "- Hook evaluation deadline: 200ms (exhaustion is indeterminate, never a silent allow)",
+            "- Hook evaluation deadline: 1000ms (exhaustion is indeterminate, never a silent allow)",
         ] {
             assert!(
                 agents.contains(expected),
@@ -469,7 +477,7 @@ mod tests {
 
         for expected in [
             "# - Full heredoc pipeline: 20ms panic",
-            "# - Hook evaluation deadline: 200ms (exhaustion is indeterminate, never a silent allow)",
+            "# - Hook evaluation deadline: 1000ms (exhaustion is indeterminate, never a silent allow)",
             "Full heredoc pipeline benchmark exceeds 20ms budget",
         ] {
             assert!(

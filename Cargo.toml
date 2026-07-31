@@ -1,6 +1,6 @@
 [package]
 name = "destructive_command_guard"
-version = "0.7.8-codexpp.1"
+version = "0.8.0-codexpp.1"
 edition = "2024"
 resolver = "2"
 authors = [
@@ -137,6 +137,29 @@ lto = true          # Link-time optimization across crates
 codegen-units = 1   # Single codegen unit for better optimization
 panic = "abort"     # Smaller binary, no unwinding overhead
 strip = true        # Remove debug symbols
+
+# The hook is a one-shot process: every enabled pack whose keywords match the
+# command compiles its full pattern set from scratch on each invocation.
+# Profiling (#245/#248) showed >90% of the ~150-200ms full-evaluation cost was
+# regex COMPILATION inside these crates, which `opt-level = "z"` slows several
+# fold. Building only the regex family for speed recovers most of that latency
+# while keeping the rest of the binary size-optimized.
+[profile.release.package.regex-automata]
+opt-level = 3
+[profile.release.package.regex-syntax]
+opt-level = 3
+[profile.release.package.regex]
+opt-level = 3
+[profile.release.package.fancy-regex]
+opt-level = 3
+[profile.release.package.aho-corasick]
+opt-level = 3
+[profile.release.package.memchr]
+opt-level = 3
+[profile.release.package.bit-set]
+opt-level = 3
+[profile.release.package.bit-vec]
+opt-level = 3
 
 [profile.dev]
 opt-level = 1       # Faster compile times during development

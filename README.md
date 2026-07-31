@@ -377,7 +377,7 @@ enabled = ["careful_company_running_windows"]
 ```
 
 With this exact preset ID enabled, the hook evaluation deadline defaults to
-3000 ms instead of the ordinary 200 ms unless config or
+3000 ms instead of the ordinary 1000 ms unless config or
 `DCG_HOOK_TIMEOUT_MS` explicitly supplies another value. This changes only the
 time available to reach the same fail-closed decision. Inspect the effective
 value and source with `dcg config --format json`.
@@ -676,7 +676,7 @@ Environment variables override config files (highest priority):
 - `DCG_HEREDOC_LANGUAGES=python,bash`: filter heredoc languages
 - `DCG_POLICY_DEFAULT_MODE=deny|ask|warn|log`: global default decision mode (`ask` requires native operator review and fails closed on unsupported clients)
 - `DCG_HOOK_TIMEOUT_MS=<milliseconds>`: explicit hook evaluation timeout
-  (ordinary default: 200; automatic
+  (ordinary default: 1000; automatic
   `careful_company_running_windows` preset default: 3000)
 
 ### Output Formats and `DCG_FORMAT`
@@ -877,7 +877,7 @@ oversized extracted command into an allow.
 **Absolute Evaluation Deadline**:
 
 To prevent any single command from blocking indefinitely, dcg enforces an
-end-to-end evaluation deadline. The ordinary default is **200ms**; the
+end-to-end evaluation deadline. The ordinary default is **1000ms**; the
 `careful_company_running_windows` preset defaults to **3000ms**, and an
 explicit `general.hook_timeout_ms` or `DCG_HOOK_TIMEOUT_MS` overrides either
 default (values below **10ms** are clamped to that safety minimum). Exhausting
@@ -2094,7 +2094,7 @@ dcg operates under strict latency constraints - every shell command passes throu
 | 6 | Full heredoc pipeline | < 5ms | > 15ms | > 20ms |
 
 Hook mode also has an absolute wall-clock evaluation deadline (ordinary
-default: 200ms; configurable). If that deadline is exhausted, dcg returns an
+default: 1000ms; configurable). If that deadline is exhausted, dcg returns an
 explicit indeterminate decision: clients that support operator review receive
 `ask`, and clients without that state receive a blocking decision. A timeout
 never becomes a silent allow. Use `dcg test --enforce-budget` to apply the

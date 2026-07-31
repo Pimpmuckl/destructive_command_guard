@@ -3924,8 +3924,8 @@ mod tests {
     fn split_command_segments_bounds_nested_unclosed_substitutions() {
         // Regression for #189: a destructive command followed by many nested,
         // *unterminated* `$(` sequences drove `find_matching_command_substitution`
-        // into 2^N re-scans, hanging the hook long past its 200ms budget and
-        // tripping agents' fail-open. The scanner must now stay linear.
+        // into 2^N re-scans, hanging the hook long past its evaluation budget
+        // and tripping agents' fail-open. The scanner must now stay linear.
         //
         // Under the pre-fix code this input took ~2^200 steps (effectively
         // forever); a generous wall-clock bound turns a regression into a hard

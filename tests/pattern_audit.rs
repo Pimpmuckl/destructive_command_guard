@@ -311,6 +311,7 @@ fn test_audit_backtracking_requirements() {
                 "mv-tmp",
                 "mv-tmpdir",
                 "mv-tmpdir-brace",
+                "mv-to-trash",
                 "mv-var-tmp",
                 "redirect-truncate-dynamic-path",
                 "redirect-truncate-root-home",

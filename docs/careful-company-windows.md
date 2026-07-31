@@ -41,7 +41,7 @@ and the default `system.disk` policy remains independent:
 enabled = ["careful_company_running_windows"]
 ```
 
-The ordinary hook deadline is 200 ms. Because this preset deliberately enables
+The ordinary hook deadline is 1000 ms. Because this preset deliberately enables
 a much larger reviewed pack set, dcg automatically uses a 3000 ms deadline when
 the preset ID is enabled and no explicit timeout is configured. This only gives
 the same fail-closed evaluation more time; it does not change a rule or permit a

@@ -180,7 +180,7 @@ TEST_ENV_XDG="$TEST_ENV_ROOT/xdg_config"
 mkdir -p "$TEST_ENV_HOME" "$TEST_ENV_XDG"
 
 # These assertions prove semantic allow/deny behavior, not the separately
-# tested 200 ms production evaluation deadline. On a heavily loaded host the
+# tested 1000 ms production evaluation deadline. On a heavily loaded host the
 # kernel can deschedule a fresh dcg process after its deadline starts and turn
 # the intended semantic result into an indeterminate blocking/ask response.
 # Keep a generous test-only deadline so this suite measures classification,

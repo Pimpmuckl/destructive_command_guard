@@ -126,7 +126,7 @@ agents](careful-company-windows.md).
 
 The preset receives a 3000 ms default hook deadline when no explicit
 `hook_timeout_ms` or `DCG_HOOK_TIMEOUT_MS` is present. The normal default
-remains 200 ms. This accommodates cold evaluation of the preset's pinned pack
+remains 1000 ms. This accommodates cold evaluation of the preset's pinned pack
 set on older Windows machines without weakening fail-closed behavior.
 
 `dcg scan` understands PowerShell (`.ps1`/`.psm1`/`.psd1`) and Windows batch

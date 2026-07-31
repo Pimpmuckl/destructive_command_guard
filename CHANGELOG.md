@@ -13,6 +13,92 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## Unreleased
 
+## [v0.8.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.8.0) -- 2026-07-31 [Release]
+
+### Hook latency (#245, #248)
+
+- Compile the regex-family crates (`regex-automata`, `regex-syntax`, `regex`,
+  `fancy-regex`, `aho-corasick`, `memchr`, `bit-set`, `bit-vec`) at
+  `opt-level = 3` in release builds. Profiling showed >90% of the ~150-200ms
+  full-evaluation cost was per-process lazy regex *compilation*, which
+  `opt-level = "z"` slows severalfold; full evaluation now measures ~40-45ms
+  on Apple Silicon (~4x faster) while the rest of the binary stays
+  size-optimized.
+- Raise the stock hook evaluation budget from 200ms to 1000ms. The old default
+  was exceeded deterministically by ordinary single-construct commands even on
+  fast hardware, turning routine agent commands into fail-closed review
+  prompts. The deadline exists to catch pathological hangs, which sit orders
+  of magnitude above normal evaluation; exhaustion still produces an explicit
+  indeterminate result, never an allow.
+
+### False positives
+
+- `[ -f x ]`, `[[ -d "$p/.git" ]]`, and every other POSIX test-bracket probe
+  no longer deny as `core.git:branch-force-delete` or as an unverified inline
+  launcher (#246). A lone `[`/`[[` (or `{`) cannot glob- or brace-expand into
+  a different executable, so it is now treated as the literal test builtin;
+  bracket expressions that close within the word (`gi[t]`) stay fail-closed.
+  Brace groups additionally require a `,`/`..` to count as expandable, so
+  xargs's `{}` placeholder is literal text.
+- The `branch-force-delete` regex walkers use `[ \t]+` separators so a benign
+  `git branch --list` line cannot bridge a newline into a `-d`-looking token
+  on a later line of the same submission (#246).
+- `cat repos.txt | xargs -P12 -I{} sh -c 'cd {} && git pull'` and other fixed
+  `xargs -I` templates are now evaluated recursively (placeholders masked as a
+  quoted variable expansion) instead of denying wholesale as "executable POSIX
+  pipeline consumer cannot be statically verified". Destructive templates
+  (`sh -c 'rm -rf {}'`), records in command position (`sh -c '{}'`,
+  `sh -c 'eval {}'`), GNU parallel's code-generating replacement grammar, and
+  positional-record templates remain fail-closed.
+- A tree-sitter recovery (`ERROR`) region only fails command-substitution
+  extraction closed when it could actually conceal `$(`/backtick syntax that
+  was not captured as a parsed node. Previously one unparseable fragment
+  anywhere in a submission produced the unactionable "POSIX command
+  substitution could not be parsed without shell-grammar recovery" deny
+  whenever any substitution appeared elsewhere in the command.
+- The literal temp-directory allowance now recognizes macOS's canonical
+  `/private/tmp` and `/private/var/tmp` forms (#244).
+- `mv <file> ~/.local/share/Trash/` (and `~/.Trash/`) — dcg's own suggested
+  soft-delete — is allowed for sources under a home directory, tmp family, or
+  relative paths; whole homes, sensitive system trees, traversal, and dynamic
+  paths stay blocked (#244).
+- A redirect whose `$VAR` target is proven by a single prior literal
+  assignment in the same command (`log=/tmp/run.log; cmd > "$log" 2>&1`,
+  including `$dir/suffix` forms) resolves statically instead of denying as
+  `redirect-truncate-dynamic-path`. The proof fails closed on reassignment,
+  variable-mutating builtins, non-fd-duplication trailing redirects, and any
+  resolved path outside the tmp family or a traversal-free relative path
+  (idea surfaced in PR #249; implemented independently).
+
+### False negatives
+
+- New `core.filesystem:rm-glob-home` rule (#247): non-recursive `rm` with an
+  unexpanded glob under a home directory (`rm -f ~/Downloads/*.md`,
+  `rm /Users/<u>/Documents/*.pdf`, `rm -f $HOME/*`) now requires approval.
+  The glob is the recursion: the shell, not the author, decides the file set.
+  Quoted (non-expanding) globs and single-file deletes are untouched.
+
+### Security-review hardening of the above
+
+A fresh-eyes review of this release's own additions closed four defects
+before publication:
+
+- The `$VAR` redirect proof accepted text concatenated directly after the
+  quoted target, so `: > "$log"/../../etc/passwd` was proven by `$log` alone;
+  the quoted token must now be the whole target word.
+- A fixed xargs template could splice records into `$(...)`, backticks,
+  process substitution, or arithmetic expansion — nested command contexts the
+  command-position scan cannot see. Substitution bodies are now enumerated
+  with the bounded tree-sitter view and any record inside one fails closed;
+  process substitution and arithmetic alongside a placeholder are refused.
+- `rm-glob-home`'s walker could bridge newlines (the same defect class fixed
+  in `branch-force-delete`), and its `\brm\b` anchor matched the `rm` of
+  `docker run --rm`; the walker now stops at newlines and the anchor refuses
+  a preceding hyphen.
+- `mv-to-trash` source and Trash-subpath tokens excluded whitespace but not
+  `;`/`|`/`&`, and its separators now use `[ \t]+` so tokens cannot span
+  command boundaries inside the safe match.
+
 ## [v0.7.8](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.8) -- 2026-07-28 [Release]
 
 ### Evaluation deadlines

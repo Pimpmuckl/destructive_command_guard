@@ -764,7 +764,7 @@ fn run_ast_match_with_timeout(
 
     // We don't `join` the handle on timeout — the worker may still hold a
     // tree-sitter parser mid-iteration and joining would block the hook past
-    // its 200ms hard ceiling. The cancellation flag bounds the worker's own
+    // its wall-clock deadline. The cancellation flag bounds the worker's own
     // wall clock so a leaked handle still terminates promptly on its next
     // `check_ast_timeout` call.
     let _worker = thread::Builder::new()

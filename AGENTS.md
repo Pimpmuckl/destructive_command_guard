@@ -784,7 +784,7 @@ Runs on push to main only (benchmarks are noisy on PRs). Checks performance budg
 - Pattern match: < 1ms panic
 - Heredoc extract: < 2ms panic
 - Full heredoc pipeline: < 20ms panic
-- Hook evaluation deadline: 200ms (exhaustion is indeterminate, never a silent allow)
+- Hook evaluation deadline: 1000ms (exhaustion is indeterminate, never a silent allow)
 
 ### UBS Static Analysis
 

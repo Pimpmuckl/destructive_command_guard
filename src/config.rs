@@ -4802,7 +4802,7 @@ impl Config {
     ///
     /// An explicit config or environment value always wins. The broad
     /// `careful_company_running_windows` preset gets a larger default because
-    /// its cold-start pack set can exceed the ordinary 200ms budget on older
+    /// its cold-start pack set can exceed the ordinary 1000ms budget on older
     /// Windows workstations.
     #[must_use]
     pub fn effective_hook_timeout_ms(&self) -> u64 {

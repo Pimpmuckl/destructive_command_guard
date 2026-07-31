@@ -242,7 +242,7 @@ function Get-BaseEnv {
         DCG_HISTORY_DB = $script:SandboxHistory
         DCG_HISTORY_DISABLED = "1"
         # This is a conformance suite, not a latency benchmark. Native process
-        # startup and cold pattern compilation can exceed the production 200ms
+        # startup and cold pattern compilation can exceed the production 1000ms
         # hook budget on older Windows hardware, which correctly produces an
         # indeterminate verdict but obscures the semantic assertion under test.
         DCG_HOOK_TIMEOUT_MS = "5000"

@@ -5443,6 +5443,33 @@ fn contains_dynamic_posix_substitution(raw: &str) -> bool {
         || raw.contains(crate::packs::core::git::POSIX_DYNAMIC_UNQUOTED)
 }
 
+/// Whether a decoded executable name contains shell syntax that can resolve to
+/// a different executable at runtime.
+///
+/// `[`/`{` count only when their closing delimiter appears later in the same
+/// name: a lone `[` (or `[[`) is the literal POSIX test builtin and a lone `{`
+/// is the compound-command reserved word — neither can glob- or brace-expand.
+/// Brace groups additionally need a `,`/`..` inside to expand, so xargs's
+/// conventional `{}` replacement token is literal text.
+fn posix_executable_name_may_expand(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.iter().enumerate().any(|(index, byte)| match byte {
+        b'$' | b'`' | b'*' | b'?' | b'(' | b')' => true,
+        b'[' => bytes[index + 1..].contains(&b']'),
+        b'{' => {
+            let remainder = &bytes[index + 1..];
+            remainder
+                .iter()
+                .position(|&b| b == b'}')
+                .is_some_and(|close| {
+                    let inner = &remainder[..close];
+                    inner.contains(&b',') || inner.windows(2).any(|pair| pair == b"..")
+                })
+        }
+        _ => false,
+    })
+}
+
 fn posix_inline_flag_position(name: Option<&str>, words: &[&str]) -> Option<usize> {
     words.iter().enumerate().skip(1).find_map(|(index, raw)| {
         let flag = shell_word_value(raw, ShellDialect::Posix)?;
@@ -5521,10 +5548,9 @@ fn parse_obfuscated_posix_inline_launcher_segment(
     let decoded_name = decoded_posix_executable_name(raw_executable);
     let dynamic_executable = contains_dynamic_posix_substitution(raw_executable)
         || decoded_name.is_none()
-        || decoded_name.as_ref().is_some_and(|name| {
-            name.bytes()
-                .any(|byte| matches!(byte, b'$' | b'`' | b'*' | b'?' | b'[' | b'{' | b'(' | b')'))
-        });
+        || decoded_name
+            .as_ref()
+            .is_some_and(|name| posix_executable_name_may_expand(name));
     if dynamic_executable {
         return if posix_inline_flag_position(None, &words).is_some() {
             PosixInlineLauncherParse::Unverified(
@@ -6358,11 +6384,18 @@ fn collect_posix_eval_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) 
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum PipelineShellInputMode {
     NotShell,
     ReadsStdin(PipelineSourceKind),
     DoesNotReadStdin,
+    /// The consumer runs a *statically fixed* POSIX shell template into which
+    /// xargs/parallel splice each input record (an `-I{}` placeholder). The
+    /// template text itself is fully known, so it is evaluated recursively as
+    /// shell source; record data selecting *where* the fixed template operates
+    /// is the ordinary xargs contract, matching the already-permitted
+    /// `xargs git -C {} pull` shape.
+    FixedTemplate(String),
     Unverified,
 }
 
@@ -6717,10 +6750,6 @@ fn appended_code_input_mode(
             }
         }
     };
-    if args.iter().any(|argument| replacement.occurs_in(argument)) {
-        return PipelineShellInputMode::Unverified;
-    }
-
     for (index, argument) in args.iter().enumerate() {
         let normalized = argument.trim_start_matches('-');
         let is_source_flag = source_flags.iter().any(|flag| {
@@ -6734,22 +6763,162 @@ fn appended_code_input_mode(
         if !is_source_flag {
             continue;
         }
+        // A replacement in the executable's option region can synthesize the
+        // source flag itself (`python3 -{}` becomes `python3 -c`), so every
+        // argument up to and including the flag must be replacement-free.
+        if args[..=index]
+            .iter()
+            .any(|argument| replacement.occurs_in(argument))
+        {
+            return PipelineShellInputMode::Unverified;
+        }
         let Some(source) = args.get(index + 1) else {
             // xargs/parallel append input operands after their fixed command
             // template, so a missing `-c`/`-e` operand means each input item is
             // executable source.
             return PipelineShellInputMode::ReadsStdin(kind.records(delimiter));
         };
-        if replacement.occurs_in(source)
-            || matches!(kind, PipelineSourceKind::PosixShell)
-                && shell_source_references_positional_input(source)
+        if matches!(kind, PipelineSourceKind::PosixShell)
+            && shell_source_references_positional_input(source)
         {
+            // Appended records land in `$0`/`$@`, and a template like
+            // `sh -c 'eval "$0"'` re-executes them as code. The recursive
+            // template analysis cannot yet prove which positional uses stay
+            // data, so this stays fail-closed.
             return PipelineShellInputMode::Unverified;
         }
+        if replacement.occurs_in(source) {
+            // `xargs -I{} sh -c 'cd {} && git pull'`: the template text is
+            // statically known, so evaluate it as shell source instead of
+            // failing closed on the placeholder's presence. Each placeholder
+            // is masked as a quoted variable expansion so the recursive
+            // evaluation applies the existing variable-path rules — a
+            // destructive template (`sh -c 'rm -rf {}'`) is still denied.
+            // Templates that put the record in command position (or under
+            // eval-like words), GNU parallel's richer replacement grammar
+            // (which includes code-generating `{= =}` forms), and interpreter
+            // templates with no shell dialect to recurse into all remain
+            // unverified.
+            if let (PipelineSourceKind::PosixShell, PipelineReplacement::Exact(placeholder)) =
+                (kind, replacement)
+            {
+                if let Some(masked) = fixed_template_with_masked_records(source, placeholder) {
+                    return PipelineShellInputMode::FixedTemplate(masked);
+                }
+            }
+            return PipelineShellInputMode::Unverified;
+        }
+        // Replacement tokens after the literal source operand are ordinary
+        // appended argv data (`sh -c 'cd "$1"' _ {}`), not executable text.
         return PipelineShellInputMode::DoesNotReadStdin;
     }
 
+    // No source flag: a replacement anywhere in the argv can still select a
+    // script file or synthesize an option, so keep the historical fail-closed
+    // behavior.
+    if args.iter().any(|argument| replacement.occurs_in(argument)) {
+        return PipelineShellInputMode::Unverified;
+    }
+
     PipelineShellInputMode::DoesNotReadStdin
+}
+
+/// Shell text substituted for each `-I` placeholder before a fixed xargs
+/// template is recursively evaluated. A quoted expansion keeps the record a
+/// single data word and routes it through the existing dynamic-path rules.
+const PIPELINE_RECORD_MASK: &str = "\"$DCG_PIPELINE_RECORD\"";
+
+/// Rewrite a fixed `xargs -I<placeholder>` shell template so every placeholder
+/// becomes a quoted variable expansion, refusing templates where a record
+/// could occupy a command-word position.
+///
+/// Returns `None` (caller fails closed) when a placeholder-bearing word sits
+/// in command position — including after wrapper words such as `nice`,
+/// `timeout 5`, `env VAR=x`, and eval-like words that re-execute their
+/// arguments as code — or inside a command/process substitution or arithmetic
+/// expansion, where the record would open its own command context that the
+/// top-level scan below cannot see.
+fn fixed_template_with_masked_records(source: &str, placeholder: &str) -> Option<String> {
+    if placeholder.is_empty() {
+        return None;
+    }
+    let masked = source.replace(placeholder, PIPELINE_RECORD_MASK);
+    // A placeholder spliced into `$(...)` or backticks becomes the command
+    // word of a nested shell context: `sh -c 'echo $({})'` executes each
+    // record. The tokenizer folds those regions into ordinary words, so
+    // enumerate them with the bounded tree-sitter view and refuse any that
+    // contain a record; an unparseable template also fails closed. Process
+    // substitutions and arithmetic expansion are not enumerated by that
+    // helper, so their mere presence alongside a placeholder is refused.
+    if masked.contains("<(") || masked.contains(">(") || masked.contains("$((") {
+        return None;
+    }
+    match crate::heredoc::extract_posix_command_substitutions(&masked) {
+        Ok(substitutions) => {
+            if substitutions
+                .iter()
+                .any(|substitution| substitution.body.contains("DCG_PIPELINE_RECORD"))
+            {
+                return None;
+            }
+        }
+        Err(_) => return None,
+    }
+    let tokens = tokenize_for_shell_dialect(&masked, ShellDialect::Posix);
+    let mut expect_command = true;
+    for token in &tokens {
+        if token.kind == NormalizeTokenKind::Separator {
+            expect_command = true;
+            continue;
+        }
+        if token.kind != NormalizeTokenKind::Word {
+            continue;
+        }
+        let word = token.text(&masked)?;
+        let has_record = word.contains("DCG_PIPELINE_RECORD");
+        if expect_command {
+            if has_record {
+                return None;
+            }
+            // Wrapper and eval-like words leave the following word in command
+            // position; so do their option/duration arguments and leading
+            // environment assignments.
+            let stays_command_position = crate::normalize::is_env_assignment(word)
+                || word.starts_with('-')
+                || word.bytes().all(|byte| byte.is_ascii_digit())
+                || matches!(
+                    word,
+                    "nice"
+                        | "env"
+                        | "nohup"
+                        | "time"
+                        | "timeout"
+                        | "stdbuf"
+                        | "setsid"
+                        | "ionice"
+                        | "chrt"
+                        | "busybox"
+                        | "command"
+                        | "exec"
+                        | "eval"
+                        | "source"
+                        | "."
+                        | "sudo"
+                        | "doas"
+                        | "xargs"
+                        | "parallel"
+                        | "sh"
+                        | "bash"
+                        | "zsh"
+                        | "ksh"
+                        | "dash"
+                );
+            if !stays_command_position {
+                expect_command = false;
+            }
+        }
+    }
+    Some(masked)
 }
 
 fn is_posix_stdin_code_path(argument: &str) -> bool {
@@ -8096,6 +8265,13 @@ fn collect_posix_process_substitution_sinks(command: &str, sinks: &mut Vec<Execu
                 PipelineShellInputMode::ReadsStdin(kind) => {
                     push_executable_input_source(source, kind, sinks);
                 }
+                PipelineShellInputMode::FixedTemplate(template) => {
+                    sinks.push(ExecutableTextSink::Payload {
+                        source: template,
+                        dialect: ShellDialect::Posix,
+                        context: "POSIX shell executes a fixed template with spliced input records",
+                    });
+                }
                 PipelineShellInputMode::Unverified => {
                     sinks.push(ExecutableTextSink::Unverified(
                         "POSIX process-substitution consumer cannot be statically verified",
@@ -8119,6 +8295,13 @@ fn collect_posix_process_substitution_sinks(command: &str, sinks: &mut Vec<Execu
             match pipeline_shell_input_mode(&substitution.source) {
                 PipelineShellInputMode::ReadsStdin(kind) => {
                     push_executable_input_source(producer, kind, sinks);
+                }
+                PipelineShellInputMode::FixedTemplate(source) => {
+                    sinks.push(ExecutableTextSink::Payload {
+                        source,
+                        dialect: ShellDialect::Posix,
+                        context: "POSIX shell executes a fixed template with spliced input records",
+                    });
                 }
                 PipelineShellInputMode::Unverified => {
                     sinks.push(ExecutableTextSink::Unverified(
@@ -8165,6 +8348,14 @@ fn collect_posix_pipeline_executable_sinks(command: &str, sinks: &mut Vec<Execut
                             producer_index -= 1;
                         }
                         push_posix_pipeline_source(&stages[producer_index], kind, sinks);
+                    }
+                    PipelineShellInputMode::FixedTemplate(source) => {
+                        sinks.push(ExecutableTextSink::Payload {
+                            source,
+                            dialect: ShellDialect::Posix,
+                            context:
+                                "POSIX shell executes a fixed template with spliced input records",
+                        });
                     }
                     PipelineShellInputMode::Unverified => {
                         sinks.push(ExecutableTextSink::Unverified(
@@ -18882,6 +19073,220 @@ fn filesystem_non_pre_rm_pattern(name: Option<&str>) -> bool {
     !filesystem_pre_rm_pattern(name)
 }
 
+fn filesystem_redirect_pattern_excluding_dynamic(name: Option<&str>) -> bool {
+    filesystem_redirect_pattern(name) && name != Some("redirect-truncate-dynamic-path")
+}
+
+fn filesystem_pre_rm_pattern_excluding_dynamic(name: Option<&str>) -> bool {
+    filesystem_pre_rm_pattern(name) && name != Some("redirect-truncate-dynamic-path")
+}
+
+/// Statically prove that a `$VAR`-target redirect resolves to a benign literal
+/// path, so `redirect-truncate-dynamic-path` need not fail closed on it.
+///
+/// The proof is deliberately narrow (#249): the target must be exactly
+/// `$NAME`/`${NAME}` (optionally double-quoted, optionally followed by a
+/// literal path suffix); exactly one preceding top-level segment must assign
+/// `NAME=` a literal value; no preceding segment may reassign the name or
+/// start with a builtin that can mutate parent-shell variables; every trailing
+/// redirect in the segment must be a static fd duplication (`2>&1`); and the
+/// resolved path must be a tmp-family or relative path with no `..` traversal
+/// — the shapes a direct literal redirect already passes. Anything else keeps
+/// today's fail-closed denial.
+fn statically_safe_variable_redirect(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    dialect_segment: &str,
+    dialect: ShellDialect,
+) -> bool {
+    if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+        return false;
+    }
+    let Some(redirect) = first_unquoted_output_redirect(dialect_segment, ShellDialect::Posix)
+    else {
+        return false;
+    };
+    let Some(mut target) = dialect_segment.get(redirect + 1..).map(str::trim_start) else {
+        return false;
+    };
+    for prefix in ['>', '|'] {
+        if let Some(rest) = target.strip_prefix(prefix) {
+            target = rest.trim_start();
+        }
+    }
+    let (token, trailing) = if let Some(rest) = target.strip_prefix('"') {
+        let Some(end) = rest.find('"') else {
+            return false;
+        };
+        let trailing = &rest[end + 1..];
+        // Text concatenated directly after the closing quote extends the real
+        // target beyond the proven value (`> "$log"/../../etc/passwd`), so the
+        // proof only holds when the quoted token IS the whole target word.
+        if !trailing.is_empty()
+            && !trailing.as_bytes().first().is_some_and(|byte| {
+                byte.is_ascii_whitespace() || matches!(byte, b';' | b'|' | b'&' | b'<' | b'>')
+            })
+        {
+            return false;
+        }
+        (&rest[..end], trailing)
+    } else {
+        let end = target
+            .find(|c: char| c.is_ascii_whitespace() || matches!(c, ';' | '|' | '&' | '<' | '>'))
+            .unwrap_or(target.len());
+        (&target[..end], &target[end..])
+    };
+    if !trailing_redirects_are_fd_duplications(trailing) {
+        return false;
+    }
+    let Some((name, suffix)) = parse_posix_variable_with_literal_suffix(token) else {
+        return false;
+    };
+    let Some(value) = single_prior_literal_assignment(source, segment_ranges, segment_start, name)
+    else {
+        return false;
+    };
+    resolved_redirect_target_is_benign(&format!("{value}{suffix}"))
+}
+
+/// Accept only static fd duplications (`2>&1`, `>&2`) after the proven target.
+fn trailing_redirects_are_fd_duplications(mut rest: &str) -> bool {
+    while let Some(index) = first_unquoted_output_redirect(rest, ShellDialect::Posix) {
+        let after = &rest[index + 1..];
+        let Some(dup) = after.strip_prefix('&') else {
+            return false;
+        };
+        let digits = dup.chars().take_while(char::is_ascii_digit).count();
+        if digits == 0 {
+            return false;
+        }
+        rest = &dup[digits..];
+    }
+    true
+}
+
+/// Parse `$NAME` / `${NAME}` with an optional literal path suffix
+/// (`$dir/out.log`), rejecting any further expansion syntax.
+fn parse_posix_variable_with_literal_suffix(token: &str) -> Option<(&str, &str)> {
+    let rest = token.strip_prefix('$')?;
+    let (name, suffix) = if let Some(body) = rest.strip_prefix('{') {
+        let close = body.find('}')?;
+        (&body[..close], &body[close + 1..])
+    } else {
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        (&rest[..end], &rest[end..])
+    };
+    let valid_name = !name.is_empty()
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    let literal_suffix = suffix
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/'));
+    (valid_name && literal_suffix).then_some((name, suffix))
+}
+
+/// Find exactly one literal `NAME=value` among the top-level segments that end
+/// before the redirect segment, refusing when any other preceding segment
+/// could mutate `NAME` in the parent shell.
+fn single_prior_literal_assignment(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    name: &str,
+) -> Option<String> {
+    let mut assignment: Option<String> = None;
+    for &(start, end) in segment_ranges {
+        if end > segment_start {
+            continue;
+        }
+        let segment = source.get(start..end).map(str::trim)?;
+        if segment.is_empty() {
+            continue;
+        }
+        if let Some(raw) = segment
+            .strip_prefix(name)
+            .and_then(|rest| rest.strip_prefix('='))
+        {
+            if assignment.is_some() {
+                return None;
+            }
+            assignment = Some(literal_assignment_value(raw)?);
+            continue;
+        }
+        let first = segment.split_ascii_whitespace().next().unwrap_or("");
+        let may_mutate_shell_variables = matches!(
+            first,
+            "read"
+                | "readonly"
+                | "declare"
+                | "typeset"
+                | "local"
+                | "export"
+                | "let"
+                | "eval"
+                | "source"
+                | "."
+                | "mapfile"
+                | "readarray"
+                | "unset"
+                | "printf"
+        );
+        if may_mutate_shell_variables || segment.contains(&format!("{name}=")) {
+            return None;
+        }
+    }
+    assignment
+}
+
+/// A whole-segment assignment value that is one literal shell word.
+fn literal_assignment_value(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let value = if let Some(inner) = raw
+        .strip_prefix('\'')
+        .and_then(|rest| rest.strip_suffix('\''))
+    {
+        if inner.contains(['\'', '\\']) {
+            return None;
+        }
+        inner.to_string()
+    } else if let Some(inner) = raw
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    {
+        if inner.contains(['$', '`', '\\', '"']) {
+            return None;
+        }
+        inner.to_string()
+    } else {
+        if !raw.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b':' | b'+' | b'@')
+        }) {
+            return None;
+        }
+        raw.to_string()
+    };
+    (!value.is_empty() && !value.starts_with('~')).then_some(value)
+}
+
+/// Would a *direct literal* redirect to this path be allowed today? Only the
+/// tmp family and traversal-free relative paths qualify; everything else
+/// keeps the fail-closed dynamic-path denial.
+fn resolved_redirect_target_is_benign(path: &str) -> bool {
+    let no_traversal = |p: &str| !p.split('/').any(|component| component == "..");
+    for prefix in ["/tmp/", "/var/tmp/", "/private/tmp/", "/private/var/tmp/"] {
+        if let Some(rest) = path.strip_prefix(prefix) {
+            return !rest.is_empty() && no_traversal(rest);
+        }
+    }
+    !path.is_empty() && !path.starts_with(['/', '~', '-']) && no_traversal(path)
+}
+
 fn filesystem_non_pre_rm_non_redirect_pattern(name: Option<&str>) -> bool {
     filesystem_non_pre_rm_pattern(name) && !filesystem_redirect_pattern(name)
 }
@@ -19067,6 +19472,34 @@ fn evaluate_core_filesystem_pack(
             })
             .collect();
 
+        // A `$VAR` redirect target proven to resolve to a benign literal path
+        // (single prior literal assignment in this same command) is exempt
+        // from the dynamic-path rule only; every other redirect rule still
+        // runs.
+        let redirect_source =
+            if shell_dialect != ShellDialect::Unknown && normalized_offset == Some(0) {
+                original_command
+            } else {
+                command_for_packs
+            };
+        let proven_variable_redirect = statically_safe_variable_redirect(
+            redirect_source,
+            segment_ranges,
+            segment_start,
+            dialect_segment,
+            shell_dialect,
+        );
+        let redirect_filter: fn(Option<&str>) -> bool = if proven_variable_redirect {
+            filesystem_redirect_pattern_excluding_dynamic
+        } else {
+            filesystem_redirect_pattern
+        };
+        let pre_rm_filter: fn(Option<&str>) -> bool = if proven_variable_redirect {
+            filesystem_pre_rm_pattern_excluding_dynamic
+        } else {
+            filesystem_pre_rm_pattern
+        };
+
         // Redirect operators are shell syntax, not argv. Legacy callers with
         // no proven dialect retain the full sanitized command so the generic
         // quoted-span guard below can distinguish `psql -c
@@ -19086,7 +19519,7 @@ fn evaluate_core_filesystem_pack(
                 first_allowlist_hit,
                 deadline,
                 &nested_segment_ranges,
-                Some(filesystem_redirect_pattern),
+                Some(redirect_filter),
             ) {
                 return Some(result);
             }
@@ -19111,7 +19544,7 @@ fn evaluate_core_filesystem_pack(
                 first_allowlist_hit,
                 deadline,
                 &nested_segment_ranges,
-                Some(filesystem_redirect_pattern),
+                Some(redirect_filter),
             ) {
                 return Some(result);
             }
@@ -19151,7 +19584,7 @@ fn evaluate_core_filesystem_pack(
             first_allowlist_hit,
             deadline,
             &nested_segment_ranges,
-            Some(filesystem_pre_rm_pattern),
+            Some(pre_rm_filter),
         ) {
             return Some(result);
         }
@@ -26802,6 +27235,138 @@ mod tests {
     }
 
     #[test]
+    fn literal_assignment_proves_variable_redirect_target() {
+        // #249-adjacent: a redirect whose `$VAR` target is proven by a single
+        // prior literal assignment resolving to a tmp-family or relative path
+        // must not fail closed as `redirect-truncate-dynamic-path`.
+        for command in [
+            "log=/tmp/gcp-multi-poll.log; : > \"$log\"",
+            "log=/tmp/run.log; my-tool --verbose > \"$log\" 2>&1",
+            "log='/tmp/spaced dir/run.log'; : > \"$log\"",
+            "S=/private/tmp/scratch; printf x > $S/p_fast.json",
+            "out=logs/run.txt; ./collect.sh > \"${out}\"",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "proven literal redirect target must be allowed: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // Everything outside the narrow proof keeps the fail-closed denial.
+        for command in [
+            ": > \"$log\"",
+            "log=/etc/passwd; : > \"$log\"",
+            "log=/tmp/a.log; log=$(mktemp); : > \"$log\"",
+            "log=/tmp/a.log; read log; : > \"$log\"",
+            "log=/tmp/a.log; export log=/etc/passwd; : > \"$log\"",
+            "log=$HOME/x.log; : > \"$log\"",
+            "log=/tmp/../etc/passwd; : > \"$log\"",
+            "log=/tmp/a.log; : > \"$log\" > \"$other\"",
+            "log=~/x.log; : > \"$log\"",
+            // Text concatenated after the closing quote extends the real
+            // target beyond the proven value; the proof must not hold.
+            "log=/tmp/x; : > \"$log\"/../../etc/passwd",
+            "log=/tmp/x; : > \"$log\"extra",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "unproven or sensitive redirect target must stay denied: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_xargs_templates_are_recursively_evaluated() {
+        // A statically fixed `xargs -I` template with the placeholder in
+        // argument position is the canonical parallel-repo sweep idiom. The
+        // placeholder is masked as a quoted variable expansion and the
+        // template is evaluated recursively, so benign templates pass.
+        for command in [
+            "cat repos.txt | xargs -P12 -I{} sh -c 'cd {} && git pull'",
+            "cat repos.txt | xargs -I{} sh -c 'cd {} && git status --short'",
+            "printf '%s\\n' a b | xargs -I% sh -c 'git -C % fetch --prune'",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "benign fixed template must be allowed: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // Destructive templates are still denied by the recursive evaluation.
+        for (command, packs) in [
+            (
+                "cat repos.txt | xargs -I{} sh -c 'rm -rf {}'",
+                &["core.filesystem"][..],
+            ),
+            (
+                "cat repos.txt | xargs -P8 -I{} sh -c 'cd {} && git reset --hard'",
+                &["core.git"][..],
+            ),
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, packs, ShellDialect::Posix);
+            assert!(
+                result.is_denied(),
+                "destructive fixed template must stay denied: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // Records in command position — directly, behind wrappers, or through
+        // eval-like words — become executable code and stay fail-closed.
+        for command in [
+            "cat repos.txt | xargs -I{} sh -c '{}'",
+            "cat repos.txt | xargs -I{} sh -c 'eval {}'",
+            "cat repos.txt | xargs -I{} sh -c '{} --version'",
+            "cat repos.txt | xargs -I{} sh -c 'nice {}'",
+            "cat repos.txt | xargs -I{} sh -c 'timeout 5 {}'",
+        ] {
+            let result =
+                evaluate_with_pack_ids_in_dialect(command, &["core.git"], ShellDialect::Posix);
+            assert!(
+                result.is_denied(),
+                "record in command position must fail closed: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // A record spliced into a command/process substitution or arithmetic
+        // expansion opens its own command context that the top-level
+        // command-position scan cannot see; those templates stay fail-closed.
+        for command in [
+            "cat repos.txt | xargs -I{} sh -c 'echo $({})'",
+            "cat repos.txt | xargs -I{} sh -c 'echo `{}`'",
+            "cat repos.txt | xargs -I{} sh -c 'diff <({}) /dev/null'",
+            "cat repos.txt | xargs -I{} sh -c 'echo $(({}))'",
+        ] {
+            let result =
+                evaluate_with_pack_ids_in_dialect(command, &["core.git"], ShellDialect::Posix);
+            assert!(
+                result.is_denied(),
+                "record inside a substitution context must fail closed: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
     fn executable_pipeline_wrapper_bound_fails_closed() {
         let wrappers = std::iter::repeat_n("nice", MAX_PIPELINE_WRAPPER_PREFIXES + 1)
             .collect::<Vec<_>>()
@@ -28292,6 +28857,72 @@ mod tests {
                 result.pattern_info
             );
         }
+    }
+
+    #[test]
+    fn posix_test_brackets_are_not_inline_launchers() {
+        // Regression for #246: the executable word `[` (or `[[`) is the
+        // literal POSIX test builtin. An unclosed bracket cannot glob-expand,
+        // so `[ -e x ]` must not be denied as "a dynamically assembled
+        // executable followed by an inline-code flag".
+        use crate::normalize::ShellDialect;
+
+        let enabled_keywords = ["git", "rm"];
+        let ordered_packs = ["core.git".to_string(), "core.filesystem".to_string()];
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+        let heredoc_settings = default_config().heredoc_settings();
+
+        for command in [
+            "[ -e x ]",
+            "[ -e /tmp/marker ]",
+            "[[ -e \"$file\" ]]",
+            "[ -f x ]",
+            "[ -d \"$p/.git\" ]",
+            "[[ -f x ]]",
+            "[ -f x ] && grep -in y x",
+        ] {
+            let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                command,
+                &enabled_keywords,
+                &ordered_packs,
+                keyword_index.as_ref(),
+                &compiled,
+                &allowlists,
+                &heredoc_settings,
+                None,
+                None,
+                None,
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "POSIX test builtin must not be denied: {command}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // Bracket expressions that close within the word can still expand to
+        // an interpreter name and must stay fail-closed.
+        let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+            "s[h] -c 'rm -r ./tree'",
+            &enabled_keywords,
+            &ordered_packs,
+            keyword_index.as_ref(),
+            &compiled,
+            &allowlists,
+            &heredoc_settings,
+            None,
+            None,
+            None,
+            ShellDialect::Posix,
+        );
+        assert!(
+            result.is_denied(),
+            "closed bracket expression in executable position must stay fail-closed: {:?}",
+            result.pattern_info
+        );
     }
 
     #[test]
