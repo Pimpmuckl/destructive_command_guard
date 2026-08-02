@@ -37,7 +37,7 @@ HOSTS_OVERRIDE=""
 JSON_OUTPUT=false
 INCLUDE_WINDOWS=true
 LOCAL_ONLY=false
-REPO_RAW="https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main"
+REPO_RAW="https://raw.githubusercontent.com/Pimpmuckl/destructive_command_guard/main"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -53,7 +53,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$VERSION" ]]; then
-  VERSION="$(gh release view -R Dicklesworthstone/destructive_command_guard \
+  VERSION="$(gh release view -R Pimpmuckl/destructive_command_guard \
     --json tagName --jq .tagName 2>/dev/null)"
   [[ -z "$VERSION" ]] && { echo "error: --version required (could not query latest)" >&2; exit 2; }
 fi
@@ -122,10 +122,9 @@ if ! curl -fsSL -o "$WORK/install.sh" "$REPO_RAW/install.sh"; then
 fi
 echo "RESULT:fetch_installer:PASS"
 
-# 2. Install the pinned version. --require-minisign makes signature
-#    verification mandatory when minisign exists; checksum is always enforced.
+# 2. Install the pinned version. Fork releases publish Sigstore bundles rather
+#    than minisign sidecars; checksum verification remains mandatory.
 MINISIGN_FLAG=""
-command -v minisign >/dev/null 2>&1 && MINISIGN_FLAG="--require-minisign"
 INSTALL_LOG="$WORK/install.log"
 if HOME="$HOME_SANDBOX" XDG_CONFIG_HOME="$HOME_SANDBOX/.config" \
    bash "$WORK/install.sh" --version "$VERSION" --dest "$DEST" \
