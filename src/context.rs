@@ -1480,6 +1480,80 @@ enum WrapperState {
         options_ended: bool,
         pending_value: bool,
     },
+    /// A POSIX execution frontend (`nice`, `nohup`, `time`, `timeout`,
+    /// `stdbuf`, `ionice`, `setsid`, `chrt`) that runs its trailing argv as a
+    /// command. Without this, the launcher word became the segment command and
+    /// the real command's data flags (e.g. `git commit -m <message>`) were
+    /// never masked, so a destructive-looking word inside a commit message
+    /// tripped raw pattern matching (issue #257). Mirrors the launcher set of
+    /// `normalize::strip_posix_execution_frontend`.
+    Launcher {
+        kind: LauncherKind,
+        options_ended: bool,
+        pending_value: bool,
+        operands_to_skip: u8,
+    },
+    /// `mise exec [TOOL@VERSION]... [--] <command>...` (and its `mise x`
+    /// alias). Tool specs carry `@`; an explicit `--` unambiguously starts
+    /// the wrapped command (issue #257).
+    MiseExec {
+        awaiting_subcommand: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LauncherKind {
+    Nice,
+    Ionice,
+    Nohup,
+    Setsid,
+    Time,
+    Timeout,
+    Stdbuf,
+    Chrt,
+}
+
+impl LauncherKind {
+    #[must_use]
+    fn from_basename(name: &str) -> Option<Self> {
+        match name {
+            "nice" => Some(Self::Nice),
+            "ionice" => Some(Self::Ionice),
+            "nohup" => Some(Self::Nohup),
+            "setsid" => Some(Self::Setsid),
+            "time" => Some(Self::Time),
+            "timeout" => Some(Self::Timeout),
+            "stdbuf" => Some(Self::Stdbuf),
+            "chrt" => Some(Self::Chrt),
+            _ => None,
+        }
+    }
+
+    /// Options that consume the following token as their value.
+    #[must_use]
+    fn option_takes_separate_value(self, token: &str) -> bool {
+        match self {
+            Self::Nice => matches!(token, "-n" | "--adjustment"),
+            Self::Ionice => matches!(
+                token,
+                "-c" | "--class" | "-n" | "--classdata" | "-p" | "-P" | "-u"
+            ),
+            Self::Time => matches!(token, "-f" | "--format" | "-o" | "--output"),
+            Self::Timeout => matches!(token, "-k" | "--kill-after" | "-s" | "--signal"),
+            Self::Stdbuf => matches!(token, "-i" | "-o" | "-e"),
+            Self::Nohup | Self::Setsid | Self::Chrt => false,
+        }
+    }
+
+    /// Positional operands the launcher consumes before the wrapped command
+    /// (`timeout DURATION cmd`, `chrt PRIORITY cmd`).
+    #[must_use]
+    const fn operands_before_command(self) -> u8 {
+        match self {
+            Self::Timeout | Self::Chrt => 1,
+            Self::Nice | Self::Ionice | Self::Nohup | Self::Setsid | Self::Time | Self::Stdbuf => 0,
+        }
+    }
 }
 
 impl WrapperState {
@@ -1500,7 +1574,15 @@ impl WrapperState {
                 options_ended: false,
                 pending_value: false,
             }),
-            _ => None,
+            "mise" => Some(Self::MiseExec {
+                awaiting_subcommand: true,
+            }),
+            other => LauncherKind::from_basename(other).map(|kind| Self::Launcher {
+                kind,
+                options_ended: false,
+                pending_value: false,
+                operands_to_skip: kind.operands_before_command(),
+            }),
         }
     }
 
@@ -1542,6 +1624,101 @@ impl WrapperState {
                 },
                 |_t| None,
             ),
+            Self::Launcher {
+                kind,
+                options_ended,
+                pending_value,
+                operands_to_skip,
+            } => {
+                if pending_value {
+                    return (
+                        Self::Launcher {
+                            kind,
+                            options_ended,
+                            pending_value: false,
+                            operands_to_skip,
+                        },
+                        true,
+                    );
+                }
+                if !options_ended {
+                    if token == "--" {
+                        return (
+                            Self::Launcher {
+                                kind,
+                                options_ended: true,
+                                pending_value: false,
+                                operands_to_skip,
+                            },
+                            true,
+                        );
+                    }
+                    if token.starts_with('-') && token != "-" {
+                        return (
+                            Self::Launcher {
+                                kind,
+                                options_ended,
+                                pending_value: kind.option_takes_separate_value(token),
+                                operands_to_skip,
+                            },
+                            true,
+                        );
+                    }
+                }
+                if operands_to_skip > 0 {
+                    return (
+                        Self::Launcher {
+                            kind,
+                            options_ended: true,
+                            pending_value: false,
+                            operands_to_skip: operands_to_skip - 1,
+                        },
+                        true,
+                    );
+                }
+                (
+                    Self::Launcher {
+                        kind,
+                        options_ended,
+                        pending_value,
+                        operands_to_skip,
+                    },
+                    false,
+                )
+            }
+            Self::MiseExec {
+                awaiting_subcommand,
+            } => {
+                if awaiting_subcommand {
+                    return if matches!(token, "exec" | "x") {
+                        (
+                            Self::MiseExec {
+                                awaiting_subcommand: false,
+                            },
+                            true,
+                        )
+                    } else {
+                        // `mise <other-subcommand>` is not an exec wrapper.
+                        (Self::None, false)
+                    };
+                }
+                if token == "--" {
+                    // The wrapped command starts at the next token.
+                    return (Self::None, true);
+                }
+                if token.starts_with('-') || token.contains('@') {
+                    // Exec options and TOOL@VERSION specs precede the command.
+                    return (
+                        Self::MiseExec {
+                            awaiting_subcommand: false,
+                        },
+                        true,
+                    );
+                }
+                // In mise's grammar the first bare word without `@` starts
+                // the wrapped command.
+                (Self::None, false)
+            }
         }
     }
 }
@@ -1569,7 +1746,10 @@ where
             options_ended,
             pending_value,
         } => (options_ended, pending_value),
-        WrapperState::None => return (WrapperState::None, false),
+        // Launcher/MiseExec have dedicated consume paths in `consume_token`.
+        WrapperState::None | WrapperState::Launcher { .. } | WrapperState::MiseExec { .. } => {
+            return (state, false);
+        }
     };
 
     if pending_value {
@@ -1628,7 +1808,7 @@ const fn set_wrapper_options_ended(state: WrapperState, options_ended: bool) -> 
             options_ended,
             pending_value,
         },
-        WrapperState::None => WrapperState::None,
+        WrapperState::None | WrapperState::Launcher { .. } | WrapperState::MiseExec { .. } => state,
     }
 }
 
@@ -1652,7 +1832,7 @@ const fn set_wrapper_pending(
             options_ended,
             pending_value,
         },
-        WrapperState::None => WrapperState::None,
+        WrapperState::None | WrapperState::Launcher { .. } | WrapperState::MiseExec { .. } => state,
     }
 }
 
@@ -4126,5 +4306,78 @@ mod tests {
                 "did not expect `{non_op}` to be classified as a redirect operator"
             );
         }
+    }
+
+    // =========================================================================
+    // Issue #257: execution wrappers must not defeat data-argument masking
+    // =========================================================================
+
+    #[test]
+    fn sanitize_masks_commit_message_behind_execution_wrappers() {
+        // Without wrapper tracking, the launcher word occupied the segment
+        // command slot, `git commit -m` was never recognized, and the word
+        // "restore" inside the message stayed visible to the raw
+        // `git ... restore` regexes (#257).
+        for wrapper in [
+            "mise exec --",
+            "nice",
+            "nice -n 10",
+            "time",
+            "nohup",
+            "stdbuf -oL",
+            "timeout 30",
+            "setsid",
+            "ionice -c 2 -n 0",
+            "chrt 50",
+        ] {
+            let cmd = format!("{wrapper} git commit -m \"prove PostgreSQL restore round trip\"");
+            let sanitized = sanitize_for_pattern_matching(&cmd);
+            assert!(
+                matches!(sanitized, std::borrow::Cow::Owned(_)),
+                "wrapped commit message was not masked at all: {cmd} -> {sanitized}"
+            );
+            assert!(
+                !sanitized.as_ref().contains("restore"),
+                "commit message leaked through wrapper `{wrapper}`: {cmd} -> {sanitized}"
+            );
+            assert!(
+                sanitized.as_ref().contains("git commit -m"),
+                "executable part must stay visible: {cmd} -> {sanitized}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_keeps_executable_payloads_behind_wrappers_visible() {
+        // Wrappers only re-point the segment command at the wrapped argv;
+        // genuinely executable payloads must never be masked.
+        for cmd in [
+            "nice git reset --hard",
+            "timeout 30 git reset --hard HEAD~1",
+            "mise exec -- git reset --hard",
+        ] {
+            let sanitized = sanitize_for_pattern_matching(cmd);
+            assert!(
+                sanitized.as_ref().contains("reset --hard"),
+                "destructive payload behind a wrapper was masked: {cmd} -> {sanitized}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_does_not_treat_other_mise_subcommands_as_wrappers() {
+        // Only `mise exec` / `mise x` run a wrapped command; other mise
+        // subcommands must not re-point the segment command (which could mask
+        // their arguments against unrelated safe-flag registries).
+        let cmd = "mise install git && git commit -m \"prove PostgreSQL restore round trip\"";
+        let sanitized = sanitize_for_pattern_matching(cmd);
+        assert!(
+            !sanitized.as_ref().contains("restore"),
+            "direct git commit message after `&&` must still be masked: {cmd} -> {sanitized}"
+        );
+        assert!(
+            sanitized.as_ref().contains("mise install git"),
+            "mise install argv must stay visible: {cmd} -> {sanitized}"
+        );
     }
 }

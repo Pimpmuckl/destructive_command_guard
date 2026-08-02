@@ -77,5 +77,35 @@ try {
     Remove-Item -Recurse -Force $r3 -ErrorAction SilentlyContinue
 }
 
+Write-Host "Test 4: PascalCase PreToolUse key is adopted explicitly (no duplicate key) (#253)"
+# Note: the both-casings repair branch cannot be exercised from a file here —
+# ConvertFrom-Json rejects keys that differ only in case as duplicates, so a
+# damaged dual-key file fails safe as "invalid JSON". This test proves the key
+# resolution is explicit (adopts the file's spelling) instead of relying on
+# PSObject's case-insensitive member lookup.
+$r4 = New-TempRepo
+try {
+    $hookDir = Join-Path $r4 'hooks'; New-Item -ItemType Directory -Path $hookDir -Force | Out-Null
+    $existing = [ordered]@{
+        version = 1
+        hooks = [ordered]@{
+            PreToolUse = @(
+                [ordered]@{ type = 'command'; bash = 'audit-pretool'; powershell = 'audit-pretool.exe' }
+            )
+        }
+    }
+    $existing | ConvertTo-Json -Depth 20 | Set-Content -Path (Join-Path $hookDir 'dcg.json')
+    $s = Configure-CopilotHook -DcgPath $dcgPath -CopilotHome $r4
+    Check ($s -eq 'merged') "returns 'merged' (got '$s')"
+    $p = Get-Content -Raw (Join-Path $hookDir 'dcg.json') | ConvertFrom-Json
+    $preKeys = @($p.hooks.PSObject.Properties.Name | Where-Object { $_.ToLowerInvariant() -eq 'pretooluse' })
+    Check (($preKeys.Count -eq 1) -and ($preKeys[0] -ceq 'PreToolUse')) "exactly one hooks key, file's PascalCase spelling adopted (got: $($preKeys -join ', '))"
+    $entries = @($p.hooks.PSObject.Properties['PreToolUse'].Value)
+    Check ($entries[0].bash -eq $dcgPath) "dcg entry prepended under the existing key"
+    Check (@($entries | Where-Object { $_.bash -eq 'audit-pretool' }).Count -eq 1) "non-dcg entry intact"
+    $s2 = Configure-CopilotHook -DcgPath $dcgPath -CopilotHome $r4
+    Check ($s2 -eq 'already') "second run is idempotent under the adopted spelling (got '$s2')"
+} finally { Remove-Item -Recurse -Force $r4 -ErrorAction SilentlyContinue }
+
 if ($script:failures -gt 0) { Write-Host "$script:failures FAILURE(S)" -ForegroundColor Red; exit 1 }
 Write-Host "All Configure-CopilotHook tests passed." -ForegroundColor Green

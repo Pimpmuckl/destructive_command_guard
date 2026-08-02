@@ -13,6 +13,100 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## Unreleased
 
+## [v0.9.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.9.0) -- 2026-08-02 [Release]
+
+### Added
+
+- **Posit Assistant support (idea from PR #254, reimplemented).** Posit
+  Assistant reads Claude-Code-compatible `PreToolUse` hooks from
+  `~/.posit/assistant/settings.json`, so dcg's existing Claude-compatible
+  protocol answers it without a new wire format. The installers now detect it
+  (`~/.posit/assistant`, legacy `~/.positai`, or `pa` on `PATH`) and merge an
+  idempotent hook entry with the lowercase exact matcher `"bash|powershell"`
+  its matcher grammar requires; the uninstallers remove only dcg-owned
+  entries. `dcg` detects the agent from its documented `PA_PROJECT_DIR` hook
+  variable (checked last, so agents with their own markers win), and that
+  variable also steers a `powershell`-named shell tool to the
+  Claude-compatible deny payload instead of Codex's minimal shape. Posit's
+  hooks documentation is not public yet; the contract is pinned empirically
+  by tests.
+- **VS Code Agent Host batched `toolCalls` envelope (#252).** The newer
+  Copilot Agent Host (and the Agents window built on it) batches tool
+  invocations as `{"toolCalls": [{"name": "powershell", "args":
+  "{\"command\":…}"}]}` with JSON-encoded argument strings. dcg previously
+  did not recognize the plural envelope, so destructive commands sent through
+  the Agent Host were silently allowed. Every shell entry in the batch is now
+  extracted (string- or object-form `args`) and evaluated — one destructive
+  entry denies the whole batch — with the Claude-shaped deny payload VS Code
+  consumes through its compatibility layer.
+
+### Fixed
+
+- **UTF-8 panic on escape sequences before multi-byte characters (#255).**
+  `dcg explain` / `dcg test` aborted (`byte index is not a char boundary`)
+  when a PowerShell backtick — and, by the same defect, a cmd.exe caret or
+  POSIX backslash — was immediately followed by a non-ASCII character, e.g.
+  `s`中`. Every escape scanner now advances by the escaped character's real
+  UTF-8 width via one shared boundary-safe helper (21 call sites).
+- **Wrapper prefixes no longer defeat data-flag masking (#257).**
+  `mise exec -- git commit -m "… restore …"`, and the same command under
+  `nice`, `time`, `nohup`, `stdbuf`, `timeout`, `ionice`, `setsid`, or
+  `chrt`, denied as `core.git:restore-worktree` because the sanitizer only
+  recognized `sudo`/`env`/`command` as wrappers, leaving the quoted commit
+  message unmasked. The sanitizer now models the same execution-frontend set
+  the normalizer strips (plus `mise exec`/`mise x`, which the normalizer also
+  gained), so `git commit -m` messages are masked under any of these
+  launchers while `nice git reset --hard` still denies.
+- **Leading `VAR="$(cmd)"` assignments misread as the executable (#256).** A
+  benign `GH_TOKEN="$(python3 …)" gh issue list --search '-label:x
+  sort:created-asc'` denied as an unverifiable inline launcher: the
+  assignment prefix was taken as a dynamically assembled executable, and any
+  later `-`-leading operand containing the letter `c` (a GitHub search
+  query, `-abc`) was read as an inline-code flag cluster. Assignment prefixes
+  are now skipped when locating the executable (their substitutions are
+  separately evaluated as nested commands), and a short-flag cluster must be
+  a real alphanumeric cluster. `"$(cmd)" foo -c` and `FOO=bar sh -c 'rm -rf
+  /'` still deny.
+- **Cross-dialect `;` artifacts no longer trip the git-alias boundary
+  (#250).** Under the all-dialect view used by `dcg test`/`explain` and
+  generic terminal tools, the cmd.exe tokenizer does not treat `;` or `'` as
+  separators, so compounds like `git status; ls`, `for d in …; do cd "$d" &&
+  git pull; done`, and `sh -c 'cd {} && git pull'` produced glued subcommand
+  tokens (`pull;`, `pull'`) that failed closed as
+  `core.git:git-alias-semantic-unverified`. A token carrying characters
+  Git's dispatch could never accept is now a usage error, not a candidate
+  alias; genuinely unknown name-shaped subcommands (`git lg`) and visible
+  dangerous alias definitions still fail closed.
+- **`for`-loop literal narrowing for `mv` and redirects (#242).**
+  `for f in a b; do mv "$f" d/; done` denied as
+  `core.filesystem:mv-dynamic-path` even though the loop variable's values
+  are fully known. When exactly one binding — a literal assignment or a
+  fully literal `for NAME in …` list (≤16 candidates, no globs,
+  substitutions, or whitespace-bearing words) — proves every value, each
+  candidate is substituted and re-evaluated, and only if every candidate
+  independently allows is the dynamic-path rule suppressed. The same proof
+  now feeds redirect targets, so `for f in a b; do echo x > "$f"; done`
+  allows while `for f in /etc x; do mv "$f" d/; done`, `for f in $(ls); …`,
+  and rebinding/nested-loop variants all still deny.
+- **Prompt from the terminal under `curl … | bash` (#251).** The installer's
+  three prompts (rustup install, predecessor removal, shell startup check)
+  were gated on stdin being a TTY, which is never true when the script is
+  piped, so the documented "interactive mode" never prompted. Prompts now
+  write to and read from `/dev/tty`, so they work from any real terminal even
+  when piped. Without any TTY (e.g. CI) the installer prints an explicit
+  notice for every auto-taken decision, and the rustup question honors its
+  documented `(y/N)` default instead of falling through to an unattended
+  rustup install.
+- **Reconcile GitHub Copilot hook key casing (#253).** The Unix installer
+  merged `hooks.preToolUse` case-sensitively, so a PascalCase `PreToolUse`
+  key left by older releases gained a duplicate camelCase key on `dcg
+  update`, and the Unix uninstaller orphaned PascalCase dcg entries. The
+  installers and uninstallers on both platforms now resolve the key
+  case-insensitively, adopt the file's existing spelling, repair
+  duplicated-casing files into the single canonical camelCase `preToolUse`
+  key without dropping any non-dcg entry, and remove dcg entries under either
+  casing.
+
 ## [v0.8.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.8.0) -- 2026-07-31 [Release]
 
 ### Hook latency (#245, #248)

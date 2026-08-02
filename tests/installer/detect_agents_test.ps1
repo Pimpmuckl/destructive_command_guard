@@ -38,9 +38,33 @@ try {
     Check ($a['Copilot'] -eq $false) "Copilot NOT detected (no ~/.copilot, no copilot CLI)"
     Check ($a['Agy'] -eq $false) "Agy NOT detected (no agy on PATH)"
     Check ($a['Hermes'] -eq $false) "Hermes NOT detected"
+    Check ($a['Posit'] -eq $false) "Posit Assistant NOT detected"
     $names = Get-DetectedAgentNames $a
     Check (($names -join ',') -eq 'Claude,Gemini,Grok') "summary lists detected agents in config order (got '$($names -join ',')')"
     Remove-Item -Recurse -Force $h1 -ErrorAction SilentlyContinue
+
+    Write-Host "Test 1b: Posit Assistant detected from ~/.posit/assistant"
+    $h1b = New-TempHome
+    New-Item -ItemType Directory -Force -Path (Join-Path (Join-Path $h1b '.posit') 'assistant') | Out-Null
+    $a1b = Detect-Agents -HomeDir $h1b
+    Check ($a1b['Posit'] -eq $true) "Posit detected (~/.posit/assistant present)"
+    $names1b = Get-DetectedAgentNames $a1b
+    Check (($names1b -join ',') -eq 'Posit') "summary lists only Posit (got '$($names1b -join ',')')"
+    Remove-Item -Recurse -Force $h1b -ErrorAction SilentlyContinue
+
+    Write-Host "Test 1c: a bare ~/.posit directory is not enough"
+    $h1c = New-TempHome
+    New-Item -ItemType Directory -Force -Path (Join-Path $h1c '.posit') | Out-Null
+    $a1c = Detect-Agents -HomeDir $h1c
+    Check ($a1c['Posit'] -eq $false) "Posit NOT detected from ~/.posit alone (other Posit tools share it)"
+    Remove-Item -Recurse -Force $h1c -ErrorAction SilentlyContinue
+
+    Write-Host "Test 1d: legacy ~/.positai counts as Posit Assistant"
+    $h1d = New-TempHome
+    New-Item -ItemType Directory -Force -Path (Join-Path $h1d '.positai') | Out-Null
+    $a1d = Detect-Agents -HomeDir $h1d
+    Check ($a1d['Posit'] -eq $true) "Posit detected via legacy ~/.positai"
+    Remove-Item -Recurse -Force $h1d -ErrorAction SilentlyContinue
 
     Write-Host "Test 2: empty home -> nothing detected"
     $h2 = New-TempHome

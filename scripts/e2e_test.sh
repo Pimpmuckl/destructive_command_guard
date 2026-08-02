@@ -237,7 +237,7 @@ log_pass() {
 
     if ! $JSON_OUTPUT; then
         if $VERBOSE && ! $JSON_OUTPUT; then
-            local duration_ms="${TEST_TIMES[-1]}"
+            local duration_ms="${TEST_TIMES[$((${#TEST_TIMES[@]} - 1))]}"
             echo -e "${GREEN}✓${NC} $desc ${CYAN}(${duration_ms}ms)${NC}"
         else
             echo -e "${GREEN}✓${NC} $desc"
@@ -269,7 +269,7 @@ log_fail() {
     fi
 
     if ! $JSON_OUTPUT; then
-        local duration_ms="${TEST_TIMES[-1]}"
+        local duration_ms="${TEST_TIMES[$((${#TEST_TIMES[@]} - 1))]}"
         if $VERBOSE && ! $JSON_OUTPUT; then
             echo -e "${RED}✗${NC} $desc ${CYAN}(${duration_ms}ms)${NC}"
             echo -e "  ${YELLOW}Expected:${NC} $expected"
@@ -1659,7 +1659,7 @@ test_command_with_allowlist_and_env() {
             XDG_CONFIG_HOME="$TEST_ENV_XDG" \
             DCG_CONFIG="$tmpdir/.dcg.toml" \
             DCG_ALLOWLIST_SYSTEM_PATH="" \
-            "${env_args[@]}" "$BINARY" 2>/dev/null || true
+            ${env_args[@]+"${env_args[@]}"} "$BINARY" 2>/dev/null || true
     )
 
     # Note: do not delete tmpdir here; destructive cleanup is intentionally avoided.
@@ -1760,7 +1760,7 @@ test_command_with_layered_allowlists() {
             XDG_CONFIG_HOME="$user_config_dir" \
             DCG_CONFIG="$project_dir/.dcg.toml" \
             DCG_ALLOWLIST_SYSTEM_PATH="$system_path" \
-            "${env_args[@]}" "$BINARY" 2>/dev/null || true
+            ${env_args[@]+"${env_args[@]}"} "$BINARY" 2>/dev/null || true
     )
 
     # Note: do not delete tmpdir here; destructive cleanup is intentionally avoided.

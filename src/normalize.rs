@@ -1259,6 +1259,25 @@ fn busybox_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> Op
     (!applet.starts_with('-')).then_some(1)
 }
 
+/// `mise exec [TOOL@VERSION]... -- <command>...` (and the `mise x` alias)
+/// runs its trailing argv as a command. Only the explicit `--` form is
+/// stripped: without it, mise's tool-spec/command boundary is ambiguous
+/// (issue #257).
+fn mise_exec_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> Option<usize> {
+    let subcommand = wrapper_word(command, tokens, 1)?;
+    if subcommand != "exec" && subcommand != "x" {
+        return None;
+    }
+    let mut index = 2usize;
+    while let Some(word) = wrapper_word(command, tokens, index) {
+        if word == "--" {
+            return (index + 1 < tokens.len()).then_some(index + 1);
+        }
+        index += 1;
+    }
+    None
+}
+
 pub(crate) fn strip_posix_execution_frontend(command: &str) -> Option<(&str, &'static str)> {
     let trimmed = command.trim_start();
     let tokens = tokenize_for_normalization(trimmed);
@@ -1284,6 +1303,7 @@ pub(crate) fn strip_posix_execution_frontend(command: &str) -> Option<(&str, &'s
         "stdbuf" => stdbuf_wrapper_command_index(trimmed, &tokens)?,
         "chrt" => chrt_wrapper_command_index(trimmed, &tokens)?,
         "busybox" => busybox_wrapper_command_index(trimmed, &tokens)?,
+        "mise" => mise_exec_wrapper_command_index(trimmed, &tokens)?,
         _ => return None,
     };
     let remaining = wrapper_command_suffix(trimmed, &tokens, command_index)?;
@@ -1300,6 +1320,7 @@ pub(crate) fn strip_posix_execution_frontend(command: &str) -> Option<(&str, &'s
             "stdbuf" => "stdbuf",
             "chrt" => "chrt",
             "busybox" => "busybox",
+            "mise" => "mise-exec",
             _ => unreachable!("wrapper basename was matched above"),
         },
     ))
@@ -4815,6 +4836,49 @@ mod tests {
             normalize_command_word_token("'hello'"),
             Some("hello".to_string())
         );
+    }
+
+    // =========================================================================
+    // Issue #257: `mise exec`/`mise x` execution-frontend stripping
+    // =========================================================================
+
+    #[test]
+    fn mise_exec_with_explicit_dashdash_strips_to_wrapped_command() {
+        assert_eq!(
+            strip_posix_execution_frontend("mise exec -- git status"),
+            Some(("git status", "mise-exec"))
+        );
+        // The `mise x` alias with a TOOL@VERSION spec before `--`.
+        assert_eq!(
+            strip_posix_execution_frontend("mise x node@20 -- npm run build"),
+            Some(("npm run build", "mise-exec"))
+        );
+        // Exec options and multiple tool specs before `--` are skipped too.
+        assert_eq!(
+            strip_posix_execution_frontend("mise exec node@20 python@3.12 -- git status"),
+            Some(("git status", "mise-exec"))
+        );
+    }
+
+    #[test]
+    fn mise_without_explicit_dashdash_is_not_stripped() {
+        // Without `--`, mise's tool-spec/command boundary is ambiguous, so
+        // the wrapper is left in place.
+        assert_eq!(strip_posix_execution_frontend("mise exec git status"), None);
+        // Non-exec subcommands never wrap a command.
+        assert_eq!(strip_posix_execution_frontend("mise install node"), None);
+        // `--` with nothing after it wraps no command at all.
+        assert_eq!(strip_posix_execution_frontend("mise exec --"), None);
+    }
+
+    #[test]
+    fn strip_wrapper_prefixes_unwraps_mise_exec_chains() {
+        let result = strip_wrapper_prefixes("mise exec -- git reset --hard");
+        assert!(result.was_normalized());
+        assert_eq!(result.normalized, "git reset --hard");
+
+        let untouched = strip_wrapper_prefixes("mise install node");
+        assert!(!untouched.was_normalized());
     }
 }
 

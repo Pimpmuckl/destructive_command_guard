@@ -422,25 +422,35 @@ function Unconfigure-CopilotHook {
   if ($null -eq $config -or $config -isnot [psobject]) { return $false }
   $hooks = Get-ObjectPropertyValue $config "hooks"
   if ($null -eq $hooks -or $hooks -isnot [psobject]) { return $false }
-  if (-not (Test-ObjectPropertyExists $hooks "preToolUse")) { return $false }
-  $entries = Get-JsonArray (Get-ObjectPropertyValue $hooks "preToolUse")
-  $kept = @()
+  # Match the event key explicitly and case-insensitively: Copilot's schema is
+  # camelCase `preToolUse`, but historical dcg releases could leave a
+  # PascalCase `PreToolUse` entry behind; clean every matching spelling (#253).
+  $preProps = @($hooks.PSObject.Properties | Where-Object { $_.Name.ToLowerInvariant() -eq 'pretooluse' })
+  if ($preProps.Count -eq 0) { return $false }
   $removed = $false
-  foreach ($e in $entries) {
-    if ($e -isnot [psobject]) { $kept += $e; continue }
-    foreach ($field in @("bash", "powershell")) {
-      $val = Get-ObjectPropertyValue $e $field
-      if ($null -ne $val -and ((Get-DcgCommandName ([string]$val)) -in @('dcg', 'dcg.exe'))) {
-        Remove-ObjectPropertyValue $e $field
-        $removed = $true
+  foreach ($prop in $preProps) {
+    $preKey = $prop.Name
+    $entries = Get-JsonArray $prop.Value
+    $kept = @()
+    $keyRemoved = $false
+    foreach ($e in $entries) {
+      if ($e -isnot [psobject]) { $kept += $e; continue }
+      foreach ($field in @("bash", "powershell")) {
+        $val = Get-ObjectPropertyValue $e $field
+        if ($null -ne $val -and ((Get-DcgCommandName ([string]$val)) -in @('dcg', 'dcg.exe'))) {
+          Remove-ObjectPropertyValue $e $field
+          $keyRemoved = $true
+        }
       }
+      $hasPlatform = (Test-ObjectPropertyExists $e "bash") -or (Test-ObjectPropertyExists $e "powershell")
+      if ($hasPlatform) { $kept += $e }  # else: drop the now-empty dcg entry
     }
-    $hasPlatform = (Test-ObjectPropertyExists $e "bash") -or (Test-ObjectPropertyExists $e "powershell")
-    if ($hasPlatform) { $kept += $e }  # else: drop the now-empty dcg entry
+    if (-not $keyRemoved) { continue }
+    $removed = $true
+    if ($kept.Count -gt 0) { Set-ObjectPropertyValue $hooks $preKey $kept }
+    else { Remove-ObjectPropertyValue $hooks $preKey }
   }
   if (-not $removed) { return $false }
-  if ($kept.Count -gt 0) { Set-ObjectPropertyValue $hooks "preToolUse" $kept }
-  else { Remove-ObjectPropertyValue $hooks "preToolUse" }
   if (Test-EmptyObject $hooks) { Remove-ObjectPropertyValue $config "hooks" }
   $remainingKeys = @($config.PSObject.Properties.Name | Where-Object { $_ -ne 'version' })
   if ($remainingKeys.Count -eq 0) {
@@ -533,6 +543,14 @@ if (Get-Command git -ErrorAction SilentlyContinue) {
 
 # Hermes Agent (~/.hermes/config.yaml).
 if (Unconfigure-HermesHook) { Write-Ok "Removed Hermes hook" }
+
+# Posit Assistant (~/.posit/assistant/settings.json): Claude-Code-shaped hooks,
+# so the generic remover applies. Deliberately NO -DeleteEmptyFile — Posit
+# Assistant keeps unrelated settings (model, permissions, ...) in this file.
+$positAssistantSettings = Join-Path (Join-Path (Join-Path $HOME ".posit") "assistant") "settings.json"
+if (Remove-DcgHooksFromJsonFile -Path $positAssistantSettings) {
+  Write-Ok "Removed Posit Assistant hook"
+}
 
 # Grok (xAI): ~/.grok/hooks/dcg.json is a dcg-OWNED file — delete it outright
 # (user-level and any project-local copy).

@@ -364,6 +364,53 @@ mod tests {
         );
     }
 
+    /// The absolute latency gate must stay wired to the shipped budget.
+    ///
+    /// #245 shipped because nothing tied the *product's* deadline to a test
+    /// that could fail on absolute cost: the perf job only ratcheted against a
+    /// recorded baseline. This test asserts the CI gate still reads
+    /// `HOOK_EVALUATION_BUDGET_MS` out of this file and still runs the two
+    /// suites that catch the failure at the protocol layer. If someone renames
+    /// the constant, drops the gate, or removes the harness matrix, this test
+    /// fails rather than silently re-opening the hole.
+    #[test]
+    fn ci_enforces_absolute_latency_gate_against_shipped_budget() {
+        let ci = include_str!("../.github/workflows/ci.yml");
+
+        assert!(
+            ci.contains("HOOK_EVALUATION_BUDGET_MS"),
+            "CI must derive the latency gate's budget by reading \
+             HOOK_EVALUATION_BUDGET_MS out of src/perf.rs — a hard-coded number \
+             in the workflow silently decouples the gate from the shipped \
+             default (#245)"
+        );
+        assert!(
+            ci.contains("--assert-budget-ms"),
+            "CI must invoke scripts/perf_baseline.py with --assert-budget-ms; \
+             the relative baseline comparison alone cannot catch a uniform \
+             slowdown that eats the fixed hook deadline (#245)"
+        );
+        assert!(
+            ci.contains("scripts/e2e_harness_matrix.sh"),
+            "CI must run the harness protocol matrix: it is the only gate that \
+             asserts each agent's wire contract against the real binary"
+        );
+
+        // The margin must leave real headroom: a gate set at ~100% of the
+        // budget passes right up until the moment users start failing closed.
+        let margin = ci
+            .split("--assert-margin-pct")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|value| value.parse::<u32>().ok())
+            .expect("CI must pass an explicit --assert-margin-pct value");
+        assert!(
+            margin <= 60,
+            "latency gate margin is {margin}% of the budget; keep it <=60% so \
+             the gate trips before real users hit indeterminate verdicts"
+        );
+    }
+
     #[test]
     fn fail_open_threshold() {
         assert!(!exceeds_absolute_budget(Duration::from_millis(999)));
@@ -461,30 +508,49 @@ mod tests {
             );
         }
 
+        // Derive the deadline prose from the constant rather than hard-coding
+        // it. A literal here only proves the docs say some fixed number — it
+        // cannot detect the constant moving underneath them, which is the
+        // exact drift this test exists to prevent (a build with the budget
+        // reverted to 200ms passed this test while the docs still claimed
+        // 1000ms).
+        let deadline_prose = format!(
+            "- Hook evaluation deadline: {HOOK_EVALUATION_BUDGET_MS}ms \
+             (exhaustion is indeterminate, never a silent allow)"
+        );
         for expected in [
             "- Quick reject: < 50us panic",
             "- Fast path: < 500us panic",
             "- Pattern match: < 1ms panic",
             "- Heredoc extract: < 2ms panic",
             "- Full heredoc pipeline: < 20ms panic",
-            "- Hook evaluation deadline: 1000ms (exhaustion is indeterminate, never a silent allow)",
+            deadline_prose.as_str(),
         ] {
             assert!(
                 agents.contains(expected),
-                "AGENTS.md benchmark budget prose drifted; missing: {expected}"
+                "AGENTS.md benchmark budget prose drifted from src/perf.rs; missing: {expected}"
             );
         }
 
+        let ci_deadline_prose = format!("# {deadline_prose}");
         for expected in [
             "# - Full heredoc pipeline: 20ms panic",
-            "# - Hook evaluation deadline: 1000ms (exhaustion is indeterminate, never a silent allow)",
+            ci_deadline_prose.as_str(),
             "Full heredoc pipeline benchmark exceeds 20ms budget",
         ] {
             assert!(
                 ci.contains(expected),
-                ".github/workflows/ci.yml budget prose drifted; missing: {expected}"
+                ".github/workflows/ci.yml budget prose drifted from src/perf.rs; missing: {expected}"
             );
         }
+
+        // The README states the same deadline in prose; keep it in lockstep so
+        // users are never told a budget the binary does not use.
+        assert!(
+            readme.contains(&format!("default is **{HOOK_EVALUATION_BUDGET_MS}ms**")),
+            "README hook-deadline prose drifted from HOOK_EVALUATION_BUDGET_MS \
+             ({HOOK_EVALUATION_BUDGET_MS}ms)"
+        );
 
         assert!(
             bench.contains("- Full heredoc pipeline: < 20ms (panic threshold)"),

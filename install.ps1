@@ -872,9 +872,31 @@ function Configure-CopilotHook {
     $hooks = [pscustomobject][ordered]@{}
     Set-ObjectPropertyValue $config "hooks" $hooks
   }
-  $pre = Get-ObjectPropertyValue $hooks "preToolUse"
-  if ($null -ne $pre -and -not (Test-JsonArray $pre)) {
-    throw "Copilot hook file preToolUse must contain a list; leaving it unchanged: $hookFile"
+  # Copilot's published hooks schema names the event camelCase `preToolUse`,
+  # but historical dcg releases could leave a PascalCase `PreToolUse` behind.
+  # Resolve the actual property name explicitly and case-insensitively rather
+  # than leaning on PSObject's case-insensitive member lookup, adopt the
+  # file's existing spelling, and repair a duplicate casing pair into the one
+  # canonical camelCase key (#253).
+  $preProps = @($hooks.PSObject.Properties | Where-Object { $_.Name.ToLowerInvariant() -eq 'pretooluse' })
+  foreach ($p in $preProps) {
+    if ($null -ne $p.Value -and -not (Test-JsonArray $p.Value)) {
+      throw "Copilot hook file $($p.Name) must contain a list; leaving it unchanged: $hookFile"
+    }
+  }
+  if ($preProps.Count -eq 0) {
+    $preKey = 'preToolUse'
+    $pre = $null
+  } elseif ($preProps.Count -eq 1) {
+    $preKey = $preProps[0].Name
+    $pre = $preProps[0].Value
+  } else {
+    # Both casings present: merge every entry into one canonical key so no
+    # non-dcg hook is dropped; dcg-owned entries are stripped below.
+    $preKey = 'preToolUse'
+    $pre = @()
+    foreach ($p in $preProps) { $pre += (Get-JsonArray $p.Value) }
+    foreach ($p in $preProps) { $hooks.PSObject.Properties.Remove($p.Name) }
   }
 
   $preserved = @()
@@ -896,7 +918,7 @@ function Configure-CopilotHook {
   }
 
   Set-ObjectPropertyValue $config "version" 1
-  Set-ObjectPropertyValue $hooks "preToolUse" (@($desired) + $preserved)
+  Set-ObjectPropertyValue $hooks $preKey (@($desired) + $preserved)
 
   $newJson = $config | ConvertTo-Json -Depth 20
   $origNorm = ($originalJson | ConvertFrom-Json) | ConvertTo-Json -Depth 20
@@ -1113,6 +1135,52 @@ function Configure-HermesHook {
   $yaml = ConvertTo-Yaml $doc
   Write-Utf8NoBomText -Path $cfgFile -Text $yaml
   "merged"
+}
+
+# Configure Posit Assistant's PreToolUse hook in ~/.posit/assistant/settings.json.
+# One entry in the global file covers the Positron/RStudio extension, the
+# standalone server, and the `pa` terminal client — they all read this file.
+#
+# The wire contract is Claude-Code-compatible (snake_case PreToolUse stdin,
+# exit code 2 blocks with stderr as the reason, and
+# hookSpecificOutput.permissionDecision is read on exit 0), so dcg answers with
+# its existing ClaudeCompatible protocol and only the config entry differs from
+# Configure-ClaudeHook:
+#
+#   1. The matcher is lowercase "bash|powershell". A simple matcher string is
+#      an EXACT match (with "|"/"," separating alternatives) against the tool
+#      name, so Claude's "Bash|PowerShell" would match neither shell tool.
+#   2. Only documented handler fields are emitted: type, command, timeout. In
+#      particular there is NO `shell` field (which the Claude entry uses); the
+#      command path is quoted instead — shell-form hooks run through cmd.exe on
+#      Windows, and quoting keeps an install path with spaces resolvable.
+#   3. `timeout` is in seconds and bounds a wedged hook.
+#
+# Returns "created" | "already" | "merged" | "skipped".
+function Configure-PositAssistantHook {
+  param([string]$DcgPath, [switch]$Force, [string]$HomeDir = $HOME)
+
+  $positDir = Join-Path (Join-Path $HomeDir ".posit") "assistant"
+  $settingsFile = Join-Path $positDir "settings.json"
+  # ~/.posit/assistant is created lazily on first run, so also accept the
+  # legacy config dir and the `pa` terminal client on PATH. A bare ~/.posit is
+  # deliberately NOT enough — other Posit tools use that directory too.
+  $positInstalled = (Test-Path $positDir -PathType Container) -or
+    (Test-Path (Join-Path $HomeDir ".positai") -PathType Container) -or
+    ($null -ne (Get-Command pa -ErrorAction SilentlyContinue))
+
+  if (-not $positInstalled -and -not $Force) { return "skipped" }
+
+  if (-not (Test-Path $positDir -PathType Container)) {
+    New-Item -ItemType Directory -Force -Path $positDir | Out-Null
+  }
+
+  $dcgHook = [pscustomobject][ordered]@{
+    type = "command"
+    command = '"' + $DcgPath + '"'
+    timeout = 10
+  }
+  Merge-AgentHookFile -HooksFile $settingsFile -DcgHook $dcgHook -Event "PreToolUse" -Matcher "bash|powershell" -Label "Posit Assistant settings.json"
 }
 
 function Resolve-LocalSourcePath {
@@ -1595,6 +1663,9 @@ function Detect-Agents {
     'Grok'    = ((_dir '.grok')    -or (-not [string]::IsNullOrEmpty($env:GROK_SESSION_ID)))
     'Agy'     = (_has 'agy')
     'Hermes'  = (_dir '.hermes')
+    # A bare ~/.posit is not enough — other Posit tools share that directory.
+    'Posit'   = ((Test-Path (Join-Path (Join-Path $HomeDir '.posit') 'assistant') -PathType Container) -or
+      (_dir '.positai') -or (_has 'pa'))
   }
 }
 
@@ -1602,7 +1673,7 @@ function Get-DetectedAgentNames {
   # The display-names of agents Detect-Agents flagged as present, in order.
   param($Agents)
   @(
-    foreach ($name in @('Claude', 'Codex', 'Gemini', 'Cursor', 'Copilot', 'Grok', 'Agy', 'Hermes')) {
+    foreach ($name in @('Claude', 'Codex', 'Gemini', 'Cursor', 'Copilot', 'Grok', 'Agy', 'Hermes', 'Posit')) {
       if ($Agents[$name]) { $name }
     }
   )
@@ -1636,6 +1707,7 @@ Configured agents (when detected, or with -Force/-EasyMode):
   Claude Code  (~/.claude/settings.json)      Codex CLI   (~/.codex/hooks.json)
   Gemini CLI   (~/.gemini/settings.json)      Copilot CLI (~/.copilot/hooks/dcg.json)
   Cursor IDE   (~/.cursor/hooks.json)         Hermes      (~/.hermes/config.yaml)
+  Posit Assistant (~/.posit/assistant/settings.json)
   Grok / agy   via dcg install --grok / --agy under -EasyMode when detected
 '@
   exit 0
@@ -2016,6 +2088,24 @@ if ($detectedAgents['Hermes'] -or $forceConfig) {
     }
   } catch {
     Write-Warn "Hermes auto-configuration failed: $_"
+  }
+}
+
+# Configure Posit Assistant (~/.posit/assistant/settings.json) when detected (or
+# -EasyMode). The single global entry covers the Positron/RStudio extension, the
+# standalone server, and the `pa` terminal client — they all read this file.
+if ($detectedAgents['Posit'] -or $forceConfig) {
+  Write-Host ""
+  try {
+    switch (Configure-PositAssistantHook -DcgPath $dcgExe -Force:$forceConfig) {
+      "created" { Write-Ok "Created Posit Assistant hook at $HOME\.posit\assistant\settings.json" }
+      "merged" { Write-Ok "Added Posit Assistant hook to $HOME\.posit\assistant\settings.json" }
+      "already" { Write-Ok "Posit Assistant hook already configured" }
+      "skipped" { Write-Info "Posit Assistant not detected; re-run with -EasyMode to configure it anyway" }
+      default { Write-Warn "Posit Assistant hook status unknown" }
+    }
+  } catch {
+    Write-Warn "Posit Assistant auto-configuration failed: $_"
   }
 }
 

@@ -2050,8 +2050,15 @@ fn resolve_visible_alias_invocation(
         let Some(alias) = lookup_visible_alias(definitions, &command) else {
             // Git next consults repository/global aliases and external
             // `git-<command>` helpers. A pure parser cannot prove either
-            // runtime namespace safe, so unknown subcommands are the explicit
-            // zero-false-negative boundary.
+            // runtime namespace safe, so unknown *name-shaped* subcommands
+            // are the explicit zero-false-negative boundary. A token Git's
+            // dispatch could never accept (shell punctuation glued on by a
+            // cross-dialect tokenizer view, e.g. the Cmd reading of POSIX
+            // `git pull; done`) is a Git usage error, not a possible alias
+            // (issue #250).
+            if !git_subcommand_token_is_dispatchable(&command) {
+                return InvokedGitAliasDecision::NoMatch;
+            }
             return InvokedGitAliasDecision::Unverified;
         };
         let VisibleAliasValue::Static(alias) = alias else {
@@ -2078,6 +2085,24 @@ fn resolve_visible_alias_invocation(
         arguments = replacement;
     }
     InvokedGitAliasDecision::Unverified
+}
+
+/// Whether a token could ever reach Git's subcommand dispatch (a builtin, an
+/// `alias.<name>` config key, or an external `git-<name>` helper).
+///
+/// Git config key names only allow ASCII alphanumerics and `-`, and helper
+/// names are ordinary executable filenames; a token carrying shell
+/// punctuation such as `;`, quotes, or redirection glyphs is a cross-dialect
+/// tokenizer artifact (e.g. the Cmd view of POSIX `git pull; done`, where
+/// `;` is not a separator), not a candidate alias — Git itself would reject
+/// it as a usage error. Treating such tokens as "possibly aliased" turned
+/// every `git <sub>; …` compound into a false `git-alias-semantic-unverified`
+/// deny under `ShellDialect::Unknown` (issue #250).
+fn git_subcommand_token_is_dispatchable(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-'))
 }
 
 fn is_known_git_command(command: &str) -> bool {
@@ -3059,7 +3084,10 @@ fn cross_segment_git_alias_decision(
             continue;
         }
 
-        if conditional_alias_state && !is_known_git_command(&words[subcommand_index].decoded) {
+        if conditional_alias_state
+            && !is_known_git_command(&words[subcommand_index].decoded)
+            && git_subcommand_token_is_dispatchable(&words[subcommand_index].decoded)
+        {
             return InvokedGitAliasDecision::Unverified;
         }
 
@@ -3077,7 +3105,9 @@ fn cross_segment_git_alias_decision(
                 definition.name.is_none() || matches!(definition.value, VisibleAliasValue::Dynamic)
             })
         {
-            if !is_known_git_command(&words[subcommand_index].decoded) {
+            if !is_known_git_command(&words[subcommand_index].decoded)
+                && git_subcommand_token_is_dispatchable(&words[subcommand_index].decoded)
+            {
                 return InvokedGitAliasDecision::Unverified;
             }
             continue;
@@ -6195,5 +6225,36 @@ git x",
 
         let many_spaces = format!("git{}status", " ".repeat(100));
         assert_matches_within_budget(&pack, &many_spaces);
+    }
+
+    // =========================================================================
+    // Issue #250: cross-dialect tokenizer artifacts are not alias candidates
+    // =========================================================================
+
+    #[test]
+    fn dispatchable_git_subcommand_tokens_are_name_shaped() {
+        // Builtins, unknown alias names, and external `git-<name>` helper
+        // names all stay candidates for Git's subcommand dispatch.
+        for token in ["pull", "lg", "foo-bar", "st.sub", "a_b", "x+y", "v2"] {
+            assert!(
+                git_subcommand_token_is_dispatchable(token),
+                "expected {token:?} to be dispatchable"
+            );
+        }
+    }
+
+    #[test]
+    fn tokenizer_artifacts_are_not_dispatchable_git_subcommands() {
+        // Shell punctuation can never appear in a config key or helper
+        // filename that Git would dispatch; such tokens are cross-dialect
+        // tokenizer artifacts (e.g. the Cmd view of POSIX `git pull; done`).
+        for token in [
+            "pull;", "pull'", "fetch\"", "", "sub|x", "x&y", "sub>out", "pu ll", "x`y", "$(x)",
+        ] {
+            assert!(
+                !git_subcommand_token_is_dispatchable(token),
+                "expected {token:?} to be rejected as a tokenizer artifact"
+            );
+        }
     }
 }

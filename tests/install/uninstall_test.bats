@@ -452,6 +452,53 @@ if "powershell" in residual:
 PYEOF
 }
 
+@test "unconfigure_copilot: removes PascalCase dcg entry and preserves coexisting hook" {
+    log_test "Testing GitHub Copilot CLI PascalCase key removal (#253)..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+    extract_uninstall_functions
+
+    export COPILOT_HOME="$HOME/.copilot"
+    mkdir -p "$COPILOT_HOME/hooks"
+    cd "$TEST_TMPDIR"
+    cat > "$COPILOT_HOME/hooks/dcg.json" << 'EOF'
+{
+  "version": 1,
+  "hooks": {
+    "PreToolUse": [
+      {
+        "type": "command",
+        "bash": "/usr/local/bin/dcg",
+        "powershell": "/usr/local/bin/dcg",
+        "cwd": ".",
+        "timeoutSec": 30
+      },
+      {
+        "type": "command",
+        "bash": "/opt/dcgrep/bin/scan",
+        "powershell": "/opt/dcgrep/bin/scan",
+        "cwd": ".",
+        "timeoutSec": 30
+      }
+    ]
+  }
+}
+EOF
+
+    run unconfigure_copilot
+
+    log_test "unconfigure_copilot status: $status"
+    log_test "unconfigure_copilot output: $output"
+    log_test "After: $(cat "$COPILOT_HOME/hooks/dcg.json")"
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"removed"* ]]
+    if grep -qF '/usr/local/bin/dcg' "$COPILOT_HOME/hooks/dcg.json"; then
+        return 1
+    fi
+    grep -qF '/opt/dcgrep/bin/scan' "$COPILOT_HOME/hooks/dcg.json"
+    grep -qF '"PreToolUse"' "$COPILOT_HOME/hooks/dcg.json"
+}
+
 # ============================================================================
 # Cursor IDE Uninstall Tests
 # ============================================================================

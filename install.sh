@@ -72,6 +72,41 @@ if command -v gum &> /dev/null && [ -t 1 ]; then
   HAS_GUM=1
 fi
 
+# Operator TTY detection (#251). Under `curl … | bash`, stdin is the script
+# pipe, so `[ -t 0 ]` is false even though a human is sitting at a terminal.
+# The controlling terminal is still reachable via /dev/tty, so prompts write
+# to and read from it directly. Truly headless runs (CI, cron) have no
+# controlling terminal, fail this probe, and take the documented defaults.
+DCG_TTY=""
+if ( : </dev/tty >/dev/tty ) 2>/dev/null; then
+  DCG_TTY="/dev/tty"
+fi
+
+# True when an operator terminal is available for prompting.
+have_tty() { [ -n "$DCG_TTY" ]; }
+
+# ask_yn "<prompt>" "<y|n default>" — ask a yes/no question on the operator
+# TTY. Prints the prompt to /dev/tty and reads the reply from it, so it works
+# under `curl … | bash`. Returns 0 for yes, 1 for no. The default answers
+# empty input, a failed read, or a missing TTY, and follows the same
+# convention as the inline prompts it replaces: a "y" default only becomes no
+# on an explicit no, an "n" default only becomes yes on an explicit yes.
+ask_yn() {
+  local prompt="$1"
+  local default="${2:-n}"
+  local reply=""
+  if have_tty; then
+    printf '%s ' "$prompt" >"$DCG_TTY" 2>/dev/null || true
+    IFS= read -r reply <"$DCG_TTY" 2>/dev/null || reply=""
+  fi
+  [ -n "$reply" ] || reply="$default"
+  if [ "$default" = "y" ]; then
+    case "$reply" in n|N|no|No|NO) return 1 ;; *) return 0 ;; esac
+  else
+    case "$reply" in y|Y|yes|Yes|YES) return 0 ;; *) return 1 ;; esac
+  fi
+}
+
 # Logging functions with optional gum formatting
 log() { [ "$QUIET" -eq 1 ] && return 0; echo -e "$@"; }
 
@@ -185,6 +220,7 @@ CONTINUE_VERSION=""
 CURSOR_VERSION=""
 COPILOT_VERSION=""
 HERMES_VERSION=""
+POSIT_ASSISTANT_VERSION=""
 
 print_agent_scan_notice() {
   [ "$QUIET" -eq 1 ] && return 0
@@ -228,6 +264,23 @@ try_version() {
   else
     "$cmd" --version 2>/dev/null | head -1 || true
   fi
+}
+
+# Posit Assistant ships as an IDE extension (Positron/RStudio), a standalone
+# server, and the `pa` terminal client, so no single probe covers every
+# install. Any one of these is enough to configure the shared global settings
+# file:
+#
+#   - ~/.posit/assistant is the current config directory (created on first run)
+#   - ~/.positai is the legacy config directory older installs still carry
+#   - `pa` on PATH covers a fresh terminal-client install that has not run yet
+#
+# An IDE-only install that has never been launched matches none of these;
+# launching Posit Assistant once and re-running the installer picks it up.
+posit_assistant_installed() {
+  [ -d "$HOME/.posit/assistant" ] ||
+    [ -d "$HOME/.positai" ] ||
+    command -v pa >/dev/null 2>&1
 }
 
 detect_agents() {
@@ -295,6 +348,12 @@ detect_agents() {
     DETECTED_AGENTS+=("hermes")
     HERMES_VERSION=$(try_version hermes)
   fi
+
+  # Posit Assistant (Posit Software, PBC)
+  if posit_assistant_installed; then
+    DETECTED_AGENTS+=("posit-assistant")
+    POSIT_ASSISTANT_VERSION=$(try_version pa)
+  fi
 }
 
 print_detected_agents() {
@@ -352,6 +411,11 @@ print_detected_agents() {
           [[ -n "$HERMES_VERSION" ]] && ver_info=" (${HERMES_VERSION})"
           gum style --foreground 42 "  ✓ Hermes Agent${ver_info}"
           ;;
+        posit-assistant)
+          local ver_info=""
+          [[ -n "$POSIT_ASSISTANT_VERSION" ]] && ver_info=" (${POSIT_ASSISTANT_VERSION})"
+          gum style --foreground 42 "  ✓ Posit Assistant${ver_info}"
+          ;;
       esac
     done
     echo ""
@@ -399,6 +463,11 @@ print_detected_agents() {
           local ver_info=""
           [[ -n "$HERMES_VERSION" ]] && ver_info=" (${HERMES_VERSION})"
           echo -e "  \033[0;32m✓\033[0m Hermes Agent${ver_info}"
+          ;;
+        posit-assistant)
+          local ver_info=""
+          [[ -n "$POSIT_ASSISTANT_VERSION" ]] && ver_info=" (${POSIT_ASSISTANT_VERSION})"
+          echo -e "  \033[0;32m✓\033[0m Posit Assistant${ver_info}"
           ;;
       esac
     done
@@ -997,10 +1066,17 @@ ensure_rust() {
   fi
   if command -v cargo >/dev/null 2>&1 && rustc --version 2>/dev/null | grep -q nightly; then return 0; fi
   if [ "$EASY" -ne 1 ]; then
-    if [ -t 0 ]; then
-      echo -n "Install Rust nightly via rustup? (y/N): "
-      read -r ans
-      case "$ans" in y|Y) :;; *) warn "Skipping rustup install"; return 0;; esac
+    if have_tty; then
+      if ! ask_yn "Install Rust nightly via rustup? (y/N):" "n"; then
+        warn "Skipping rustup install"
+        return 0
+      fi
+    else
+      # No operator terminal: honor the documented (y/N) default and do NOT
+      # install rustup unattended (#251).
+      warn "Skipping rustup install (no TTY to confirm; the default answer is No)"
+      info "Install a Rust nightly toolchain yourself (https://rustup.rs), or re-run the installer from a terminal to be prompted"
+      return 0
     fi
   fi
   info "Installing rustup (nightly)"
@@ -1536,6 +1612,7 @@ CURSOR_HOOKS_JSON="$HOME/.cursor/hooks.json"
 CURSOR_HOOK_DIR="$HOME/.cursor/hooks"
 CURSOR_HOOK_SCRIPT="$CURSOR_HOOK_DIR/dcg-pre-shell.py"
 HERMES_CONFIG="$HOME/.hermes/config.yaml"
+POSIT_ASSISTANT_SETTINGS="$HOME/.posit/assistant/settings.json"
 AUTO_CONFIGURED=0
 
 # Detailed tracking for what was configured
@@ -1553,6 +1630,9 @@ CURSOR_FAILURE_REASON=""
 COPILOT_STATUS="" # "created"|"merged"|"already"|"skipped"|"failed"
 HERMES_STATUS=""  # "created"|"merged"|"already"|"skipped"|"failed"
 HERMES_FAILURE_REASON=""
+POSIT_ASSISTANT_STATUS=""  # "created"|"merged"|"already"|"skipped"|"failed"
+POSIT_ASSISTANT_FAILURE_REASON=""
+POSIT_ASSISTANT_BACKUP=""
 CLAUDE_BACKUP=""
 GEMINI_BACKUP=""
 AIDER_BACKUP=""
@@ -2593,13 +2673,34 @@ if not isinstance(hooks, dict):
     print(f"Copilot hook file hooks must contain a JSON object: {hook_file}", file=sys.stderr)
     raise SystemExit(1)
 
-pre_tool = hooks.get("preToolUse")
-if "preToolUse" not in hooks:
+# Copilot's published hooks schema names the event camelCase `preToolUse`,
+# but dcg <= 0.8.0 merged case-sensitively and could leave a PascalCase
+# `PreToolUse` (or a duplicate pair) behind. Resolve the key
+# case-insensitively, adopt the file's existing spelling, and never create a
+# duplicate second key (#253).
+pre_tool_keys = [k for k in hooks if k.lower() == "pretooluse"]
+for key in pre_tool_keys:
+    if not isinstance(hooks[key], list):
+        print(f"Copilot hook file {key} must contain a list: {hook_file}", file=sys.stderr)
+        raise SystemExit(1)
+
+if not pre_tool_keys:
+    pre_tool_key = "preToolUse"
     pre_tool = []
-    hooks["preToolUse"] = pre_tool
-elif not isinstance(pre_tool, list):
-    print(f"Copilot hook file preToolUse must contain a list: {hook_file}", file=sys.stderr)
-    raise SystemExit(1)
+    hooks[pre_tool_key] = pre_tool
+elif len(pre_tool_keys) == 1:
+    pre_tool_key = pre_tool_keys[0]
+    pre_tool = hooks[pre_tool_key]
+else:
+    # Both casings exist (a file damaged by the old case-sensitive merge):
+    # repair into the single canonical camelCase key, carrying over every
+    # entry so non-dcg hooks are never dropped. dcg-owned entries are
+    # stripped below before the canonical entry is prepended.
+    pre_tool_key = "preToolUse"
+    pre_tool = []
+    for key in pre_tool_keys:
+        pre_tool.extend(hooks.pop(key))
+    hooks[pre_tool_key] = pre_tool
 
 desired = {
     "type": "command",
@@ -2651,7 +2752,7 @@ for entry in pre_tool:
 
 next_pre_tool = [desired] + preserved
 changed = pre_tool != next_pre_tool
-hooks["preToolUse"] = next_pre_tool
+hooks[pre_tool_key] = next_pre_tool
 
 after = json.dumps(settings, sort_keys=True)
 if not changed and before == after:
@@ -3267,6 +3368,306 @@ EOFSET
   fi
 }
 
+configure_posit_assistant() {
+  # Posit Assistant (Posit Software, PBC — https://positron.posit.co/assistant/)
+  # reads Claude-Code-compatible lifecycle hooks from the global
+  # ~/.posit/assistant/settings.json plus per-workspace overrides. We write the
+  # global file so one install covers the Positron/RStudio extension, the
+  # standalone server, and the `pa` terminal client in every workspace.
+  #
+  # The hook contract is not publicly documented yet; the behavior below is the
+  # empirically-verified contract, pinned by tests in src/hook.rs: `PreToolUse`
+  # stdin is the snake_case Claude shape with the command in
+  # `tool_input.command`, exit code 2 blocks with stderr as the reason, and
+  # `hookSpecificOutput.permissionDecision` is read on exit 0. dcg's existing
+  # ClaudeCompatible protocol answers all of that, so only the config entry
+  # differs from Claude Code's:
+  #
+  #   1. The matcher is lowercase "bash|powershell". A simple matcher string is
+  #      an EXACT match against the tool name (with "|"/"," separating
+  #      alternatives), and the shell tools are named "bash"/"powershell" — a
+  #      matcher copied from the Claude entry would never fire. Listing both
+  #      names covers a Windows PowerShell host with the same entry.
+  #   2. Only documented handler fields are written: type, command, timeout.
+  #      There is NO `shell` field (which the Windows Claude entry uses); the
+  #      command path is quoted instead so an install path containing spaces
+  #      survives shell-form execution (cmd.exe on Windows).
+  #   3. `timeout` is in SECONDS and bounds a wedged hook.
+  #
+  # Unlike configure_claude_code, existing matcher groups are preserved
+  # structurally rather than consolidated: hook config is additive (every group
+  # whose matcher matches contributes), so a user's "bash,edit" group keeps
+  # working untouched. dcg gets one dedicated group at the front — a denial
+  # then fires before other hooks — and stale dcg entries anywhere else are
+  # collapsed into it.
+
+  local settings_file="$POSIT_ASSISTANT_SETTINGS"
+  POSIT_ASSISTANT_FAILURE_REASON=""
+  POSIT_ASSISTANT_BACKUP=""
+  local settings_dir
+  settings_dir=$(dirname "$settings_file")
+  local pa_matcher="bash|powershell"
+  # Contract detail 2: the stored command is the quoted binary path.
+  local pa_command="\"$DEST/dcg\""
+
+  if ! posit_assistant_installed; then
+    POSIT_ASSISTANT_STATUS="skipped"
+    return 0
+  fi
+
+  if [ ! -d "$settings_dir" ]; then
+    mkdir -p "$settings_dir"
+  fi
+
+  if [ -f "$settings_file" ]; then
+    if ! command -v python3 >/dev/null 2>&1; then
+      POSIT_ASSISTANT_STATUS="failed"
+      POSIT_ASSISTANT_FAILURE_REASON="python3 required to safely merge settings.json"
+      return 0
+    fi
+
+    # First pass: is the exact current dcg hook already the sole dcg entry,
+    # sitting first in its own matcher group? Stale paths and duplicates fall
+    # through to the merge below so they get collapsed.
+    local pa_hook_state
+    pa_hook_state=$(python3 - "$settings_file" "$pa_command" "$pa_matcher" <<'PYEOF'
+import json
+import os
+import shlex
+import sys
+
+settings_file = sys.argv[1]
+dcg_command = sys.argv[2]
+matcher = sys.argv[3]
+
+def is_dcg_command(cmd):
+    if not isinstance(cmd, str) or not cmd:
+        return False
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    name = os.path.basename(tokens[0])
+    if name.endswith('.exe'):
+        name = name[:-4]
+    return name == 'dcg'
+
+try:
+    with open(settings_file, 'r') as f:
+        settings = json.load(f)
+except (IOError, ValueError, json.JSONDecodeError):
+    print("invalid")
+    raise SystemExit(0)
+
+if not isinstance(settings, dict):
+    print("invalid")
+    raise SystemExit(0)
+
+hooks_obj = settings.get("hooks", {})
+if not isinstance(hooks_obj, dict):
+    print("invalid")
+    raise SystemExit(0)
+
+pre_tool_use = hooks_obj.get("PreToolUse", [])
+if not isinstance(pre_tool_use, list):
+    print("invalid")
+    raise SystemExit(0)
+
+dcg_commands = []
+for entry in pre_tool_use:
+    if not isinstance(entry, dict):
+        continue
+    hooks = entry.get("hooks", [])
+    if not isinstance(hooks, list):
+        print("invalid")
+        raise SystemExit(0)
+    for hook in hooks:
+        if isinstance(hook, dict) and is_dcg_command(hook.get("command")):
+            dcg_commands.append(hook.get("command"))
+
+first = pre_tool_use[0] if pre_tool_use else None
+first_is_current = (
+    isinstance(first, dict)
+    and first.get("matcher") == matcher
+    and isinstance(first.get("hooks"), list)
+    and bool(first["hooks"])
+    and isinstance(first["hooks"][0], dict)
+    and first["hooks"][0].get("command") == dcg_command
+)
+
+if dcg_commands == [dcg_command] and first_is_current:
+    print("already")
+else:
+    print("merge")
+PYEOF
+)
+    if [ "$pa_hook_state" = "invalid" ]; then
+      POSIT_ASSISTANT_STATUS="failed"
+      POSIT_ASSISTANT_FAILURE_REASON="existing settings.json is invalid or has malformed hooks; left unchanged"
+      warn "Posit Assistant settings.json is invalid or has malformed hooks; leaving it unchanged: $settings_file"
+      return 0
+    fi
+    if [ "$pa_hook_state" = "already" ]; then
+      POSIT_ASSISTANT_STATUS="already"
+      AUTO_CONFIGURED=1
+      return 0
+    fi
+
+    POSIT_ASSISTANT_BACKUP="${settings_file}.bak.$(date +%Y%m%d%H%M%S)"
+    cp "$settings_file" "$POSIT_ASSISTANT_BACKUP"
+
+    if python3 - "$settings_file" "$pa_command" "$pa_matcher" <<'PYEOF'
+import json
+import os
+import shlex
+import sys
+
+settings_file = sys.argv[1]
+dcg_command = sys.argv[2]
+matcher = sys.argv[3]
+
+def is_dcg_command(cmd):
+    """True iff `cmd` invokes the dcg binary (basename match, not substring).
+
+    A substring check would also match unrelated user tools whose path merely
+    contains "dcg" (/opt/dcgrep/bin/scan, ~/.local/bin/dcgworkflow, ...) and
+    would then drop or replace their hook entries.
+    """
+    if not isinstance(cmd, str) or not cmd:
+        return False
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        # Unparseable command (mismatched quotes, ...) — treat as NOT-dcg so
+        # it is never dropped or replaced.
+        return False
+    if not tokens:
+        return False
+    name = os.path.basename(tokens[0])
+    if name.endswith('.exe'):
+        name = name[:-4]
+    return name == 'dcg'
+
+try:
+    with open(settings_file, 'r') as f:
+        raw_settings = f.read()
+except IOError:
+    raw_settings = ""
+
+if raw_settings.strip():
+    try:
+        settings = json.loads(raw_settings)
+    except ValueError:
+        print(f"invalid Posit Assistant settings.json: {settings_file}", file=sys.stderr)
+        raise SystemExit(1)
+else:
+    settings = {}
+
+if not isinstance(settings, dict):
+    print(
+        f"Posit Assistant settings.json must contain a JSON object: {settings_file}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+if 'hooks' not in settings:
+    settings['hooks'] = {}
+elif not isinstance(settings['hooks'], dict):
+    print(
+        f"Posit Assistant settings.json hooks must contain a JSON object: {settings_file}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+if 'PreToolUse' not in settings['hooks']:
+    settings['hooks']['PreToolUse'] = []
+elif not isinstance(settings['hooks']['PreToolUse'], list):
+    print(
+        f"Posit Assistant settings.json PreToolUse must contain a list: {settings_file}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+# Strip every pre-existing dcg entry (stale paths, duplicates) from all matcher
+# groups; a group whose hooks list empties out as a result is pruned rather
+# than left behind as an empty group. Non-dcg hooks and the user's group
+# structure are otherwise preserved verbatim.
+cleaned = []
+for entry in settings['hooks']['PreToolUse']:
+    if not isinstance(entry, dict):
+        cleaned.append(entry)
+        continue
+    hooks = entry.get('hooks')
+    if not isinstance(hooks, list):
+        if 'hooks' in entry:
+            print(
+                f"Posit Assistant matcher-group hooks must contain a list: {settings_file}",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        cleaned.append(entry)
+        continue
+    kept = [
+        hook
+        for hook in hooks
+        if not (isinstance(hook, dict) and is_dcg_command(hook.get('command')))
+    ]
+    if hooks and not kept:
+        # The group existed only to run dcg; drop it.
+        continue
+    entry['hooks'] = kept
+    cleaned.append(entry)
+
+# dcg's dedicated group goes first so a denial fires before other hooks run.
+cleaned.insert(
+    0,
+    {
+        "matcher": matcher,
+        "hooks": [{"type": "command", "command": dcg_command, "timeout": 10}],
+    },
+)
+
+settings['hooks']['PreToolUse'] = cleaned
+
+with open(settings_file, 'w') as f:
+    json.dump(settings, f, indent=2)
+    f.write("\n")
+PYEOF
+    then
+      POSIT_ASSISTANT_STATUS="merged"
+      AUTO_CONFIGURED=1
+    else
+      mv "$POSIT_ASSISTANT_BACKUP" "$settings_file" 2>/dev/null || true
+      POSIT_ASSISTANT_STATUS="failed"
+      POSIT_ASSISTANT_FAILURE_REASON="merge failed; restored backup"
+      POSIT_ASSISTANT_BACKUP=""
+    fi
+  else
+    cat > "$settings_file" <<EOFSET
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "$pa_matcher",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\\"$DEST/dcg\\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
+EOFSET
+    POSIT_ASSISTANT_STATUS="created"
+    AUTO_CONFIGURED=1
+  fi
+}
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Run Auto-Configuration
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3286,24 +3687,21 @@ if [ "$NO_CONFIGURE" -eq 0 ]; then
       # Easy mode: always remove
       REMOVE_PREDECESSOR=1
       info "Easy mode: auto-removing predecessor"
-    elif [ -t 0 ]; then
-      # Interactive: ask user
+    elif have_tty; then
+      # Interactive: ask user (reads /dev/tty, so this works under curl|bash)
       if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
-        if gum confirm "Remove predecessor ($PREDECESSOR_SCRIPT) and upgrade to dcg?"; then
+        if gum confirm "Remove predecessor ($PREDECESSOR_SCRIPT) and upgrade to dcg?" <"$DCG_TTY"; then
           REMOVE_PREDECESSOR=1
         fi
       else
-        echo -n "Remove predecessor ($PREDECESSOR_SCRIPT) and upgrade to dcg? (Y/n): "
-        read -r ans
-        case "$ans" in
-          n|N|no|No|NO) REMOVE_PREDECESSOR=0;;
-          *) REMOVE_PREDECESSOR=1;;
-        esac
+        if ask_yn "Remove predecessor ($PREDECESSOR_SCRIPT) and upgrade to dcg? (Y/n):" "y"; then
+          REMOVE_PREDECESSOR=1
+        fi
       fi
     else
-      # Non-interactive without --easy-mode: default to removing (user ran installer intentionally)
+      # No TTY without --easy-mode: default to removing (user ran installer intentionally)
       REMOVE_PREDECESSOR=1
-      info "Non-interactive mode: auto-removing predecessor (use --easy-mode to suppress this message)"
+      info "No TTY available: auto-removing predecessor (use --easy-mode to suppress this message)"
     fi
 
     if [ "$REMOVE_PREDECESSOR" -eq 1 ]; then
@@ -3340,6 +3738,9 @@ if [ "$NO_CONFIGURE" -eq 0 ]; then
 
   # Configure Hermes Agent (if installed)
   configure_hermes
+
+  # Configure Posit Assistant (if installed)
+  configure_posit_assistant
 else
   info "Skipping agent configuration (--no-configure)"
 fi
@@ -3352,14 +3753,14 @@ if [ "$NO_CONFIGURE" -eq 0 ]; then
   # In easy mode or non-interactive, inject automatically; otherwise prompt.
   if [ "$EASY" -eq 1 ]; then
     maybe_add_shell_check
-  elif [ -t 0 ] && [ -t 1 ]; then
+  elif have_tty; then
     echo ""
     if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
       gum style --foreground 39 --bold "Shell startup check"
       gum style --foreground 247 "Claude Code can silently remove the dcg hook when it rewrites settings.json."
       gum style --foreground 247 "A shell startup check will warn you on every new terminal if the hook goes missing."
       echo ""
-      if gum confirm "Add shell startup check to your RC files?"; then
+      if gum confirm "Add shell startup check to your RC files?" <"$DCG_TTY"; then
         maybe_add_shell_check
       else
         info "Skipped. You can add it later with: dcg setup --shell-check"
@@ -3369,15 +3770,16 @@ if [ "$NO_CONFIGURE" -eq 0 ]; then
       echo "Claude Code can silently remove the dcg hook when it rewrites settings.json."
       echo "A shell startup check will warn you on every new terminal if the hook goes missing."
       echo ""
-      printf 'Add shell startup check to your RC files? [Y/n] '
-      read -r REPLY </dev/tty 2>/dev/null || REPLY="y"
-      case "$REPLY" in
-        n|N|no|No|NO) info "Skipped. You can add it later with: dcg setup --shell-check" ;;
-        *) maybe_add_shell_check ;;
-      esac
+      if ask_yn "Add shell startup check to your RC files? [Y/n]" "y"; then
+        maybe_add_shell_check
+      else
+        info "Skipped. You can add it later with: dcg setup --shell-check"
+      fi
     fi
   else
-    # Non-interactive, non-easy-mode: auto-inject (user ran installer intentionally)
+    # No TTY, non-easy-mode: auto-inject (user ran installer intentionally),
+    # and say so explicitly since nobody was asked (#251).
+    info "No TTY available: adding the shell startup check to your shell RC files (warns when the dcg hook goes missing; opt out next time with --no-configure)"
     maybe_add_shell_check
   fi
 fi
@@ -3563,6 +3965,29 @@ case "$HERMES_STATUS" in
       summary_lines+=("Hermes:      Configuration failed ($HERMES_FAILURE_REASON)")
     else
       summary_lines+=("Hermes:      Configuration failed")
+    fi
+    ;;
+esac
+
+case "$POSIT_ASSISTANT_STATUS" in
+  created)
+    summary_lines+=("Posit Assistant: Created $POSIT_ASSISTANT_SETTINGS with dcg hook")
+    ;;
+  merged)
+    summary_lines+=("Posit Assistant: Added dcg hook to existing $POSIT_ASSISTANT_SETTINGS")
+    [ -n "$POSIT_ASSISTANT_BACKUP" ] && summary_lines+=("             Backup: $POSIT_ASSISTANT_BACKUP")
+    ;;
+  already)
+    summary_lines+=("Posit Assistant: Already configured (no changes)")
+    ;;
+  skipped|"")
+    summary_lines+=("Posit Assistant: Not installed (skipped)")
+    ;;
+  failed)
+    if [ -n "$POSIT_ASSISTANT_FAILURE_REASON" ]; then
+      summary_lines+=("Posit Assistant: Configuration failed ($POSIT_ASSISTANT_FAILURE_REASON)")
+    else
+      summary_lines+=("Posit Assistant: Configuration failed")
     fi
     ;;
 esac

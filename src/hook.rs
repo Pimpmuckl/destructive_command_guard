@@ -27,7 +27,8 @@ pub struct HookInput {
     #[serde(alias = "hookEventName")]
     pub hook_event_name: Option<String>,
 
-    /// Gemini session id.
+    /// Session id (Gemini snake_case; VS Code Agent Host camelCase).
+    #[serde(alias = "sessionId")]
     pub session_id: Option<String>,
 
     /// Gemini transcript path.
@@ -76,6 +77,16 @@ pub struct HookInput {
     /// capturing the stdin `agy` passes to a `PreToolUse` hook.
     #[serde(alias = "toolCall")]
     pub tool_call: Option<ToolCall>,
+
+    /// VS Code "Agent Host" batched tool-call envelope (issue #252). The
+    /// newer Copilot Agent Host (and the Agents window built on it) sends
+    /// `{"sessionId": "...", "cwd": "...", "toolCalls": [{"name":
+    /// "powershell", "args": "{\"command\":\"...\"}"}]}` — an *array* under
+    /// plural `toolCalls`, with each entry's `args` JSON-encoded as a string.
+    /// Before this field existed the envelope deserialized without any
+    /// recognized command and the hook silently failed open.
+    #[serde(alias = "toolCalls")]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 /// Tool-specific input containing the command to execute.
@@ -332,6 +343,14 @@ pub enum HookProtocol {
     /// Claude Code / Augment-compatible `hookSpecificOutput` protocol.
     /// Tolerant JSON parser; accepts dcg's full deny payload with
     /// `allowOnceCode`, `ruleId`, `severity`, `remediation`, etc.
+    ///
+    /// Posit Assistant also speaks this protocol: its `PreToolUse` stdin is
+    /// the snake_case Claude shape (`tool_name`, `tool_input.command`,
+    /// `tool_use_id`, `permission_mode`), exit code 2 blocks with stderr as
+    /// the reason, and `hookSpecificOutput.permissionDecision` is read on
+    /// exit 0 — so no dedicated variant is needed. Its hook env var
+    /// `PA_PROJECT_DIR` is consulted in [`detect_protocol`] only to keep a
+    /// `powershell`-named shell tool from being classified as Codex.
     ClaudeCompatible,
     /// Copilot hook protocol (top-level permission decision and reason).
     Copilot,
@@ -507,6 +526,12 @@ pub fn read_hook_input(max_bytes: usize) -> Result<HookInput, HookReadError> {
 /// and `CLAUDE_CODE` env var), then Gemini-specific markers (tool name
 /// `"run_shell_command"` with hook event `"BeforeTool"`).
 ///
+/// Posit Assistant uses the Claude wire shape, so it resolves to
+/// [`HookProtocol::ClaudeCompatible`] through the shared shell-tool names. Its
+/// hook env var `PA_PROJECT_DIR` is consulted only to steer a
+/// `powershell`-named shell tool away from the unconditional Windows-shell →
+/// Codex rule.
+///
 /// See: <https://github.com/Dicklesworthstone/destructive_command_guard/issues/77>
 #[must_use]
 pub fn detect_protocol(input: &HookInput) -> HookProtocol {
@@ -516,6 +541,20 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
     let hook_event_name = input.hook_event_name.as_deref().unwrap_or_default();
+
+    // --- VS Code Agent Host indicators (checked first) ---
+    // The Copilot "Agent Host" batches tool calls in a plural `toolCalls`
+    // array (issue #252); no other supported agent emits that field. VS Code
+    // consumes Claude-shaped hook output through its Claude-hooks
+    // compatibility layer (#184), so the Claude-compatible deny payload is
+    // the documented answer shape.
+    if input
+        .tool_calls
+        .as_ref()
+        .is_some_and(|calls| !calls.is_empty())
+    {
+        return HookProtocol::ClaudeCompatible;
+    }
 
     // --- Antigravity CLI (`agy`) indicators (checked first) ---
     // `agy` is the only agent that nests the tool name and arguments under a
@@ -610,6 +649,31 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
         && (has_codex_turn_id || input.permission_decision_ask_supported.is_some())
     {
         return codex_protocol(input);
+    }
+
+    // --- Posit Assistant indicator (env var, checked before the Windows-shell
+    // rule below) ---
+    // Posit Assistant sets `PA_PROJECT_DIR=<workspace root>` in every hook
+    // subprocess and speaks the snake_case Claude wire shape, so it needs no
+    // protocol of its own. The only reason this check exists is the
+    // unconditional Windows-shell → Codex rule below: on a Windows host Posit
+    // Assistant's shell tool is named `powershell`, which would otherwise be
+    // answered with Codex's minimal deny shape (no allowOnceCode/ruleId/
+    // remediation) instead of the `hookSpecificOutput.permissionDecision`
+    // payload Posit Assistant reads on exit 0. For a `bash` tool name the
+    // Claude-compatible checks below reach the same conclusion without this.
+    //
+    // The check only redirects between two protocols dcg already emits, and it
+    // cannot hijack another agent's payload: every agent with its own wire
+    // markers (VS Code `toolCalls`, agy `toolCall`, Hermes `pre_tool_call`/
+    // `terminal`, Grok `pre_tool_use`/`run_terminal_cmd`, Copilot `event`/
+    // `tool_args`, Codex `turn_id`) has already returned above, and the event
+    // gate rejects everything that is not a Claude-shaped `PreToolUse`.
+    let has_posit_assistant_env = std::env::var_os("PA_PROJECT_DIR").is_some();
+    let is_posit_assistant_event =
+        hook_event_name.is_empty() || hook_event_name.eq_ignore_ascii_case("pretooluse");
+    if has_posit_assistant_env && is_posit_assistant_event {
+        return HookProtocol::ClaudeCompatible;
     }
 
     // Explicit Windows-shell tool names ("powershell"/"pwsh"/"cmd"/"cmd.exe")
@@ -778,6 +842,15 @@ pub(crate) fn is_shell_hook_candidate(input: &HookInput) -> bool {
         }
     }
 
+    // VS Code Agent Host: any batched call naming a shell tool (issue #252).
+    if input.tool_calls.as_ref().is_some_and(|calls| {
+        calls
+            .iter()
+            .any(|call| is_supported_shell_tool(call.name.as_deref()))
+    }) {
+        return true;
+    }
+
     input.tool_name.is_none()
         && matches!(detect_protocol(input), HookProtocol::Copilot)
         && (input.tool_input.is_some() || input.tool_args.is_some())
@@ -841,6 +914,39 @@ pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCo
     // treat that distinctive envelope as a shell candidate too.
     if !is_shell_hook_candidate(input) {
         return None;
+    }
+
+    // VS Code Agent Host batches shell invocations in `toolCalls[]`, each
+    // with a JSON-encoded `args` string (issue #252). Every shell call in
+    // the batch must be evaluated: the commands are joined with newlines so
+    // the evaluator's ordinary segment splitting checks each one, and a
+    // single destructive entry denies the whole batch. A batch whose shell
+    // entries use one shell keeps that dialect; mixed shells fall back to
+    // the conservative `Unknown` (all-dialect) view.
+    if let Some(calls) = input.tool_calls.as_ref() {
+        let mut commands: Vec<String> = Vec::new();
+        let mut dialects: Vec<ShellDialect> = Vec::new();
+        for call in calls {
+            if !is_supported_shell_tool(call.name.as_deref()) {
+                continue;
+            }
+            if let Some(command) = call.args.as_ref().and_then(extract_command_from_tool_args) {
+                dialects.push(shell_dialect_for_tool_name(call.name.as_deref()));
+                commands.push(command);
+            }
+        }
+        if !commands.is_empty() {
+            let batch_dialect = if dialects.windows(2).all(|pair| pair[0] == pair[1]) {
+                dialects[0]
+            } else {
+                ShellDialect::Unknown
+            };
+            return Some(ExtractedHookCommand {
+                command: commands.join("\n"),
+                protocol,
+                dialect: batch_dialect,
+            });
+        }
     }
 
     // Antigravity CLI (`agy`) nests the command under `toolCall.args.CommandLine`.
@@ -2143,7 +2249,6 @@ mod tests {
             Self { key, previous }
         }
 
-        #[allow(dead_code)]
         fn remove(key: &'static str) -> Self {
             let previous = std::env::var(key).ok();
             // SAFETY: We hold ENV_LOCK during all tests that use this guard,
@@ -2326,6 +2431,12 @@ mod tests {
         // letting the destructive command through. These tool names are
         // Codex-only (Claude Code always uses "Bash"/"launch-process"), so
         // they must classify as Codex even with no turn_id.
+        //
+        // Ambient `PA_PROJECT_DIR` (the Posit Assistant marker checked ahead
+        // of the Windows-shell rule) would legitimately steer these payloads
+        // to ClaudeCompatible, so pin it removed for a deterministic result.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _no_posit_env = EnvVarGuard::remove("PA_PROJECT_DIR");
         for tool in [
             "powershell",
             "pwsh",
@@ -2368,6 +2479,148 @@ mod tests {
                 "{tool:?} without turn_id must stay ClaudeCompatible"
             );
         }
+    }
+
+    // --- Posit Assistant ---------------------------------------------------
+    //
+    // Posit Assistant's `PreToolUse` stdin is the snake_case Claude shape and
+    // its shell tool is lowercase `bash` (or `powershell` on a Windows host).
+    // These tests pin the classification for both tool names: the wire shape
+    // is close enough to Codex's that a regression would silently answer
+    // Posit Assistant with Codex's minimal deny payload.
+
+    /// A `PreToolUse` payload as Posit Assistant sends it for a `bash` shell
+    /// tool.
+    const POSIT_ASSISTANT_BASH_PAYLOAD: &str = r#"{
+        "session_id":"pa-session-42",
+        "transcript_path":null,
+        "cwd":"/home/user/analysis",
+        "hook_event_name":"PreToolUse",
+        "permission_mode":"normal",
+        "tool_name":"bash",
+        "tool_input":{"command":"git reset --hard"},
+        "tool_use_id":"toolu_posit_01"
+    }"#;
+
+    #[test]
+    fn test_posit_assistant_bash_payload_is_claude_compatible_without_env() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _no_env = EnvVarGuard::remove("PA_PROJECT_DIR");
+
+        let input: HookInput = serde_json::from_str(POSIT_ASSISTANT_BASH_PAYLOAD).unwrap();
+        assert_eq!(
+            extract_command(&input),
+            Some("git reset --hard".to_string())
+        );
+        // The lowercase `bash` tool name alone is Claude-shaped; no env marker
+        // is needed on a Unix host.
+        assert_eq!(detect_protocol(&input), HookProtocol::ClaudeCompatible);
+    }
+
+    #[test]
+    fn test_posit_assistant_payload_carries_no_foreign_markers() {
+        // Guards the disambiguators this classification relies on: if Posit
+        // Assistant ever grew a `turn_id`, `event`, or `tool_args` field, an
+        // earlier branch would capture the payload before the Posit checks.
+        let input: HookInput = serde_json::from_str(POSIT_ASSISTANT_BASH_PAYLOAD).unwrap();
+        assert!(input.turn_id.is_none());
+        assert!(input.event.is_none());
+        assert!(input.tool_args.is_none());
+        assert!(input.tool_call.is_none());
+        assert!(input.tool_calls.is_none());
+    }
+
+    #[test]
+    fn test_posit_assistant_powershell_payload_is_claude_compatible_via_env() {
+        // On a Windows host Posit Assistant's shell tool is named
+        // `powershell`, which on its own falls into the unconditional
+        // Windows-shell → Codex rule. `PA_PROJECT_DIR` — which the hook
+        // contract sets in the hook subprocess — must steer the payload back
+        // to the Claude-compatible response Posit Assistant actually reads.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let json = r#"{
+            "session_id":"pa-session-42",
+            "cwd":"C:\\Users\\user\\analysis",
+            "hook_event_name":"PreToolUse",
+            "permission_mode":"normal",
+            "tool_name":"powershell",
+            "tool_input":{"command":"Remove-Item -Recurse -Force C:\\data"},
+            "tool_use_id":"toolu_posit_01"
+        }"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+
+        {
+            let _no_env = EnvVarGuard::remove("PA_PROJECT_DIR");
+            assert_eq!(
+                detect_protocol(&input),
+                HookProtocol::Codex,
+                "without the env marker a bare `powershell` tool stays Codex"
+            );
+        }
+
+        let _env = EnvVarGuard::set("PA_PROJECT_DIR", "C:\\Users\\user\\analysis");
+        assert_eq!(detect_protocol(&input), HookProtocol::ClaudeCompatible);
+    }
+
+    #[test]
+    fn test_posit_assistant_env_does_not_hijack_other_protocols() {
+        // `PA_PROJECT_DIR` can leak into any process spawned inside a Posit
+        // Assistant workspace, so a payload carrying another agent's own wire
+        // markers must keep that agent's protocol. Every branch below runs
+        // ahead of the Posit Assistant env check.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvVarGuard::set("PA_PROJECT_DIR", "/home/user/analysis");
+
+        // Gemini: BeforeTool event + run_shell_command tool.
+        let gemini: HookInput = serde_json::from_str(
+            r#"{"hook_event_name":"BeforeTool","tool_name":"run_shell_command","tool_input":{"command":"ls"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_protocol(&gemini), HookProtocol::Gemini);
+
+        // Copilot: the `event` field.
+        let copilot: HookInput =
+            serde_json::from_str(r#"{"event":"pre-tool-use","toolInput":{"command":"ls"}}"#)
+                .unwrap();
+        assert_eq!(detect_protocol(&copilot), HookProtocol::Copilot);
+
+        // Hermes: pre_tool_call event + terminal tool.
+        let hermes: HookInput = serde_json::from_str(
+            r#"{"hook_event_name":"pre_tool_call","tool_name":"terminal","tool_input":{"command":"ls"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_protocol(&hermes), HookProtocol::Hermes);
+
+        // Grok: pre_tool_use event + run_terminal_cmd tool.
+        let grok: HookInput = serde_json::from_str(
+            r#"{"hookEventName":"pre_tool_use","toolName":"run_terminal_cmd","toolInput":{"command":"ls"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_protocol(&grok), HookProtocol::Grok);
+
+        // Codex: a non-empty turn_id, even on a PreToolUse/bash payload.
+        let codex: HookInput = serde_json::from_str(
+            r#"{"hook_event_name":"PreToolUse","tool_name":"bash","turn_id":"turn-9","tool_input":{"command":"ls"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_protocol(&codex), HookProtocol::Codex);
+
+        // agy: the nested toolCall envelope.
+        let agy: HookInput = serde_json::from_str(
+            r#"{"toolCall":{"name":"run_command","args":{"CommandLine":"ls"}},"conversationId":"c-1"}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_protocol(&agy), HookProtocol::Antigravity);
+
+        // VS Code Agent Host: the plural toolCalls envelope. The expected
+        // protocol is ClaudeCompatible either way; this pins that the
+        // toolCalls branch (which also drives batched command extraction)
+        // still fires first.
+        let vscode: HookInput = serde_json::from_str(
+            r#"{"sessionId":"s-1","toolCalls":[{"name":"powershell","args":"{\"command\":\"ls\"}"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_protocol(&vscode), HookProtocol::ClaudeCompatible);
     }
 
     #[test]

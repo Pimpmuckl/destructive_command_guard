@@ -4075,13 +4075,28 @@ fn powershell_hash_role(bytes: &[u8], index: usize) -> PowerShellHashRole {
     PowerShellHashRole::Ambiguous
 }
 
+/// Byte offset immediately after a shell escape sequence starting at `index`,
+/// where `index` points at the escape character itself (a PowerShell backtick,
+/// a cmd.exe caret, or a POSIX backslash).
+///
+/// The escaped character may be multi-byte UTF-8, so advancing a fixed two
+/// bytes can land inside a code point and panic on a later string slice
+/// (issue #255). The escape character is ASCII, so `index + 1` is always a
+/// char boundary.
+fn escape_sequence_end(text: &str, index: usize) -> usize {
+    text[index + 1..]
+        .chars()
+        .next()
+        .map_or(text.len(), |escaped| index + 1 + escaped.len_utf8())
+}
+
 fn find_powershell_script_block_close(command: &str, start: usize) -> Option<usize> {
     let bytes = command.as_bytes();
     let mut index = start;
     let mut depth = 1usize;
     while index < bytes.len() {
         match bytes[index] {
-            b'`' => index = (index + 2).min(bytes.len()),
+            b'`' => index = escape_sequence_end(command, index),
             b'#' if powershell_hash_role(bytes, index) == PowerShellHashRole::Comment => {
                 index = command[index..]
                     .find('\n')
@@ -4095,7 +4110,7 @@ fn find_powershell_script_block_close(command: &str, start: usize) -> Option<usi
                 index += 1;
                 while index < bytes.len() {
                     if bytes[index] == b'`' {
-                        index = (index + 2).min(bytes.len());
+                        index = escape_sequence_end(command, index);
                     } else if bytes[index] == b'"' {
                         index += 1;
                         break;
@@ -4142,7 +4157,7 @@ fn powershell_payload_is_dynamic(command: &str) -> bool {
     while index < bytes.len() {
         match bytes[index] {
             b'`' if !in_single => {
-                index = (index + 2).min(bytes.len());
+                index = escape_sequence_end(command, index);
                 continue;
             }
             b'\'' if !in_double => in_single = !in_single,
@@ -4160,7 +4175,7 @@ fn cmd_payload_is_dynamic(command: &str) -> bool {
     let mut index = 0usize;
     while index < bytes.len() {
         if bytes[index] == b'^' && !matches!(bytes.get(index + 1), Some(b'%' | b'!')) {
-            index = (index + 2).min(bytes.len());
+            index = escape_sequence_end(command, index);
             continue;
         }
         if matches!(bytes[index], b'%' | b'!') {
@@ -4523,7 +4538,7 @@ fn cmd_control_has_unapproved_expansion(segment: &str) -> bool {
     let mut in_double_quotes = false;
     while index < bytes.len() {
         if bytes[index] == b'^' && !matches!(bytes.get(index + 1), Some(b'%' | b'!')) {
-            index = (index + 2).min(bytes.len());
+            index = escape_sequence_end(segment, index);
             continue;
         }
         if bytes[index] == b'"' {
@@ -4600,7 +4615,7 @@ fn cmd_word_uses_for_variable(word: &str, variable: CmdForVariable) -> bool {
     let mut index = 0usize;
     while index < bytes.len() {
         if bytes[index] == b'^' && !matches!(bytes.get(index + 1), Some(b'%' | b'!')) {
-            index = (index + 2).min(bytes.len());
+            index = escape_sequence_end(word, index);
             continue;
         }
         if cmd_for_variable_reference_end(bytes, index, variable).is_some() {
@@ -5470,6 +5485,35 @@ fn posix_executable_name_may_expand(name: &str) -> bool {
     })
 }
 
+/// Whether a raw word is a leading POSIX `NAME=value` assignment prefix
+/// rather than the executable. POSIX requires `NAME` to be a shell name
+/// (`[A-Za-z_][A-Za-z0-9_]*`) followed by an unquoted `=`; anything else —
+/// including `--flag=value` options and quoted words — is not an assignment.
+fn posix_word_is_assignment_prefix(raw: &str) -> bool {
+    let Some(name) = raw.split('=').next() else {
+        return false;
+    };
+    name.len() < raw.len()
+        && !name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// The leading cluster of a POSIX short-flag word (`-xc` → `xc`), or `None`
+/// when the word merely starts with `-` without being a flag cluster.
+///
+/// Only the first whitespace-delimited chunk can be the flag; anything after
+/// it is glued payload (`-c'echo hi'` decodes to `-cecho hi`, whose chunk is
+/// still alphanumeric). An operand like the GitHub search query
+/// `-label:need-human sort:created-asc` contains `:`/`-` inside the chunk and
+/// is data, not a flag cluster (issue #256).
+fn posix_short_flag_cluster(flag: &str) -> Option<&str> {
+    let short = flag.strip_prefix('-')?;
+    let cluster = short.split_ascii_whitespace().next()?;
+    (!cluster.starts_with('-') && cluster.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .then_some(cluster)
+}
+
 fn posix_inline_flag_position(name: Option<&str>, words: &[&str]) -> Option<usize> {
     words.iter().enumerate().skip(1).find_map(|(index, raw)| {
         let flag = shell_word_value(raw, ShellDialect::Posix)?;
@@ -5480,9 +5524,7 @@ fn posix_inline_flag_position(name: Option<&str>, words: &[&str]) -> Option<usiz
         let is_inline = if let Some(name) = name {
             if posix_inline_shell_name(name) {
                 lower == "--command"
-                    || lower
-                        .strip_prefix('-')
-                        .is_some_and(|short| !short.starts_with('-') && short.contains('c'))
+                    || posix_short_flag_cluster(&lower).is_some_and(|cluster| cluster.contains('c'))
             } else if name.starts_with("python") {
                 matches!(lower.as_str(), "-c" | "-e")
             } else if matches!(name, "ruby" | "irb" | "perl" | "lua")
@@ -5502,9 +5544,7 @@ fn posix_inline_flag_position(name: Option<&str>, words: &[&str]) -> Option<usiz
             matches!(
                 lower.as_str(),
                 "-c" | "-e" | "-p" | "-r" | "--eval" | "--print" | "--command"
-            ) || lower
-                .strip_prefix('-')
-                .is_some_and(|short| !short.starts_with('-') && short.contains('c'))
+            ) || posix_short_flag_cluster(&lower).is_some_and(|cluster| cluster.contains('c'))
         };
         is_inline.then_some(index)
     })
@@ -5516,10 +5556,17 @@ fn parse_obfuscated_posix_inline_launcher_segment(
 ) -> PosixInlineLauncherParse {
     let stripped = strip_wrapper_prefixes(segment);
     let original_segment = stripped.normalized.as_ref();
-    let original_raw_executable = tokenize_for_shell_dialect(original_segment, ShellDialect::Posix)
-        .into_iter()
-        .find(|token| token.kind == NormalizeTokenKind::Word)
-        .and_then(|token| token.text(original_segment));
+    let original_tokens = tokenize_for_shell_dialect(original_segment, ShellDialect::Posix);
+    let original_words: Vec<&str> = original_tokens
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+        .filter_map(|token| token.text(original_segment))
+        .collect();
+    let original_raw_executable = original_words
+        .iter()
+        .copied()
+        .find(|word| !posix_word_is_assignment_prefix(word))
+        .or_else(|| original_words.first().copied());
     let substitution_view = crate::packs::core::git::posix_substitution_view(original_segment)
         .ok()
         .filter(|view| view.command != original_segment);
@@ -5533,11 +5580,21 @@ fn parse_obfuscated_posix_inline_launcher_segment(
     {
         return PosixInlineLauncherParse::NotLauncher;
     }
-    let words: Vec<&str> = tokens
+    let all_words: Vec<&str> = tokens
         .iter()
         .filter(|token| token.kind == NormalizeTokenKind::Word)
         .filter_map(|token| token.text(segment))
         .collect();
+    // Leading `NAME=value` words are environment assignments, not the
+    // executable: a command substitution inside an assignment value becomes
+    // data in the environment and is evaluated separately as a nested
+    // command, so it cannot assemble this segment's executable (issue #256).
+    // An assignments-only segment keeps its conservative treatment.
+    let exec_index = all_words
+        .iter()
+        .position(|word| !posix_word_is_assignment_prefix(word))
+        .unwrap_or(0);
+    let words: &[&str] = &all_words[exec_index..];
     let Some(raw_executable) = words.first().copied() else {
         return PosixInlineLauncherParse::NotLauncher;
     };
@@ -5552,7 +5609,7 @@ fn parse_obfuscated_posix_inline_launcher_segment(
             .as_ref()
             .is_some_and(|name| posix_executable_name_may_expand(name));
     if dynamic_executable {
-        return if posix_inline_flag_position(None, &words).is_some() {
+        return if posix_inline_flag_position(None, words).is_some() {
             PosixInlineLauncherParse::Unverified(
                 "a dynamically assembled executable is followed by an inline-code flag".to_string(),
             )
@@ -5568,7 +5625,7 @@ fn parse_obfuscated_posix_inline_launcher_segment(
     {
         return PosixInlineLauncherParse::NotLauncher;
     }
-    let Some(flag_index) = posix_inline_flag_position(Some(&name), &words) else {
+    let Some(flag_index) = posix_inline_flag_position(Some(&name), words) else {
         return PosixInlineLauncherParse::NotLauncher;
     };
     if words
@@ -5781,7 +5838,7 @@ fn find_powershell_subexpression_close(command: &str, body_start: usize) -> Resu
     let mut depth = 1usize;
     while index < bytes.len() {
         match bytes[index] {
-            b'`' => index = (index + 2).min(bytes.len()),
+            b'`' => index = escape_sequence_end(command, index),
             b'#' if powershell_hash_role(bytes, index) == PowerShellHashRole::Comment => {
                 index = command[index..]
                     .find('\n')
@@ -5798,7 +5855,7 @@ fn find_powershell_subexpression_close(command: &str, body_start: usize) -> Resu
                 index += 1;
                 while index < bytes.len() {
                     if bytes[index] == b'`' {
-                        index = (index + 2).min(bytes.len());
+                        index = escape_sequence_end(command, index);
                     } else if bytes[index] == b'"' {
                         index += 1;
                         break;
@@ -5848,7 +5905,7 @@ fn collect_powershell_expandable_region(
     let mut index = start;
     while index < end {
         if bytes[index] == b'`' {
-            index = (index + 2).min(end);
+            index = escape_sequence_end(command, index).min(end);
         } else if bytes[index] == b'$' && bytes.get(index + 1) == Some(&b'(') {
             let close = find_powershell_subexpression_close(command, index + 2)?;
             if close > end {
@@ -5885,7 +5942,7 @@ fn collect_powershell_substitution_bodies(command: &str) -> Result<Vec<String>, 
     let mut index = 0usize;
     while index < bytes.len() {
         match bytes[index] {
-            b'`' => index = (index + 2).min(bytes.len()),
+            b'`' => index = escape_sequence_end(command, index),
             b'#' if powershell_hash_role(bytes, index) == PowerShellHashRole::Comment => {
                 index = command[index..]
                     .find('\n')
@@ -5902,7 +5959,7 @@ fn collect_powershell_substitution_bodies(command: &str) -> Result<Vec<String>, 
                 index += 1;
                 while index < bytes.len() {
                     if bytes[index] == b'`' {
-                        index = (index + 2).min(bytes.len());
+                        index = escape_sequence_end(command, index);
                     } else if bytes[index] == b'$' && bytes.get(index + 1) == Some(&b'(') {
                         let close = find_powershell_subexpression_close(command, index + 2)?;
                         bodies.push(powershell_substitution_body_for_evaluation(
@@ -5964,7 +6021,7 @@ fn collect_powershell_verbatim_here_string_substitution_bodies(
     let mut index = 0usize;
     while index < bytes.len() {
         match bytes[index] {
-            b'`' => index = (index + 2).min(bytes.len()),
+            b'`' => index = escape_sequence_end(command, index),
             b'#' if powershell_hash_role(bytes, index) == PowerShellHashRole::Comment => {
                 index = command[index..]
                     .find('\n')
@@ -5981,7 +6038,7 @@ fn collect_powershell_verbatim_here_string_substitution_bodies(
                 index += 1;
                 while index < bytes.len() {
                     if bytes[index] == b'`' {
-                        index = (index + 2).min(bytes.len());
+                        index = escape_sequence_end(command, index);
                     } else if bytes[index] == b'"' {
                         index += 1;
                         break;
@@ -6018,7 +6075,7 @@ fn mask_powershell_block_comments(command: &str) -> Cow<'_, str> {
     let mut masked: Option<Vec<u8>> = None;
     while index < bytes.len() {
         match bytes[index] {
-            b'`' => index = (index + 2).min(bytes.len()),
+            b'`' => index = escape_sequence_end(command, index),
             b'#' if powershell_hash_role(bytes, index) == PowerShellHashRole::Comment => {
                 index = command[index..]
                     .find('\n')
@@ -6029,7 +6086,7 @@ fn mask_powershell_block_comments(command: &str) -> Cow<'_, str> {
                 index += 1;
                 while index < bytes.len() {
                     if bytes[index] == b'`' {
-                        index = (index + 2).min(bytes.len());
+                        index = escape_sequence_end(command, index);
                     } else if bytes[index] == b'"' {
                         index += 1;
                         break;
@@ -6563,7 +6620,7 @@ fn shell_source_references_positional_input(source: &str) -> bool {
     while index < bytes.len() {
         match bytes[index] {
             b'\\' if !in_single => {
-                index = (index + 2).min(bytes.len());
+                index = escape_sequence_end(source, index);
                 continue;
             }
             b'\'' => {
@@ -8536,7 +8593,7 @@ fn find_powershell_code_marker(command: &str, marker: &str, start: usize) -> Opt
     let mut index = start;
     while index < bytes.len() {
         match bytes[index] {
-            b'`' => index = (index + 2).min(bytes.len()),
+            b'`' => index = escape_sequence_end(command, index),
             b'#' if powershell_hash_role(bytes, index) == PowerShellHashRole::Comment => {
                 index = command[index..]
                     .find('\n')
@@ -8550,7 +8607,7 @@ fn find_powershell_code_marker(command: &str, marker: &str, start: usize) -> Opt
                 index += 1;
                 while index < bytes.len() {
                     if bytes[index] == b'`' {
-                        index = (index + 2).min(bytes.len());
+                        index = escape_sequence_end(command, index);
                     } else if bytes[index] == b'"' {
                         index += 1;
                         break;
@@ -9009,7 +9066,7 @@ fn powershell_unescaped_redirect_suffix(word: &str) -> Option<(usize, bool)> {
     let mut double = false;
     while index < bytes.len() {
         match bytes[index] {
-            b'`' if !single => index = (index + 2).min(bytes.len()),
+            b'`' if !single => index = escape_sequence_end(word, index),
             b'\'' if !double => {
                 if single && bytes.get(index + 1) == Some(&b'\'') {
                     index += 2;
@@ -9849,7 +9906,7 @@ fn restore_powershell_here_string_substitution_text<'a>(
     let mut index = 0usize;
     while index < bytes.len() {
         match bytes[index] {
-            b'`' => index = (index + 2).min(bytes.len()),
+            b'`' => index = escape_sequence_end(original_command, index),
             b'#' if powershell_hash_role(bytes, index) == PowerShellHashRole::Comment => {
                 index = original_command[index..]
                     .find('\n')
@@ -9863,7 +9920,7 @@ fn restore_powershell_here_string_substitution_text<'a>(
                 index += 1;
                 while index < bytes.len() {
                     if bytes[index] == b'`' {
-                        index = (index + 2).min(bytes.len());
+                        index = escape_sequence_end(original_command, index);
                     } else if bytes[index] == b'"' {
                         index += 1;
                         break;
@@ -19143,11 +19200,12 @@ fn statically_safe_variable_redirect(
     let Some((name, suffix)) = parse_posix_variable_with_literal_suffix(token) else {
         return false;
     };
-    let Some(value) = single_prior_literal_assignment(source, segment_ranges, segment_start, name)
-    else {
+    let Some(values) = resolved_variable_values(source, segment_ranges, segment_start, name) else {
         return false;
     };
-    resolved_redirect_target_is_benign(&format!("{value}{suffix}"))
+    values
+        .iter()
+        .all(|value| resolved_redirect_target_is_benign(&format!("{value}{suffix}")))
 }
 
 /// Accept only static fd duplications (`2>&1`, `>&2`) after the proven target.
@@ -19191,16 +19249,23 @@ fn parse_posix_variable_with_literal_suffix(token: &str) -> Option<(&str, &str)>
     (valid_name && literal_suffix).then_some((name, suffix))
 }
 
-/// Find exactly one literal `NAME=value` among the top-level segments that end
-/// before the redirect segment, refusing when any other preceding segment
-/// could mutate `NAME` in the parent shell.
-fn single_prior_literal_assignment(
+/// Upper bound on `for`-loop candidate values a proof will enumerate.
+const MAX_LOOP_CANDIDATES: usize = 16;
+
+/// Every value `NAME` can hold when the current segment runs, provable from
+/// exactly one binding among the top-level segments that end before it:
+/// either a literal `NAME=value` assignment or a fully literal
+/// `for NAME in …` loop header (issue #242). Refuses when a second binding
+/// exists, when a `for` header binding `NAME` is not statically enumerable,
+/// or when any other preceding segment could mutate `NAME` in the parent
+/// shell.
+fn resolved_variable_values(
     source: &str,
     segment_ranges: &[(usize, usize)],
     segment_start: usize,
     name: &str,
-) -> Option<String> {
-    let mut assignment: Option<String> = None;
+) -> Option<Vec<String>> {
+    let mut values: Option<Vec<String>> = None;
     for &(start, end) in segment_ranges {
         if end > segment_start {
             continue;
@@ -19213,10 +19278,24 @@ fn single_prior_literal_assignment(
             .strip_prefix(name)
             .and_then(|rest| rest.strip_prefix('='))
         {
-            if assignment.is_some() {
+            if values.is_some() {
                 return None;
             }
-            assignment = Some(literal_assignment_value(raw)?);
+            values = Some(vec![literal_assignment_value(raw)?]);
+            continue;
+        }
+        if posix_for_loop_binds(segment, name) {
+            // A second binding (assignment or another loop) makes the live
+            // value ambiguous; a header that is not statically enumerable
+            // (globs, substitutions, `"$@"`) makes it unprovable.
+            if values.is_some() {
+                return None;
+            }
+            let (header_name, candidates) = parse_posix_for_loop_header(segment)?;
+            if header_name != name {
+                return None;
+            }
+            values = Some(candidates);
             continue;
         }
         let first = segment.split_ascii_whitespace().next().unwrap_or("");
@@ -19241,7 +19320,73 @@ fn single_prior_literal_assignment(
             return None;
         }
     }
-    assignment
+    values
+}
+
+/// Strip the reserved words that can directly precede a command inside
+/// control flow (`do`, `then`, `else`), so a nested header like
+/// `do for f in …` is still recognized as a `for` header.
+fn strip_command_prefix_reserved_words(segment: &str) -> &str {
+    let mut rest = segment.trim_start();
+    loop {
+        let Some(word) = rest.split_ascii_whitespace().next() else {
+            return rest;
+        };
+        if !matches!(word, "do" | "then" | "else") {
+            return rest;
+        }
+        rest = rest[word.len()..].trim_start();
+    }
+}
+
+/// Whether a top-level segment is a `for NAME in …` header binding `NAME`,
+/// including headers nested behind control-flow prefixes (`do for NAME in …`).
+fn posix_for_loop_binds(segment: &str, name: &str) -> bool {
+    let mut words = strip_command_prefix_reserved_words(segment).split_ascii_whitespace();
+    words.next() == Some("for") && words.next() == Some(name)
+}
+
+/// Parse a fully literal POSIX `for NAME in word…` loop header into the bound
+/// name and its candidate values.
+///
+/// Every candidate must be a single literal shell word with no whitespace, so
+/// substituting it for `$NAME` in the loop body is parse-neutral in both bare
+/// and double-quoted positions. Globs, expansions, `"$@"`, arithmetic `for
+/// ((…))`, and empty or oversized lists all refuse the parse.
+fn parse_posix_for_loop_header(segment: &str) -> Option<(String, Vec<String>)> {
+    let segment = strip_command_prefix_reserved_words(segment);
+    let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Posix);
+    if tokens
+        .iter()
+        .any(|token| token.kind == NormalizeTokenKind::Separator)
+    {
+        return None;
+    }
+    let words: Vec<&str> = tokens
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+        .filter_map(|token| token.text(segment))
+        .collect();
+    let ["for", name, "in", candidates @ ..] = words.as_slice() else {
+        return None;
+    };
+    let valid_name = !name.is_empty()
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    if !valid_name || candidates.is_empty() || candidates.len() > MAX_LOOP_CANDIDATES {
+        return None;
+    }
+    let values = candidates
+        .iter()
+        .map(|raw| {
+            let value = literal_assignment_value(raw)?;
+            (!value.contains(|c: char| c.is_ascii_whitespace())).then_some(value)
+        })
+        .collect::<Option<Vec<String>>>()?;
+    Some(((*name).to_string(), values))
 }
 
 /// A whole-segment assignment value that is one literal shell word.
@@ -19289,6 +19434,134 @@ fn resolved_redirect_target_is_benign(path: &str) -> bool {
 
 fn filesystem_non_pre_rm_non_redirect_pattern(name: Option<&str>) -> bool {
     filesystem_non_pre_rm_pattern(name) && !filesystem_redirect_pattern(name)
+}
+
+fn filesystem_non_pre_rm_non_redirect_pattern_excluding_mv_dynamic(name: Option<&str>) -> bool {
+    filesystem_non_pre_rm_non_redirect_pattern(name) && name != Some("mv-dynamic-path")
+}
+
+/// Parse the variable reference starting at a `$`, returning the name and
+/// the byte length of the whole reference (`$NAME` or `${NAME}`).
+fn parse_leading_posix_variable(token: &str) -> Option<(&str, usize)> {
+    let rest = token.strip_prefix('$')?;
+    let (name, consumed) = if let Some(body) = rest.strip_prefix('{') {
+        let close = body.find('}')?;
+        (&body[..close], close + 3)
+    } else {
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        (&rest[..end], end + 1)
+    };
+    let valid_name = !name.is_empty()
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    valid_name.then_some((name, consumed))
+}
+
+/// The single distinct variable name referenced by every `$` in the segment,
+/// provided each `$` begins a plain `$NAME` / `${NAME}` reference. Any other
+/// expansion syntax, or a second distinct name, refuses the proof.
+fn single_posix_variable_reference(segment: &str) -> Option<String> {
+    let bytes = segment.as_bytes();
+    let mut name: Option<&str> = None;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] != b'$' {
+            index += 1;
+            continue;
+        }
+        let (reference, consumed) = parse_leading_posix_variable(&segment[index..])?;
+        match name {
+            Some(existing) if existing != reference => return None,
+            _ => name = Some(reference),
+        }
+        index += consumed;
+    }
+    name.map(str::to_string)
+}
+
+/// Replace every `$NAME` / `${NAME}` reference in the segment with `value`.
+/// Callers must have proven via [`single_posix_variable_reference`] that all
+/// references resolve to `name`.
+fn substitute_posix_variable(segment: &str, name: &str, value: &str) -> String {
+    let bytes = segment.as_bytes();
+    let mut result = String::with_capacity(segment.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'$'
+            && let Some((reference, consumed)) = parse_leading_posix_variable(&segment[index..])
+            && reference == name
+        {
+            result.push_str(value);
+            index += consumed;
+            continue;
+        }
+        let ch = segment[index..]
+            .chars()
+            .next()
+            .expect("index is on a char boundary");
+        result.push(ch);
+        index += ch.len_utf8();
+    }
+    result
+}
+
+/// Statically prove that every value a `$VAR` operand can take keeps this
+/// segment allowed by the filesystem pack, so `mv-dynamic-path` need not fail
+/// closed on it (issue #242).
+///
+/// Unlike the redirect proof, suppressing the dynamic rule alone would be
+/// unsound: `for f in /etc x; do mv "$f" d/; done` has no sensitive literal
+/// in the body segment, so no other rule could catch the `/etc` candidate.
+/// Each candidate is therefore substituted into the segment and re-evaluated
+/// against the same safe and destructive pattern sets the segment itself
+/// faces; every candidate must independently allow. Single quotes, backticks,
+/// and `$(` refuse the proof because textual substitution could change their
+/// meaning; any non-`$NAME` expansion syntax fails the reference scan.
+fn statically_safe_loop_variable_mv(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    dialect_segment: &str,
+    dialect: ShellDialect,
+    pack: &crate::packs::Pack,
+    deadline: Option<&crate::perf::Deadline>,
+) -> bool {
+    if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+        return false;
+    }
+    if !dialect_segment.contains("mv") || !dialect_segment.contains('$') {
+        return false;
+    }
+    if dialect_segment.contains('\'')
+        || dialect_segment.contains('`')
+        || dialect_segment.contains("$(")
+    {
+        return false;
+    }
+    let Some(name) = single_posix_variable_reference(dialect_segment) else {
+        return false;
+    };
+    let Some(values) = resolved_variable_values(source, segment_ranges, segment_start, &name)
+    else {
+        return false;
+    };
+    values.iter().all(|value| {
+        if deadline.is_some_and(crate::perf::Deadline::is_exceeded) {
+            return false;
+        }
+        let substituted = substitute_posix_variable(dialect_segment, &name, value);
+        pack.matches_safe_with_deadline(&substituted, deadline)
+            || !pack
+                .destructive_patterns
+                .iter()
+                .filter(|pattern| filesystem_non_pre_rm_non_redirect_pattern(pattern.name))
+                .any(|pattern| pattern.regex.is_match(&substituted))
+    })
 }
 
 #[inline]
@@ -19670,6 +19943,23 @@ fn evaluate_core_filesystem_pack(
             continue;
         }
 
+        // A `$VAR` mv operand whose every provable value (literal assignment
+        // or fully literal `for` list) re-evaluates to an allowed segment is
+        // exempt from the dynamic-path rule only (issue #242).
+        let final_filter: fn(Option<&str>) -> bool = if statically_safe_loop_variable_mv(
+            redirect_source,
+            segment_ranges,
+            segment_start,
+            dialect_segment,
+            shell_dialect,
+            pack,
+            deadline,
+        ) {
+            filesystem_non_pre_rm_non_redirect_pattern_excluding_mv_dynamic
+        } else {
+            filesystem_non_pre_rm_non_redirect_pattern
+        };
+
         if let Some(result) = evaluate_pack_destructive_patterns(
             pack_id,
             pack,
@@ -19684,7 +19974,7 @@ fn evaluate_core_filesystem_pack(
             first_allowlist_hit,
             deadline,
             &nested_segment_ranges,
-            Some(filesystem_non_pre_rm_non_redirect_pattern),
+            Some(final_filter),
         ) {
             return Some(result);
         }
@@ -30643,5 +30933,486 @@ mod tests {
             // multi-byte trailing char. Char iteration is safe.
             assert_eq!(ResponseConfig::parse_history_window("24é"), None);
         }
+    }
+
+    // =========================================================================
+    // Issue #255: escape scanning must advance by whole UTF-8 characters
+    // =========================================================================
+
+    #[test]
+    fn escape_sequence_end_advances_past_ascii_escaped_char() {
+        // The escape character itself is 1 byte; an ASCII escaped char keeps
+        // the historical `index + 2` behavior.
+        assert_eq!(escape_sequence_end("a`b", 1), 3);
+        assert_eq!(escape_sequence_end("a\\b", 1), 3);
+        assert_eq!(escape_sequence_end("a^b", 1), 3);
+        assert_eq!(escape_sequence_end("`x rest", 0), 2);
+    }
+
+    #[test]
+    fn escape_sequence_end_advances_past_two_byte_escaped_char() {
+        // é is 2 bytes; the old fixed `index + 2` landed mid-codepoint.
+        assert_eq!('é'.len_utf8(), 2);
+        assert_eq!(escape_sequence_end("s`é", 1), 4);
+        assert_eq!(escape_sequence_end("s\\é", 1), 4);
+        assert_eq!(escape_sequence_end("s^é", 1), 4);
+    }
+
+    #[test]
+    fn escape_sequence_end_advances_past_three_byte_escaped_char() {
+        // 中 is 3 bytes.
+        assert_eq!('中'.len_utf8(), 3);
+        assert_eq!(escape_sequence_end("s`中", 1), 5);
+        assert_eq!(escape_sequence_end("s`中x", 1), 5);
+        // ） (fullwidth right parenthesis, the #255 report's char) is 3 bytes.
+        assert_eq!('）'.len_utf8(), 3);
+        assert_eq!(escape_sequence_end("a`）", 1), 5);
+    }
+
+    #[test]
+    fn escape_sequence_end_advances_past_four_byte_escaped_char() {
+        // 😀 is 4 bytes.
+        assert_eq!('😀'.len_utf8(), 4);
+        assert_eq!(escape_sequence_end("s`😀", 1), 6);
+        assert_eq!(escape_sequence_end("s`😀 tail", 1), 6);
+    }
+
+    #[test]
+    fn escape_sequence_end_at_final_byte_returns_len() {
+        // Escape char with nothing after it: the sequence ends at the string
+        // end rather than reading past it.
+        assert_eq!(escape_sequence_end("s`", 1), 2);
+        assert_eq!(escape_sequence_end("`", 0), 1);
+        assert_eq!(escape_sequence_end("git`", 3), 4);
+    }
+
+    #[test]
+    fn multibyte_escaped_chars_do_not_panic_in_any_dialect() {
+        // #255: `b'\`' => index = (index + 2).min(bytes.len())` (and the caret
+        // and backslash equivalents) advanced two bytes over a multi-byte
+        // escaped character, and a later `command[index..]` slice panicked.
+        // The regression here is a panic, so completing evaluation in every
+        // dialect is the pass condition. (The decision itself may legitimately
+        // be Deny: a lone backtick fails closed as an ambiguous POSIX command
+        // substitution under the Posix/Unknown views.)
+        for command in [
+            "s`中", "a`）", "s`é", "s`😀", "git`）", "s^中", "s^）", "s\\中",
+            // Controls: escape at end of input, escape at index 0, no escape.
+            "s`", "`中", "s中",
+        ] {
+            for dialect in [
+                ShellDialect::Unknown,
+                ShellDialect::Posix,
+                ShellDialect::PowerShell,
+                ShellDialect::Cmd,
+            ] {
+                let result = evaluate_with_pack_ids_in_dialect(
+                    command,
+                    &["core.git", "core.filesystem"],
+                    dialect,
+                );
+                assert!(
+                    matches!(
+                        result.decision,
+                        EvaluationDecision::Allow | EvaluationDecision::Deny
+                    ),
+                    "escaped multi-byte fragment must complete evaluation: \
+                     {command:?} in {dialect:?}: {:?}",
+                    result.pattern_info
+                );
+            }
+        }
+
+        // Where the escape character is native to the dialect, the fragment
+        // decodes to a plain benign word and must be allowed.
+        for (command, dialect) in [
+            ("s`中", ShellDialect::PowerShell),
+            ("a`）", ShellDialect::PowerShell),
+            ("s`é", ShellDialect::PowerShell),
+            ("s`😀", ShellDialect::PowerShell),
+            ("s^中", ShellDialect::Cmd),
+            ("s^）", ShellDialect::Cmd),
+            ("s\\中", ShellDialect::Posix),
+            ("s中", ShellDialect::Unknown),
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.git", "core.filesystem"],
+                dialect,
+            );
+            assert!(
+                result.is_allowed(),
+                "benign escaped fragment must be allowed in its native \
+                 dialect: {command:?} in {dialect:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    // =========================================================================
+    // Issue #256: assignment prefixes and short-flag clusters in the
+    // obfuscated-inline-launcher parse
+    // =========================================================================
+
+    #[test]
+    fn posix_word_is_assignment_prefix_accepts_only_shell_name_assignments() {
+        // POSIX `NAME=value` assignment prefixes.
+        assert!(posix_word_is_assignment_prefix("FOO=bar"));
+        assert!(posix_word_is_assignment_prefix("_x9=1"));
+        assert!(posix_word_is_assignment_prefix(
+            "GH_TOKEN=\"$(python3 /tmp/x.py)\""
+        ));
+        assert!(posix_word_is_assignment_prefix("TOKEN="));
+
+        // `--flag=value` is an option, not an assignment.
+        assert!(!posix_word_is_assignment_prefix("--flag=value"));
+        // `9X` is not a valid shell name (leading digit).
+        assert!(!posix_word_is_assignment_prefix("9X=1"));
+        // Empty name, missing `=`, punctuated or quoted names.
+        assert!(!posix_word_is_assignment_prefix("=x"));
+        assert!(!posix_word_is_assignment_prefix("FOO"));
+        assert!(!posix_word_is_assignment_prefix("a-b=1"));
+        assert!(!posix_word_is_assignment_prefix("\"FOO\"=bar"));
+        assert!(!posix_word_is_assignment_prefix("$(python3 /tmp/x.py)"));
+    }
+
+    #[test]
+    fn posix_short_flag_cluster_requires_alphanumeric_leading_chunk() {
+        // Genuine short-flag clusters.
+        assert_eq!(posix_short_flag_cluster("-xc"), Some("xc"));
+        assert_eq!(posix_short_flag_cluster("-c"), Some("c"));
+        assert_eq!(posix_short_flag_cluster("-abc"), Some("abc"));
+        // The decoded form of `-c'echo hi'` is `-cecho hi`; only the first
+        // whitespace-delimited chunk is the flag, the rest is glued payload.
+        assert_eq!(posix_short_flag_cluster("-cecho hi"), Some("cecho"));
+
+        // Operand data that merely starts with `-` is not a cluster.
+        assert_eq!(posix_short_flag_cluster("-label:x"), None);
+        assert_eq!(
+            posix_short_flag_cluster("-label:need-human sort:created-asc"),
+            None
+        );
+        // Long options, bare dash, and non-flag words are not clusters.
+        assert_eq!(posix_short_flag_cluster("--command"), None);
+        assert_eq!(posix_short_flag_cluster("-"), None);
+        assert_eq!(posix_short_flag_cluster("xc"), None);
+    }
+
+    // =========================================================================
+    // Issue #257: execution wrappers must not defeat data-argument masking
+    // =========================================================================
+
+    const EXECUTION_WRAPPER_PREFIXES: [&str; 10] = [
+        "mise exec --",
+        "nice",
+        "nice -n 10",
+        "time",
+        "nohup",
+        "stdbuf -oL",
+        "timeout 30",
+        "setsid",
+        "ionice -c 2 -n 0",
+        "chrt 50",
+    ];
+
+    #[test]
+    fn execution_wrappers_keep_commit_message_payloads_masked() {
+        // Unwrapped control: without masking, "restore" inside the commit
+        // message trips the raw `git ... restore` regex; the sanitizer must
+        // keep masking behind every execution wrapper (#257).
+        for wrapper in EXECUTION_WRAPPER_PREFIXES {
+            let command =
+                format!("{wrapper} git commit -m \"prove PostgreSQL restore round trip\"");
+            let result = evaluate_with_pack_ids(&command, &["core.git"]);
+            assert!(
+                result.is_allowed(),
+                "wrapped commit message must stay masked and allowed: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn execution_wrappers_do_not_mask_executable_payloads() {
+        // The wrapper runs its trailing argv as a command, so a genuinely
+        // destructive inner command must stay visible and denied.
+        for command in [
+            "nice git reset --hard",
+            "timeout 30 git reset --hard HEAD~1",
+            "mise exec -- git push --force origin main",
+            "nohup git clean -fd",
+        ] {
+            let result = evaluate_with_pack_ids(command, &["core.git"]);
+            assert!(
+                result.is_denied(),
+                "destructive command behind an execution wrapper must stay denied: \
+                 {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    // =========================================================================
+    // Issue #250: cross-dialect tokenizer artifacts are not git aliases
+    // =========================================================================
+
+    #[test]
+    fn unknown_dialect_git_compounds_are_not_alias_artifacts() {
+        // Under `ShellDialect::Unknown` (the `dcg test` default), the Cmd view
+        // of a POSIX compound leaves `;`-glued tokens like `pull;` in the
+        // subcommand slot. Those tokens can never reach Git's alias dispatch,
+        // so they must not produce `git-alias-semantic-unverified` denials.
+        for command in [
+            "git status; ls",
+            "git -C /tmp/x pull; ls",
+            "for d in a b; do cd \"$d\" && git pull; done",
+            "sh -c 'cd {} && git pull'",
+            "cat repos.txt | xargs -P12 -I{} sh -c 'cd {} && git pull'",
+            "while read d; do cd \"$d\" && git fetch; done",
+            "{ cd x && git pull; }",
+            "ssh host 'cd x && git pull'",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Unknown,
+            );
+            assert!(
+                result.is_allowed(),
+                "compound with dispatchable git subcommand must be allowed: \
+                 {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // Genuine name-shaped alias boundaries keep their conservative
+        // treatment: unknown alias names and visible destructive alias
+        // definitions must still deny.
+        for command in [
+            "git lg",
+            "git config alias.x '!rm -rf /' && git x",
+            "git config alias.x '!rm -rf /' && git x; ls",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Unknown,
+            );
+            assert!(
+                result.is_denied(),
+                "name-shaped alias boundary must stay denied: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    // =========================================================================
+    // Issue #242: for-loop literal narrowing for mv (and loop-bound redirects)
+    // =========================================================================
+
+    #[test]
+    fn literal_for_loop_binding_proves_mv_operands() {
+        // A fully literal `for NAME in word…` header proves every value the
+        // loop variable can take; when every candidate keeps the mv segment
+        // allowed, `mv-dynamic-path` must not fail closed on it (#242).
+        for command in [
+            "for f in a b; do mv \"$f\" d/; done",
+            "mkdir -p d; for f in a b; do mv \"$f\" \"d/$f\"; done",
+            "for f in a b; do [ -e \"$f\" ] && mv \"$f\" \"d/$f\" && echo \"moved $f\"; done",
+            "for f in a.txt b.txt; do mv $f archive/; done",
+            // Loop-bound redirect targets get the same proof.
+            "for f in a b; do echo x > \"$f\"; done",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "loop-proven mv/redirect must be allowed: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn unprovable_or_sensitive_for_loop_bindings_stay_denied() {
+        let deny_cases: [(&str, &[&str]); 11] = [
+            // Dynamic candidate lists refuse the proof.
+            (
+                "for f in $(ls); do mv \"$f\" d/; done",
+                &["mv-dynamic-path"],
+            ),
+            ("for f in *; do mv \"$f\" d/; done", &["mv-dynamic-path"]),
+            // A sensitive literal destination is denied outright.
+            (
+                "for f in a b; do mv \"$f\" /etc/; done",
+                &["mv-sensitive-source-root-home", "mv-dynamic-path"],
+            ),
+            // The case proving per-candidate re-evaluation is mandatory: the
+            // body segment has no sensitive literal, so only substituting
+            // `/etc` back in can catch it.
+            (
+                "for f in /etc x; do mv \"$f\" d/; done",
+                &["mv-dynamic-path"],
+            ),
+            // The narrowing is mv-only; rm keeps its own rules.
+            ("for f in a b; do rm -rf \"$f\"; done", &[]),
+            // A second, unproven variable refuses the proof.
+            (
+                "for f in a b; do mv \"$f\" $DEST/; done",
+                &["mv-dynamic-path"],
+            ),
+            // Whitespace-bearing candidates are not parse-neutral.
+            ("for f in 'a b' c; do mv $f d/; done", &["mv-dynamic-path"]),
+            // Nested rebinding behind the `do` prefix makes the live value
+            // ambiguous.
+            (
+                "for f in a b; do for f in $(ls); do mv \"$f\" d/; done; done",
+                &["mv-dynamic-path"],
+            ),
+            // A binding before the loop plus the loop itself is two bindings.
+            (
+                "f=/etc; for f in a b; do :; done; mv \"$f\" d/",
+                &["mv-dynamic-path"],
+            ),
+            (
+                "f=a; for f in /etc x; do mv \"$f\" d/; done",
+                &["mv-dynamic-path"],
+            ),
+            // Loop-bound redirect to a sensitive candidate.
+            (
+                "for f in /etc/passwd; do echo x > \"$f\"; done",
+                &["redirect-truncate-dynamic-path"],
+            ),
+        ];
+        for (command, expected_rules) in deny_cases {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "unprovable loop binding must stay denied: {command:?}: {:?}",
+                result.pattern_info
+            );
+            let name = result
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.pattern_name.as_deref())
+                .unwrap_or("<none>");
+            if expected_rules.is_empty() {
+                assert!(
+                    name.starts_with("rm-"),
+                    "expected an rm rule for {command:?}, got {name}"
+                );
+            } else {
+                assert!(
+                    expected_rules.contains(&name),
+                    "unexpected deny rule for {command:?}: {name} \
+                     (expected one of {expected_rules:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn literal_assignment_redirect_proof_survives_loop_narrowing() {
+        // The pre-existing #249 assignment proof must keep working alongside
+        // the loop-binding proof.
+        let result = evaluate_with_pack_ids_in_dialect(
+            "log=/tmp/out.log; echo hi > \"$log\"",
+            &["core.filesystem"],
+            ShellDialect::Posix,
+        );
+        assert!(
+            result.is_allowed(),
+            "proven literal redirect target must stay allowed: {:?}",
+            result.pattern_info
+        );
+
+        for command in [
+            "log=/etc/passwd; echo hi > \"$log\"",
+            "log=$(mktemp); echo hi > \"$log\"",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "sensitive or dynamic redirect target must stay denied: \
+                 {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn parse_posix_for_loop_header_accepts_literal_headers() {
+        assert_eq!(
+            parse_posix_for_loop_header("for f in a b"),
+            Some(("f".to_string(), vec!["a".to_string(), "b".to_string()]))
+        );
+        // Quoted candidate words decode to their literal values.
+        assert_eq!(
+            parse_posix_for_loop_header("for f in 'a' \"b\" c"),
+            Some((
+                "f".to_string(),
+                vec!["a".to_string(), "b".to_string(), "c".to_string()]
+            ))
+        );
+        // Headers nested behind control-flow prefixes are still headers.
+        assert_eq!(
+            parse_posix_for_loop_header("do for f in a b"),
+            Some(("f".to_string(), vec!["a".to_string(), "b".to_string()]))
+        );
+    }
+
+    #[test]
+    fn parse_posix_for_loop_header_refuses_unprovable_headers() {
+        // `"$@"` is not statically enumerable.
+        assert_eq!(parse_posix_for_loop_header("for f in \"$@\""), None);
+        // Whitespace inside a single-quoted candidate is not parse-neutral.
+        assert_eq!(parse_posix_for_loop_header("for f in 'a b' c"), None);
+        // Globs, substitutions, empty lists, and invalid names all refuse.
+        assert_eq!(parse_posix_for_loop_header("for f in *"), None);
+        assert_eq!(parse_posix_for_loop_header("for f in $(ls)"), None);
+        assert_eq!(parse_posix_for_loop_header("for f in"), None);
+        assert_eq!(parse_posix_for_loop_header("for 9f in a b"), None);
+
+        // Candidate-count cap: MAX_LOOP_CANDIDATES is accepted, one more is
+        // refused.
+        let at_cap = (0..MAX_LOOP_CANDIDATES)
+            .map(|i| format!("c{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(parse_posix_for_loop_header(&format!("for f in {at_cap}")).is_some());
+        let over_cap = (0..=MAX_LOOP_CANDIDATES)
+            .map(|i| format!("c{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            parse_posix_for_loop_header(&format!("for f in {over_cap}")),
+            None
+        );
+    }
+
+    #[test]
+    fn substitute_posix_variable_replaces_only_the_named_references() {
+        assert_eq!(substitute_posix_variable("mv $f d/", "f", "a"), "mv a d/");
+        assert_eq!(substitute_posix_variable("mv ${f} d/", "f", "a"), "mv a d/");
+        assert_eq!(
+            substitute_posix_variable("mv \"$f\" \"d/$f\"", "f", "a"),
+            "mv \"a\" \"d/a\""
+        );
+        // `$f` must not match inside the longer name `$foo`.
+        assert_eq!(
+            substitute_posix_variable("mv $foo d/", "f", "a"),
+            "mv $foo d/"
+        );
     }
 }

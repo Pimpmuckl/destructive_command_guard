@@ -301,10 +301,60 @@ cargo test safe_pattern_tests
 cargo test destructive_pattern_tests
 ```
 
+### The Three Release-Blocking E2E Suites (read before touching perf or protocols)
+
+`cargo test` cannot catch the failure modes that have actually broken users.
+Three real-binary, no-mock suites exist specifically to close those gaps. All
+three must be green before any release.
+
+| Suite | Catches | Why unit tests can't |
+|-------|---------|----------------------|
+| `scripts/e2e_harness_matrix.sh` | Wire-protocol breakage for **every** agent (Claude Code, Codex, Gemini, Copilot, Hermes, Grok, agy) | Unit tests call Rust functions; harnesses parse **bytes**. Asserts decision field + exit code + stdout/stderr separation per protocol against the real binary. |
+| `scripts/perf_baseline.py --assert-budget-ms` | **#245**: per-invocation cost silently eating the fixed hook deadline | The perf job is a *relative* ratchet — a uniform slowdown just gets re-baselined. This gate asserts cold p95 against the **shipped** `HOOK_EVALUATION_BUDGET_MS` with a hermetic HOME and scrubbed `DCG_*`. |
+| `scripts/e2e_fleet_install.sh` | Published artifact missing/unrunnable per platform; installer picking the wrong triple; checksum/signature verification silently skipped; hook config non-idempotent | Nothing in-tree proves the **public download path** works on real Linux/macOS/Windows hardware. |
+
+```bash
+# Protocol conformance for all 7 harnesses (needs a release binary + jq)
+./scripts/e2e_harness_matrix.sh --binary target/release/dcg
+
+# Absolute latency gate — the #245 guard. Budget MUST come from src/perf.rs.
+python3 scripts/perf_baseline.py --bin target/release/dcg --skip-trace \
+  --assert-budget-ms 1000 --assert-margin-pct 50
+
+# Real installs from the PUBLIC release on every DSR host
+./scripts/e2e_fleet_install.sh --version vX.Y.Z          # whole fleet
+./scripts/e2e_fleet_install.sh --version vX.Y.Z --local-only
+```
+
+Rules:
+- **Scrub ambient `DCG_*` before measuring anything.** Operators bitten by #245
+  export `DCG_HOOK_TIMEOUT_MS=5000` (an agent `settings.json` `env` block puts
+  it in every child process), so an un-scrubbed suite measures the *workaround*
+  and passes on exactly the machines that need protecting. `env -i` covers the
+  hook calls; the installer cannot use it (it needs the host PATH for
+  `curl`/`tar`/`xz`/`minisign`), so the probes also `unset` every `DCG_*` up
+  front. Assert `general.hook_timeout_source` too — a bare `>= 1000` check
+  cannot tell the shipped default from an inherited 5000.
+- **Set `DCG_SELF_HEAL_HOOK=0` before the installer runs, not after.** dcg
+  repairs a missing/stale hook entry whenever it runs in hook mode, and native
+  Windows resolves the settings path via the Win32 known-folder API, which
+  `USERPROFILE` cannot redirect — so a late disable can rewrite a real
+  machine's agent config.
+- **Never hard-code the budget in `.github/workflows/ci.yml`.** It is grepped
+  out of `HOOK_EVALUATION_BUDGET_MS`; `perf::tests::ci_enforces_absolute_latency_gate_against_shipped_budget`
+  fails if that wiring is removed or the margin is loosened past 60%.
+- Measure dcg's own cost as `full_eval − DCG_BYPASS`, never raw wall-clock:
+  process spawn (≈940ms under Windows PowerShell) sits **outside** the
+  evaluation deadline and would otherwise produce false alarms.
+- The fleet suite installs into a scratch prefix with an isolated `HOME` and
+  `--no-configure`; it never touches a host's real agent hook config.
+- A probe that dies partway must FAIL, not pass: every probe emits
+  `probe_complete` and the runner asserts the full expected case set.
+
 ### End-to-End Testing
 
 ```bash
-# Run the E2E test script
+# Run the E2E test script (needs bash >= 4; macOS /bin/bash 3.2 breaks the summary)
 ./scripts/e2e_test.sh
 
 # Or test manually

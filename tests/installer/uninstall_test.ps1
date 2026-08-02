@@ -173,5 +173,22 @@ try {
     Check (-not (Test-Path $data)) "KeepConfig removes data directory"
 } finally { Remove-Item -Recurse -Force $h9 -ErrorAction SilentlyContinue }
 
+Write-Host "Test 10: Copilot PascalCase PreToolUse dcg entry removed, coexisting survives (#253)"
+$h10 = New-Tmp
+try {
+    $hookDir = Join-Path $h10 'hooks'; New-Item -ItemType Directory -Path $hookDir -Force | Out-Null
+    @{ version = 1; hooks = @{ PreToolUse = @(
+        @{ type = 'command'; bash = $dcg; powershell = $dcg; cwd = '.'; timeoutSec = 30 },
+        @{ type = 'command'; bash = 'linter'; powershell = 'linter.exe' }) } } |
+        ConvertTo-Json -Depth 20 | Set-Content (Join-Path $hookDir 'dcg.json')
+    Check ((Unconfigure-CopilotHook -CopilotHome $h10) -eq $true) "PascalCase key: returns true (removed)"
+    $cfg = Get-Content -Raw (Join-Path $hookDir 'dcg.json') | ConvertFrom-Json
+    $preKeys = @($cfg.hooks.PSObject.Properties.Name | Where-Object { $_.ToLowerInvariant() -eq 'pretooluse' })
+    Check (($preKeys.Count -eq 1) -and ($preKeys[0] -ceq 'PreToolUse')) "existing PascalCase spelling kept (got: $($preKeys -join ', '))"
+    $entries = @($cfg.hooks.PSObject.Properties['PreToolUse'].Value)
+    Check ($null -eq ($entries | Where-Object { $_.bash -eq $dcg -or $_.powershell -eq $dcg })) "PascalCase dcg entry removed"
+    Check (@($entries | Where-Object { $_.bash -eq 'linter' }).Count -eq 1) "coexisting non-dcg entry survives"
+} finally { Remove-Item -Recurse -Force $h10 -ErrorAction SilentlyContinue }
+
 if ($script:failures -gt 0) { Write-Host "$script:failures FAILURE(S)" -ForegroundColor Red; exit 1 }
 Write-Host "All uninstall parity tests passed." -ForegroundColor Green

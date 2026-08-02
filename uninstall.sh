@@ -204,15 +204,20 @@ if not isinstance(settings, dict):
 hooks = settings.get("hooks")
 if not isinstance(hooks, dict):
     sys.exit(1)
-pre_tool = hooks.get("preToolUse")
-if not isinstance(pre_tool, list):
+
+# Match the event key case-insensitively: Copilot's schema is camelCase
+# `preToolUse`, but dcg <= 0.8.0 could leave a PascalCase `PreToolUse`
+# entry behind (#253).
+pre_tool_lists = [v for k, v in hooks.items() if k.lower() == "pretooluse" and isinstance(v, list)]
+if not pre_tool_lists:
     sys.exit(1)
 
-for entry in pre_tool:
-    if not isinstance(entry, dict):
-        continue
-    if is_dcg_command(entry.get("bash")) or is_dcg_command(entry.get("powershell")):
-        sys.exit(0)
+for pre_tool in pre_tool_lists:
+    for entry in pre_tool:
+        if not isinstance(entry, dict):
+            continue
+        if is_dcg_command(entry.get("bash")) or is_dcg_command(entry.get("powershell")):
+            sys.exit(0)
 
 sys.exit(1)
 PYEOF
@@ -564,8 +569,11 @@ hooks = settings.get("hooks")
 if not isinstance(hooks, dict):
     sys.exit(0)
 
-pre_tool = hooks.get("preToolUse")
-if not isinstance(pre_tool, list):
+# Copilot's schema is camelCase `preToolUse`, but dcg <= 0.8.0 could leave a
+# PascalCase `PreToolUse` entry behind, so match the key case-insensitively
+# and clean every matching spelling (#253).
+pre_tool_keys = [k for k in hooks if k.lower() == "pretooluse" and isinstance(hooks[k], list)]
+if not pre_tool_keys:
     sys.exit(0)
 
 def is_dcg_command(command):
@@ -600,20 +608,25 @@ def strip_dcg_platform_fields(entry):
     return True, []
 
 removed = False
-new_pre = []
-for entry in pre_tool:
-    entry_removed, residual_entries = strip_dcg_platform_fields(entry)
-    if entry_removed:
-        removed = True
-    new_pre.extend(residual_entries)
+for key in pre_tool_keys:
+    new_pre = []
+    key_removed = False
+    for entry in hooks[key]:
+        entry_removed, residual_entries = strip_dcg_platform_fields(entry)
+        if entry_removed:
+            key_removed = True
+        new_pre.extend(residual_entries)
+
+    if not key_removed:
+        continue
+    removed = True
+    if new_pre:
+        hooks[key] = new_pre
+    else:
+        hooks.pop(key, None)
 
 if not removed:
     sys.exit(0)
-
-if new_pre:
-    hooks["preToolUse"] = new_pre
-else:
-    hooks.pop("preToolUse", None)
 
 for key in list(hooks.keys()):
     if hooks.get(key) == []:
@@ -983,6 +996,116 @@ PYEOF
     return $?
 }
 
+# Remove dcg hook from Posit Assistant (~/.posit/assistant/settings.json).
+#
+# Only dcg-owned entries are removed. A matcher group is dropped only when it
+# had hooks and dcg was the last one left; groups the user wrote for other
+# tools — and groups with no `hooks` key at all — survive untouched. The file
+# itself is NEVER deleted: Posit Assistant keeps unrelated settings in it.
+unconfigure_posit_assistant() {
+    local settings="$HOME/.posit/assistant/settings.json"
+
+    if [ ! -f "$settings" ]; then
+        return 0
+    fi
+
+    if ! json_settings_has_dcg_command_hook "$settings" "PreToolUse"; then
+        return 0
+    fi
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        warn "python3 not available - cannot safely edit Posit Assistant settings"
+        warn "Please manually remove dcg from $settings"
+        return 1
+    fi
+
+    python3 - "$settings" <<'PYEOF'
+import json
+import os
+import shlex
+import sys
+
+settings_file = sys.argv[1]
+
+def is_dcg_command(cmd):
+    """True iff `cmd` invokes the dcg binary (basename match, not substring).
+
+    This code DELETES entries, so a substring false positive (e.g.
+    /opt/dcgrep/bin/scan or ~/.local/bin/dcgworkflow) would be data loss for
+    the user's unrelated tooling.
+    """
+    if not isinstance(cmd, str) or not cmd:
+        return False
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    name = os.path.basename(tokens[0])
+    if name.endswith('.exe'):
+        name = name[:-4]
+    return name == 'dcg'
+
+try:
+    with open(settings_file, 'r', encoding='utf-8') as f:
+        settings = json.load(f)
+except (IOError, ValueError, json.JSONDecodeError):
+    sys.exit(0)
+
+if not isinstance(settings, dict):
+    sys.exit(0)
+hooks = settings.get('hooks')
+if not isinstance(hooks, dict):
+    sys.exit(0)
+pre_tool_use = hooks.get('PreToolUse')
+if not isinstance(pre_tool_use, list):
+    sys.exit(0)
+
+new_entries = []
+removed = False
+for entry in pre_tool_use:
+    if not isinstance(entry, dict) or not isinstance(entry.get('hooks'), list):
+        new_entries.append(entry)
+        continue
+    inner = entry['hooks']
+    filtered = [
+        hook for hook in inner
+        if not (isinstance(hook, dict) and is_dcg_command(hook.get('command')))
+    ]
+    if len(filtered) != len(inner):
+        removed = True
+    if inner and not filtered:
+        # The group existed only to run dcg; drop it rather than leave an
+        # empty group behind.
+        continue
+    entry['hooks'] = filtered
+    new_entries.append(entry)
+
+if not removed:
+    sys.exit(0)
+
+# The settings file stays in place even when the hooks empty out — unlike
+# ~/.codex/hooks.json (dcg-dedicated), this file also holds unrelated Posit
+# Assistant settings, and an empty `hooks` object is valid.
+if new_entries:
+    hooks['PreToolUse'] = new_entries
+else:
+    hooks.pop('PreToolUse', None)
+
+try:
+    with open(settings_file, 'w', encoding='utf-8') as f:
+        json.dump(settings, f, indent=2)
+        f.write("\n")
+except OSError as exc:
+    print(f"warning: failed to update {settings_file}: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+print("removed", file=sys.stderr)
+PYEOF
+    return $?
+}
+
 remove_state_directories() {
     local config_dir="$1"
     local data_dir="$2"
@@ -1089,6 +1212,11 @@ main() {
         log "  • Hermes Agent hook ($hermes_config)"
         found_anything=1
     fi
+    local posit_assistant_settings="$HOME/.posit/assistant/settings.json"
+    if json_settings_has_dcg_command_hook "$posit_assistant_settings" "PreToolUse"; then
+        log "  • Posit Assistant hook ($posit_assistant_settings)"
+        found_anything=1
+    fi
 
     # Config
     if { [ "$KEEP_CONFIG" -eq 0 ] || [ "$KEEP_HISTORY" -eq 0 ]; } &&
@@ -1179,6 +1307,11 @@ main() {
     # Remove Hermes Agent hook
     if unconfigure_hermes 2>&1 | grep -q "removed"; then
         ok "Removed Hermes Agent hook"
+    fi
+
+    # Remove Posit Assistant hook
+    if unconfigure_posit_assistant 2>&1 | grep -q "removed"; then
+        ok "Removed Posit Assistant hook"
     fi
 
     # Remove Aider config
