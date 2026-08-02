@@ -1463,7 +1463,7 @@ jobs:
           $dest = Join-Path $env:RUNNER_TEMP 'dcg-bin'
           New-Item -ItemType Directory -Force -Path $dest | Out-Null
           $src = Invoke-RestMethod -Uri "https://raw.githubusercontent.com/${{ github.repository }}/main/install.ps1"
-          $installLog = (& ([scriptblock]::Create($src)) -Version $version -Dest $dest -Verify -NoConfigure 2>&1 | Out-String)
+          $installLog = (& ([scriptblock]::Create($src)) -Version $version -Dest $dest -Verify -NoConfigure *>&1 | Out-String)
           Write-Output $installLog
           if ($installLog -notmatch 'Signature verified \(cosign') {
             throw "installer did not verify the release Sigstore bundle"
