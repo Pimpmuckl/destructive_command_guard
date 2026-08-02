@@ -8,14 +8,25 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-INSTALL_SCRIPT="$PROJECT_ROOT/install.sh"
-UNINSTALL_SCRIPT="$PROJECT_ROOT/uninstall.sh"
+# Overridable so a historical script (e.g. `git show <ref>:install.sh` into a
+# temp file) can be run through the same suites to prove a test genuinely
+# pins its fix — the test must FAIL against the pre-fix script.
+INSTALL_SCRIPT="${DCG_TEST_INSTALL_SCRIPT:-$PROJECT_ROOT/install.sh}"
+UNINSTALL_SCRIPT="${DCG_TEST_UNINSTALL_SCRIPT:-$PROJECT_ROOT/uninstall.sh}"
 
 # Extract and source functions from install.sh
 # We create a temporary file with just the functions (no execution)
 extract_install_functions() {
     local tmp_functions
     tmp_functions="$(mktemp)"
+
+    # The extraction keeps the top-level code that runs before the download
+    # phase, including the `resolve_version` call. With VERSION unset that
+    # call hits the live GitHub API once per test (rate-limit flakes, and the
+    # suite breaks entirely offline). Preset a valid SemVer placeholder so
+    # resolve_version takes its no-network early-return path.
+    VERSION="${VERSION:-v0.0.0-test}"
+    export VERSION
 
     # Create a modified version of install.sh that can be sourced.
     # Functions are defined throughout the file, including after the download
@@ -42,6 +53,11 @@ return 0 2>/dev/null || true
     # Suppress all output from sourcing
     # shellcheck disable=SC1090
     source "$tmp_functions" >/dev/null 2>&1 || true
+    # The sourced script leaves `set +e` behind (the extraction disables
+    # errexit so stray top-level failures cannot abort the test shell
+    # mid-source). Bats failure detection depends on errexit, so restore it —
+    # without this, `[ 1 -eq 2 ]` in a test body still reports ok.
+    set -e
     rm -f "$tmp_functions"
 }
 
@@ -61,7 +77,8 @@ return 0 2>/dev/null || true
 
     # shellcheck disable=SC1090
     source "$tmp_functions" >/dev/null 2>&1 || true
-    set +e
+    # Restore errexit for the test shell (see extract_install_functions).
+    set -e
     rm -f "$tmp_functions"
 }
 
@@ -78,6 +95,16 @@ setup_isolated_home() {
     # This prevents detection of user-installed agents like claude, aider, etc.
     mkdir -p "$TEST_TMPDIR/bin"
     export PATH="$TEST_TMPDIR/bin:/usr/bin:/bin"
+
+    # Host processes must not leak into isolated tests either: install.sh's
+    # Cursor detection falls back to pgrep, so a Cursor IDE running on the
+    # host would be "detected" even with a fresh HOME. Stub pgrep to report
+    # no matches (exit 1, matching the real tool's no-match behavior).
+    cat > "$TEST_TMPDIR/bin/pgrep" << 'EOF'
+#!/bin/bash
+exit 1
+EOF
+    chmod +x "$TEST_TMPDIR/bin/pgrep"
 
     # Suppress gum and colors for testing
     export HAS_GUM=0

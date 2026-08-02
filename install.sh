@@ -85,19 +85,36 @@ fi
 # True when an operator terminal is available for prompting.
 have_tty() { [ -n "$DCG_TTY" ]; }
 
+# Seconds an interactive prompt waits for a reply before taking its default
+# (#251). A pty can exist with nobody attached to answer — `docker run -t`
+# without `-i`, pty-allocating CI — and an untimed read would hang the
+# install forever there. Overridable for tests.
+DCG_PROMPT_TIMEOUT="${DCG_PROMPT_TIMEOUT:-120}"
+
 # ask_yn "<prompt>" "<y|n default>" — ask a yes/no question on the operator
 # TTY. Prints the prompt to /dev/tty and reads the reply from it, so it works
 # under `curl … | bash`. Returns 0 for yes, 1 for no. The default answers
-# empty input, a failed read, or a missing TTY, and follows the same
-# convention as the inline prompts it replaces: a "y" default only becomes no
-# on an explicit no, an "n" default only becomes yes on an explicit yes.
+# empty input, a failed read, a missing TTY, or a reply timeout, and follows
+# the same convention as the inline prompts it replaces: a "y" default only
+# becomes no on an explicit no, an "n" default only becomes yes on an
+# explicit yes.
 ask_yn() {
   local prompt="$1"
   local default="${2:-n}"
   local reply=""
+  local read_status=0
   if have_tty; then
     printf '%s ' "$prompt" >"$DCG_TTY" 2>/dev/null || true
-    IFS= read -r reply <"$DCG_TTY" 2>/dev/null || reply=""
+    IFS= read -r -t "$DCG_PROMPT_TIMEOUT" reply <"$DCG_TTY" 2>/dev/null || read_status=$?
+    if [ "$read_status" -ne 0 ]; then
+      # Timed out or EOF: nobody is answering this pty. bash >= 4 marks a
+      # timeout with an exit status > 128, but bash 3.2 (macOS /bin/bash)
+      # returns 1 for both, so treat every failed TTY read the same — take
+      # the default rather than hanging, and say so on the record.
+      reply=""
+      printf '\n' >"$DCG_TTY" 2>/dev/null || true
+      warn "No reply (timeout after ${DCG_PROMPT_TIMEOUT}s or end of input); taking the default (${default})."
+    fi
   fi
   [ -n "$reply" ] || reply="$default"
   if [ "$default" = "y" ]; then
@@ -1769,7 +1786,11 @@ PYEOF
       local dcg_command_marker
       local after_first_dcg
       dcg_hook_regex=$(printf '%s' "$DEST/dcg" | sed 's/[][\\.^$*+?{}()|]/\\&/g')
-      compact_settings=$(LC_ALL=C sed ':a;N;$!ba;s/[[:space:]]//g' "$settings_file" 2>/dev/null || true)
+      # Strip ALL whitespace (including newlines) with tr: the GNU sed idiom
+      # `:a;N;$!ba;...` is not portable — BSD sed (macOS) parses it as one
+      # giant label, changes nothing, and a pretty-printed already-configured
+      # settings.json was never recognized here.
+      compact_settings=$(LC_ALL=C tr -d '[:space:]' < "$settings_file" 2>/dev/null || true)
       dcg_command_marker="\"command\":\"$DEST/dcg\""
       after_first_dcg="${compact_settings#*"$dcg_command_marker"}"
       if [ "$after_first_dcg" != "$compact_settings" ] &&
@@ -2059,7 +2080,9 @@ PYEOF
       local dcg_command_marker
       local after_first_dcg
       dcg_hook_regex=$(printf '%s' "$DEST/dcg" | sed 's/[][\\.^$*+?{}()|]/\\&/g')
-      compact_settings=$(LC_ALL=C sed ':a;N;$!ba;s/[[:space:]]//g' "$settings_file" 2>/dev/null || true)
+      # tr, not GNU sed `:a;N;$!ba;...` — see the configure_claude_code
+      # fallback above for why (BSD sed compatibility).
+      compact_settings=$(LC_ALL=C tr -d '[:space:]' < "$settings_file" 2>/dev/null || true)
       dcg_command_marker="\"command\":\"$DEST/dcg\""
       after_first_dcg="${compact_settings#*"$dcg_command_marker"}"
       if [ "$after_first_dcg" != "$compact_settings" ] &&
@@ -2702,10 +2725,15 @@ else:
         pre_tool.extend(hooks.pop(key))
     hooks[pre_tool_key] = pre_tool
 
+# The platform fields hold SHELL COMMAND strings, so the binary path is
+# double-quoted (shlex-compatible, same convention as configure_posit_assistant)
+# — an install path containing spaces would otherwise be word-split at run
+# time, and the unquoted form defeats the shlex-based dcg-entry detection
+# used for dedupe and uninstall (#253-adjacent).
 desired = {
     "type": "command",
-    "bash": dcg_path,
-    "powershell": dcg_path,
+    "bash": f'"{dcg_path}"',
+    "powershell": f'"{dcg_path}"',
     "cwd": ".",
     "timeoutSec": 30,
 }
@@ -2799,7 +2827,9 @@ PYEOF
       return 1
     fi
   else
-    # Create new dedicated dcg hook file.
+    # Create new dedicated dcg hook file. The platform fields are shell
+    # command strings, so the binary path is double-quoted (same convention
+    # as configure_posit_assistant) to survive an install path with spaces.
     cat > "$hook_file" <<EOFSET
 {
   "version": 1,
@@ -2807,8 +2837,8 @@ PYEOF
     "preToolUse": [
       {
         "type": "command",
-        "bash": "$DEST/dcg",
-        "powershell": "$DEST/dcg",
+        "bash": "\\"$DEST/dcg\\"",
+        "powershell": "\\"$DEST/dcg\\"",
         "cwd": ".",
         "timeoutSec": 30
       }
@@ -3419,7 +3449,11 @@ configure_posit_assistant() {
     mkdir -p "$settings_dir"
   fi
 
-  if [ -f "$settings_file" ]; then
+  # An existing but EMPTY (or whitespace-only) settings.json holds nothing to
+  # merge or preserve — treat it exactly like a missing file and create
+  # fresh. The first-pass state check below would otherwise misreport it as
+  # invalid JSON and fail the configuration.
+  if [ -f "$settings_file" ] && LC_ALL=C grep -q '[^[:space:]]' "$settings_file" 2>/dev/null; then
     if ! command -v python3 >/dev/null 2>&1; then
       POSIT_ASSISTANT_STATUS="failed"
       POSIT_ASSISTANT_FAILURE_REASON="python3 required to safely merge settings.json"

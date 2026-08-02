@@ -283,14 +283,14 @@ EOF
     local no_python_path="$TEST_TMPDIR/no-python-bin"
     mkdir -p "$no_python_path"
     local tool
-    for tool in dirname mkdir cp date grep sed rm mv cat; do
+    for tool in dirname mkdir cp date grep sed tr rm mv cat; do
         ln -s "$(command -v "$tool")" "$no_python_path/$tool"
     done
 
     local old_path="$PATH"
     PATH="$no_python_path"
-    configure_claude_code "$CLAUDE_SETTINGS" "0"
-    local rc=$?
+    local rc=0
+    configure_claude_code "$CLAUDE_SETTINGS" "0" || rc=$?
     PATH="$old_path"
 
     log_test "CLAUDE_STATUS: $CLAUDE_STATUS rc=$rc"
@@ -326,14 +326,14 @@ EOF
     local no_python_path="$TEST_TMPDIR/no-python-bin"
     mkdir -p "$no_python_path"
     local tool
-    for tool in dirname mkdir cp date grep sed rm mv cat; do
+    for tool in dirname mkdir cp date grep sed tr rm mv cat; do
         ln -s "$(command -v "$tool")" "$no_python_path/$tool"
     done
 
     local old_path="$PATH"
     PATH="$no_python_path"
-    configure_claude_code "$CLAUDE_SETTINGS" "0"
-    local rc=$?
+    local rc=0
+    configure_claude_code "$CLAUDE_SETTINGS" "0" || rc=$?
     PATH="$old_path"
 
     log_test "CLAUDE_STATUS: $CLAUDE_STATUS rc=$rc"
@@ -352,14 +352,14 @@ EOF
     local no_python_path="$TEST_TMPDIR/no-python-bin"
     mkdir -p "$no_python_path"
     local tool
-    for tool in dirname mkdir cp date grep sed rm mv cat; do
+    for tool in dirname mkdir cp date grep sed tr rm mv cat; do
         ln -s "$(command -v "$tool")" "$no_python_path/$tool"
     done
 
     local old_path="$PATH"
     PATH="$no_python_path"
-    configure_claude_code "$CLAUDE_SETTINGS" "0"
-    local rc=$?
+    local rc=0
+    configure_claude_code "$CLAUDE_SETTINGS" "0" || rc=$?
     PATH="$old_path"
 
     log_test "CLAUDE_STATUS: $CLAUDE_STATUS rc=$rc"
@@ -393,14 +393,14 @@ EOF
     local no_python_path="$TEST_TMPDIR/no-python-bin"
     mkdir -p "$no_python_path"
     local tool
-    for tool in dirname mkdir cp date grep sed rm mv cat; do
+    for tool in dirname mkdir cp date grep sed tr rm mv cat; do
         ln -s "$(command -v "$tool")" "$no_python_path/$tool"
     done
 
     local old_path="$PATH"
     PATH="$no_python_path"
-    configure_claude_code "$CLAUDE_SETTINGS" "0"
-    local rc=$?
+    local rc=0
+    configure_claude_code "$CLAUDE_SETTINGS" "0" || rc=$?
     PATH="$old_path"
 
     log_test "CLAUDE_STATUS: $CLAUDE_STATUS rc=$rc"
@@ -567,14 +567,14 @@ EOF
     local no_python_path="$TEST_TMPDIR/no-python-bin"
     mkdir -p "$no_python_path"
     local tool
-    for tool in dirname mkdir cp date grep sed rm mv cat; do
+    for tool in dirname mkdir cp date grep sed tr rm mv cat; do
         ln -s "$(command -v "$tool")" "$no_python_path/$tool"
     done
 
     local old_path="$PATH"
     PATH="$no_python_path"
-    configure_gemini "$GEMINI_SETTINGS"
-    local rc=$?
+    local rc=0
+    configure_gemini "$GEMINI_SETTINGS" || rc=$?
     PATH="$old_path"
 
     log_test "GEMINI_STATUS: $GEMINI_STATUS rc=$rc"
@@ -695,8 +695,8 @@ PYEOF
     local before
     before=$(cat "$GEMINI_SETTINGS")
 
-    configure_gemini "$GEMINI_SETTINGS"
-    local rc=$?
+    local rc=0
+    configure_gemini "$GEMINI_SETTINGS" || rc=$?
 
     log_test "GEMINI_STATUS: $GEMINI_STATUS"
     log_test "GEMINI_FAILURE_REASON: ${GEMINI_FAILURE_REASON:-}"
@@ -721,8 +721,8 @@ EOF
     local before
     before=$(cat "$GEMINI_SETTINGS")
 
-    configure_gemini "$GEMINI_SETTINGS"
-    local rc=$?
+    local rc=0
+    configure_gemini "$GEMINI_SETTINGS" || rc=$?
 
     log_test "GEMINI_STATUS: $GEMINI_STATUS"
     log_test "GEMINI_FAILURE_REASON: ${GEMINI_FAILURE_REASON:-}"
@@ -764,8 +764,8 @@ EOF
     local before
     before=$(cat "$GEMINI_SETTINGS")
 
-    configure_gemini "$GEMINI_SETTINGS"
-    local rc=$?
+    local rc=0
+    configure_gemini "$GEMINI_SETTINGS" || rc=$?
 
     log_test "GEMINI_STATUS: $GEMINI_STATUS"
     log_test "GEMINI_FAILURE_REASON: ${GEMINI_FAILURE_REASON:-}"
@@ -805,8 +805,8 @@ EOF
     local before
     before=$(cat "$GEMINI_SETTINGS")
 
-    configure_gemini "$GEMINI_SETTINGS"
-    local rc=$?
+    local rc=0
+    configure_gemini "$GEMINI_SETTINGS" || rc=$?
 
     log_test "GEMINI_STATUS: $GEMINI_STATUS"
     log_test "GEMINI_FAILURE_REASON: ${GEMINI_FAILURE_REASON:-}"
@@ -1426,8 +1426,8 @@ EOF
     local before
     before=$(cat "$CURSOR_HOOKS_JSON")
 
-    configure_cursor
-    local rc=$?
+    local rc=0
+    configure_cursor || rc=$?
 
     log_test "configure_cursor rc: $rc"
     log_test "CURSOR_STATUS: $CURSOR_STATUS"
@@ -1456,8 +1456,8 @@ EOF
     local before
     before=$(cat "$CURSOR_HOOKS_JSON")
 
-    configure_cursor
-    local rc=$?
+    local rc=0
+    configure_cursor || rc=$?
 
     log_test "configure_cursor rc: $rc"
     log_test "CURSOR_STATUS: $CURSOR_STATUS"
@@ -1488,8 +1488,8 @@ EOF
     local before
     before=$(cat "$CURSOR_HOOKS_JSON")
 
-    configure_cursor
-    local rc=$?
+    local rc=0
+    configure_cursor || rc=$?
 
     log_test "configure_cursor rc: $rc"
     log_test "CURSOR_STATUS: $CURSOR_STATUS"
@@ -1537,7 +1537,9 @@ PYEOF
 assert_copilot_dcg_hook_count() {
     command -v python3 &>/dev/null || skip "python3 not available"
 
-    python3 - "$COPILOT_HOOK_FILE" "$DEST/dcg" "$1" <<'PYEOF'
+    # The canonical stored form is the double-quoted binary path (survives a
+    # DEST containing spaces), matching configure_posit_assistant.
+    python3 - "$COPILOT_HOOK_FILE" "\"$DEST/dcg\"" "$1" <<'PYEOF'
 import json
 import os
 import shlex
@@ -1591,7 +1593,7 @@ PYEOF
 
     [ "$COPILOT_STATUS" = "created" ]
     [ -f "$COPILOT_HOOK_FILE" ]
-    assert_copilot_first_hook "$DEST/dcg"
+    assert_copilot_first_hook "\"$DEST/dcg\""
     assert_copilot_dcg_hook_count 1
 }
 
@@ -1624,7 +1626,7 @@ EOF
     log_test "Hook content: $(cat "$COPILOT_HOOK_FILE")"
 
     [ "$COPILOT_STATUS" = "merged" ]
-    assert_copilot_first_hook "$DEST/dcg"
+    assert_copilot_first_hook "\"$DEST/dcg\""
     assert_copilot_dcg_hook_count 1
     grep -qF "/opt/dcgrep/bin/scan" "$COPILOT_HOOK_FILE"
     grep -qF "pwsh-dcg-helper" "$COPILOT_HOOK_FILE"
@@ -1673,7 +1675,7 @@ EOF
     log_test "Hook content: $(cat "$COPILOT_HOOK_FILE")"
 
     [ "$COPILOT_STATUS" = "merged" ]
-    assert_copilot_first_hook "$DEST/dcg"
+    assert_copilot_first_hook "\"$DEST/dcg\""
     assert_copilot_dcg_hook_count 1
     grep -qF "atuin history start" "$COPILOT_HOOK_FILE"
 }
@@ -1707,7 +1709,7 @@ EOF
     log_test "Hook content: $(cat "$COPILOT_HOOK_FILE")"
 
     [ "$COPILOT_STATUS" = "merged" ]
-    assert_copilot_first_hook "$DEST/dcg"
+    assert_copilot_first_hook "\"$DEST/dcg\""
     assert_copilot_dcg_hook_count 1
     python3 - "$COPILOT_HOOK_FILE" <<'PYEOF'
 import json
@@ -1755,7 +1757,7 @@ EOF
     log_test "Hook content: $(cat "$COPILOT_HOOK_FILE")"
 
     [ "$COPILOT_STATUS" = "merged" ]
-    assert_copilot_first_hook "$DEST/dcg"
+    assert_copilot_first_hook "\"$DEST/dcg\""
     assert_copilot_dcg_hook_count 1
     grep -qF "postToolUse" "$COPILOT_HOOK_FILE"
     grep -qF "atuin history end" "$COPILOT_HOOK_FILE"
@@ -1771,8 +1773,8 @@ EOF
     local before
     before=$(cat "$COPILOT_HOME/hooks/dcg.json")
 
-    configure_copilot
-    local rc=$?
+    local rc=0
+    configure_copilot || rc=$?
 
     log_test "configure_copilot rc: $rc"
     log_test "COPILOT_STATUS: $COPILOT_STATUS"
@@ -1801,8 +1803,8 @@ EOF
     local before
     before=$(cat "$COPILOT_HOME/hooks/dcg.json")
 
-    configure_copilot
-    local rc=$?
+    local rc=0
+    configure_copilot || rc=$?
 
     log_test "configure_copilot rc: $rc"
     log_test "COPILOT_STATUS: $COPILOT_STATUS"
@@ -1845,7 +1847,7 @@ EOF
     log_test "Hook content: $(cat "$COPILOT_HOOK_FILE")"
 
     [ "$COPILOT_STATUS" = "merged" ]
-    python3 - "$COPILOT_HOOK_FILE" "$DEST/dcg" <<'PYEOF'
+    python3 - "$COPILOT_HOOK_FILE" "\"$DEST/dcg\"" <<'PYEOF'
 import json
 import sys
 
@@ -1915,7 +1917,7 @@ EOF
     log_test "Hook content: $(cat "$COPILOT_HOOK_FILE")"
 
     [ "$COPILOT_STATUS" = "merged" ]
-    assert_copilot_first_hook "$DEST/dcg"
+    assert_copilot_first_hook "\"$DEST/dcg\""
     assert_copilot_dcg_hook_count 1
     python3 - "$COPILOT_HOOK_FILE" <<'PYEOF'
 import json
@@ -1935,6 +1937,44 @@ for expected in ("audit-pretool", "atuin history start"):
     if expected not in bashes:
         raise SystemExit(f"non-dcg entry {expected!r} was dropped: {bashes!r}")
 PYEOF
+}
+
+@test "configure_copilot: spaced DEST is quoted, idempotent, and uninstallable" {
+    log_test "Testing Copilot hook with a DEST containing spaces (#253-adjacent)..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_copilot_repo
+
+    # Reinstall the mock dcg under a destination directory containing a space.
+    DEST="$TEST_TMPDIR/spaced bin"
+    mkdir -p "$DEST"
+    cat > "$DEST/dcg" << 'MOCKEOF'
+#!/bin/bash
+echo "dcg 1.0.0"
+MOCKEOF
+    chmod +x "$DEST/dcg"
+
+    configure_copilot
+    log_test "First run status: $COPILOT_STATUS"
+    log_test "Hook content: $(cat "$COPILOT_HOOK_FILE")"
+    [ "$COPILOT_STATUS" = "created" ]
+    assert_copilot_first_hook "\"$DEST/dcg\""
+    assert_copilot_dcg_hook_count 1
+
+    # Re-run: the quoted command must round-trip through the shlex-based
+    # dedupe as the current dcg entry — not get duplicated.
+    configure_copilot
+    log_test "Second run status: $COPILOT_STATUS"
+    log_test "Hook content: $(cat "$COPILOT_HOOK_FILE")"
+    [ "$COPILOT_STATUS" = "already" ]
+    assert_copilot_dcg_hook_count 1
+
+    # Uninstall must recognize the quoted spaced path too; the dcg-dedicated
+    # hook file empties out and is removed entirely.
+    run unconfigure_copilot
+    log_test "unconfigure_copilot status: $status output: $output"
+    [ "$status" -eq 0 ]
+    [ ! -e "$COPILOT_HOME/hooks/dcg.json" ]
 }
 
 # ============================================================================
@@ -2298,8 +2338,8 @@ EOF
   }
 }'
 
-    configure_codex
-    local rc=$?
+    local rc=0
+    configure_codex || rc=$?
 
     log_test "CODEX_STATUS: $CODEX_STATUS"
     log_test "CODEX_FAILURE_REASON: ${CODEX_FAILURE_REASON:-}"
@@ -2376,8 +2416,8 @@ try {
     printf '%s\n' '{"hooks":{"PreToolUse":[' > "$CODEX_SETTINGS"
     save_codex_hooks_snapshot
 
-    configure_codex
-    local rc=$?
+    local rc=0
+    configure_codex || rc=$?
 
     log_test "CODEX_STATUS: $CODEX_STATUS"
     log_test "CODEX_FAILURE_REASON: ${CODEX_FAILURE_REASON:-}"
@@ -2397,8 +2437,8 @@ try {
     setup_mock_codex
     seed_codex_hooks_json '{"hooks":["bad-shape"]}'
 
-    configure_codex
-    local rc=$?
+    local rc=0
+    configure_codex || rc=$?
 
     log_test "CODEX_STATUS: $CODEX_STATUS"
     log_test "CODEX_FAILURE_REASON: ${CODEX_FAILURE_REASON:-}"
@@ -2430,8 +2470,8 @@ try {
   }
 }'
 
-    configure_codex
-    local rc=$?
+    local rc=0
+    configure_codex || rc=$?
 
     log_test "CODEX_STATUS: $CODEX_STATUS"
     log_test "CODEX_FAILURE_REASON: ${CODEX_FAILURE_REASON:-}"
@@ -2471,8 +2511,8 @@ EOF
     local saved_path="$PATH"
     PATH="$(create_no_python_path)"
 
-    configure_codex
-    local rc=$?
+    local rc=0
+    configure_codex || rc=$?
 
     PATH="$saved_path"
 
@@ -3327,6 +3367,33 @@ hooks_auto_accept: true
     # Only documented handler fields; `shell` is not one of them.
     assert_posit_assistant_settings_not_contains '"shell"'
     [ "$AUTO_CONFIGURED" = "1" ]
+}
+
+@test "configure_posit_assistant: treats an existing empty settings.json as create-fresh" {
+    log_test "Testing Posit Assistant empty settings.json handling..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_posit_assistant
+    # An existing 0-byte file (e.g. left behind by a crashed editor or a
+    # `touch`) must configure like a fresh install, not fail as invalid.
+    : > "$POSIT_ASSISTANT_SETTINGS"
+
+    configure_posit_assistant
+
+    log_test "POSIT_ASSISTANT_STATUS: $POSIT_ASSISTANT_STATUS"
+    log_test "settings.json: $(cat "$POSIT_ASSISTANT_SETTINGS" 2>/dev/null || echo 'missing')"
+
+    [ "$POSIT_ASSISTANT_STATUS" = "created" ]
+    assert_posit_assistant_settings_valid_json
+    [ "$(posit_assistant_first_group_first_command)" = "\"$DEST/dcg\"" ]
+
+    # Whitespace-only content is the same case.
+    printf '  \n\t\n' > "$POSIT_ASSISTANT_SETTINGS"
+    configure_posit_assistant
+    log_test "Whitespace-only rerun status: $POSIT_ASSISTANT_STATUS"
+    [ "$POSIT_ASSISTANT_STATUS" = "created" ]
+    assert_posit_assistant_settings_valid_json
+    [ "$(posit_assistant_first_group_first_command)" = "\"$DEST/dcg\"" ]
 }
 
 @test "configure_posit_assistant: detects a bare pa client on PATH" {

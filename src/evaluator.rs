@@ -5499,19 +5499,25 @@ fn posix_word_is_assignment_prefix(raw: &str) -> bool {
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
-/// The leading cluster of a POSIX short-flag word (`-xc` → `xc`), or `None`
-/// when the word merely starts with `-` without being a flag cluster.
+/// The leading alphanumeric run of a POSIX short-flag word (`-xc` → `xc`,
+/// `-c/bin/sh …` → `c`), or `None` when the word merely starts with `-`
+/// without a flag cluster.
 ///
-/// Only the first whitespace-delimited chunk can be the flag; anything after
-/// it is glued payload (`-c'echo hi'` decodes to `-cecho hi`, whose chunk is
-/// still alphanumeric). An operand like the GitHub search query
-/// `-label:need-human sort:created-asc` contains `:`/`-` inside the chunk and
-/// is data, not a flag cluster (issue #256).
+/// Glued payloads start immediately after the flag letters, so only the
+/// leading alphanumeric run is the cluster — a payload beginning with
+/// punctuation (`-c"/bin/sh $(…)"` decodes to `-c/bin/sh $(…)`) must still
+/// yield `c`. An operand like the GitHub search query
+/// `-label:need-human sort:created-asc` yields `label`, which callers reject
+/// because it carries no interpreter flag letter (issue #256).
 fn posix_short_flag_cluster(flag: &str) -> Option<&str> {
     let short = flag.strip_prefix('-')?;
-    let cluster = short.split_ascii_whitespace().next()?;
-    (!cluster.starts_with('-') && cluster.bytes().all(|b| b.is_ascii_alphanumeric()))
-        .then_some(cluster)
+    if short.starts_with('-') {
+        return None;
+    }
+    let end = short
+        .find(|c: char| !c.is_ascii_alphanumeric())
+        .unwrap_or(short.len());
+    (end > 0).then_some(&short[..end])
 }
 
 fn posix_inline_flag_position(name: Option<&str>, words: &[&str]) -> Option<usize> {
@@ -19274,29 +19280,41 @@ fn resolved_variable_values(
         if segment.is_empty() {
             continue;
         }
-        if let Some(raw) = segment
-            .strip_prefix(name)
-            .and_then(|rest| rest.strip_prefix('='))
-        {
-            if values.is_some() {
-                return None;
+        // A binding inside a command or process substitution runs in a
+        // subshell and cannot set `NAME` for this segment — the live value
+        // would come from the ambient environment instead
+        // (`x=$(for f in a b; do :; done); mv "$f" d/` must not be proven by
+        // the inner header). Nested segment ranges are strictly contained in
+        // their extraction parent, so containment identifies them; they are
+        // never binding sources but still run the mutation-hazard check
+        // below, keeping a nested `NAME=` an outright refusal.
+        let nested = segment_range_is_nested(segment_ranges, start, end);
+        if !nested {
+            if let Some(raw) = segment
+                .strip_prefix(name)
+                .and_then(|rest| rest.strip_prefix('='))
+            {
+                if values.is_some() {
+                    return None;
+                }
+                values = Some(vec![literal_assignment_value(raw)?]);
+                continue;
             }
-            values = Some(vec![literal_assignment_value(raw)?]);
-            continue;
-        }
-        if posix_for_loop_binds(segment, name) {
-            // A second binding (assignment or another loop) makes the live
-            // value ambiguous; a header that is not statically enumerable
-            // (globs, substitutions, `"$@"`) makes it unprovable.
-            if values.is_some() {
-                return None;
+            if posix_for_loop_binds(segment, name) {
+                // A second binding (assignment or another loop) makes the
+                // live value ambiguous; a header that is not statically
+                // enumerable (globs, substitutions, `"$@"`) makes it
+                // unprovable.
+                if values.is_some() {
+                    return None;
+                }
+                let (header_name, candidates) = parse_posix_for_loop_header(segment)?;
+                if header_name != name {
+                    return None;
+                }
+                values = Some(candidates);
+                continue;
             }
-            let (header_name, candidates) = parse_posix_for_loop_header(segment)?;
-            if header_name != name {
-                return None;
-            }
-            values = Some(candidates);
-            continue;
         }
         let first = segment.split_ascii_whitespace().next().unwrap_or("");
         let may_mutate_shell_variables = matches!(
@@ -19316,11 +19334,30 @@ fn resolved_variable_values(
                 | "unset"
                 | "printf"
         );
-        if may_mutate_shell_variables || segment.contains(&format!("{name}=")) {
+        if may_mutate_shell_variables || segment_text_may_assign(segment, name) {
             return None;
         }
     }
     values
+}
+
+/// Whether a segment range is nested inside another extracted segment (the
+/// body of a `$( )`, backtick, or `<( )` construct). Top-level segments are
+/// disjoint, so strict containment in any other range identifies nesting.
+fn segment_range_is_nested(segment_ranges: &[(usize, usize)], start: usize, end: usize) -> bool {
+    segment_ranges.iter().any(|&(other_start, other_end)| {
+        other_start <= start && end <= other_end && (other_start != start || other_end != end)
+    })
+}
+
+/// Whether a segment's text could assign or mutate `NAME` in a form the
+/// binding scan does not model: plain `NAME=`, append `NAME+=`, or an array
+/// element `NAME[…]=` (bash makes `$NAME` alias element 0, so `f[0]=/etc`
+/// changes what `$f` expands to).
+fn segment_text_may_assign(segment: &str, name: &str) -> bool {
+    segment.contains(&format!("{name}="))
+        || segment.contains(&format!("{name}+="))
+        || segment.contains(&format!("{name}["))
 }
 
 /// Strip the reserved words that can directly precede a command inside
@@ -19416,7 +19453,12 @@ fn literal_assignment_value(raw: &str) -> Option<String> {
         }
         raw.to_string()
     };
-    (!value.is_empty() && !value.starts_with('~')).then_some(value)
+    // Glob metacharacters survive quoting in the *assignment* but expand when
+    // the variable is later used unquoted (pathname expansion runs after
+    // variable expansion), so `f='/et?'` can resolve to `/etc` at use time —
+    // a literal proof cannot cover that (issue #242 review).
+    (!value.is_empty() && !value.starts_with('~') && !value.contains(['*', '?', '[']))
+        .then_some(value)
 }
 
 /// Would a *direct literal* redirect to this path be allowed today? Only the
@@ -31077,24 +31119,31 @@ mod tests {
     }
 
     #[test]
-    fn posix_short_flag_cluster_requires_alphanumeric_leading_chunk() {
+    fn posix_short_flag_cluster_takes_leading_alphanumeric_run() {
         // Genuine short-flag clusters.
         assert_eq!(posix_short_flag_cluster("-xc"), Some("xc"));
         assert_eq!(posix_short_flag_cluster("-c"), Some("c"));
         assert_eq!(posix_short_flag_cluster("-abc"), Some("abc"));
-        // The decoded form of `-c'echo hi'` is `-cecho hi`; only the first
-        // whitespace-delimited chunk is the flag, the rest is glued payload.
+        // The decoded form of `-c'echo hi'` is `-cecho hi`; the leading
+        // alphanumeric run is the cluster, the rest is glued payload.
         assert_eq!(posix_short_flag_cluster("-cecho hi"), Some("cecho"));
+        // A glued payload may begin with punctuation immediately after the
+        // flag letter (`-c"/bin/sh …"` decodes to `-c/bin/sh …`); the run
+        // must still yield the flag letter (v0.9.0 review regression).
+        assert_eq!(posix_short_flag_cluster("-c/bin/sh x"), Some("c"));
 
-        // Operand data that merely starts with `-` is not a cluster.
-        assert_eq!(posix_short_flag_cluster("-label:x"), None);
+        // Operand data yields its leading run; callers reject clusters that
+        // carry no interpreter flag letter, so `-label:x` stays data.
+        assert_eq!(posix_short_flag_cluster("-label:x"), Some("label"));
         assert_eq!(
             posix_short_flag_cluster("-label:need-human sort:created-asc"),
-            None
+            Some("label")
         );
-        // Long options, bare dash, and non-flag words are not clusters.
+        // Long options, bare dash, punctuation-first, and non-flag words
+        // yield no cluster.
         assert_eq!(posix_short_flag_cluster("--command"), None);
         assert_eq!(posix_short_flag_cluster("-"), None);
+        assert_eq!(posix_short_flag_cluster("-/bin/sh"), None);
         assert_eq!(posix_short_flag_cluster("xc"), None);
     }
 
@@ -31315,6 +31364,109 @@ mod tests {
                      (expected one of {expected_rules:?})"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn nested_substitution_bindings_do_not_prove_outer_variables() {
+        // A binding inside `$( )`, backticks, or `<( )` runs in a subshell;
+        // the outer `$f` resolves from the ambient environment, so the inner
+        // header must never prove it (v0.9.0 review false negative).
+        for command in [
+            "x=$(for f in a b; do echo $f; done); mv $f d/",
+            "x=$(for f in a b; do echo $f; done); mv \"$f\" d/",
+            "x=`for f in a b; do echo $f; done`; mv $f d/",
+            "diff <(for f in a b; do echo $f; done) z; mv $f d/",
+            "x=$(y=$(for f in a b; do echo $f; done)); mv $f d/",
+            "x=$(for f in a b; do echo $f; done); echo hi > \"$f\"",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "subshell binding must not prove the outer variable: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+        // A top-level binding stays provable even when an unrelated subshell
+        // rebinds the same name: the subshell cannot mutate the parent.
+        let result = evaluate_with_pack_ids_in_dialect(
+            "f=a; echo $(for f in x y; do :; done); mv \"$f\" d/",
+            &["core.filesystem"],
+            ShellDialect::Posix,
+        );
+        assert!(
+            result.is_allowed(),
+            "top-level binding survives an unrelated subshell rebinding: {:?}",
+            result.pattern_info
+        );
+    }
+
+    #[test]
+    fn append_array_and_glob_assignments_refuse_the_variable_proof() {
+        // `+=` and array-element assignment mutate `$NAME` without matching
+        // the plain `NAME=` scan, and quoted glob characters expand at
+        // unquoted use time — all three must refuse the literal proof
+        // (v0.9.0 review false negatives).
+        for command in [
+            "f=/et; f+=c; mv $f d/",
+            "f=a; f[0]=/etc; mv $f d/",
+            "f='/et?'; mv $f d/",
+            "f='/et*'; mv $f d/",
+            "for f in 'a?' b; do mv \"$f\" d/; done",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "mutating or glob-bearing binding must refuse the proof: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn mise_exec_cannot_hide_destructive_argv() {
+        // The `--` scan must stop at the first bare word (mise's real
+        // command boundary), and unmodeled option values must not become an
+        // args-data command that masks the rest of the segment
+        // (v0.9.0 review false negatives).
+        let packs = ["core.git", "core.filesystem"];
+        for command in [
+            "mise exec rm -rf / -- ok",
+            "mise exec git reset --hard -- ok",
+            "mise exec node@20 git reset --hard -- .",
+            "mise x git clean -fd -- .",
+            "mise exec -p echo rm -rf /",
+            "mise exec --cd echo git reset --hard",
+            "mise x -p echo rm -rf /",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, &packs, ShellDialect::Posix);
+            assert!(
+                result.is_denied(),
+                "mise wrapper handling must not hide destructive argv: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+        // The unambiguous `--` forms keep working for both stripping and
+        // data-flag masking (#257).
+        for command in [
+            "mise exec -- git status",
+            "mise exec node@20 -- git status",
+            "mise exec -- git commit -m \"prove PostgreSQL restore round trip\"",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, &packs, ShellDialect::Posix);
+            assert!(
+                result.is_allowed(),
+                "benign mise exec form must stay allowed: {command:?}: {:?}",
+                result.pattern_info
+            );
         }
     }
 

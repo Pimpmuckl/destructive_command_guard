@@ -1106,6 +1106,24 @@ PYEOF
     return $?
 }
 
+# Run an unconfigure function and report the outcome. The old call pattern
+# (`unconfigure_x 2>&1 | grep -q removed`) swallowed every human-visible line
+# the function printed — most importantly the `warn` fallback messages on
+# python3-less hosts — so capture the output, replay everything except the
+# machine-readable "removed" marker line, and report success on the marker.
+report_unconfigure() {
+    local label="$1"
+    shift
+    local output=""
+    output=$("$@" 2>&1) || true
+    if [ -n "$output" ]; then
+        printf '%s\n' "$output" | grep -v '^removed$' || true
+    fi
+    if printf '%s\n' "$output" | grep -q "removed"; then
+        ok "Removed $label"
+    fi
+}
+
 remove_state_directories() {
     local config_dir="$1"
     local data_dir="$2"
@@ -1279,40 +1297,17 @@ main() {
 
     log ""
 
-    # Remove Claude Code hook
-    if unconfigure_claude_code 2>&1 | grep -q "removed"; then
-        ok "Removed Claude Code hook"
-    fi
-
-    # Remove Gemini CLI hook
-    if unconfigure_gemini 2>&1 | grep -q "removed"; then
-        ok "Removed Gemini CLI hook"
-    fi
-
-    # Remove GitHub Copilot CLI hook (user-level plus legacy repo-local).
-    if unconfigure_copilot 2>&1 | grep -q "removed"; then
-        ok "Removed GitHub Copilot CLI hook"
-    fi
-
-    # Remove Cursor IDE hook
-    if unconfigure_cursor 2>&1 | grep -q "removed"; then
-        ok "Removed Cursor IDE hook"
-    fi
-
-    # Remove Codex CLI hook
-    if unconfigure_codex 2>&1 | grep -q "removed"; then
-        ok "Removed Codex CLI hook"
-    fi
-
-    # Remove Hermes Agent hook
-    if unconfigure_hermes 2>&1 | grep -q "removed"; then
-        ok "Removed Hermes Agent hook"
-    fi
-
-    # Remove Posit Assistant hook
-    if unconfigure_posit_assistant 2>&1 | grep -q "removed"; then
-        ok "Removed Posit Assistant hook"
-    fi
+    # Remove agent hooks. report_unconfigure replays each function's
+    # human-visible output (the old inline `2>&1 | grep -q` ate it) and
+    # prints the success line when the "removed" marker is present.
+    report_unconfigure "Claude Code hook" unconfigure_claude_code
+    report_unconfigure "Gemini CLI hook" unconfigure_gemini
+    # GitHub Copilot CLI hook (user-level plus legacy repo-local).
+    report_unconfigure "GitHub Copilot CLI hook" unconfigure_copilot
+    report_unconfigure "Cursor IDE hook" unconfigure_cursor
+    report_unconfigure "Codex CLI hook" unconfigure_codex
+    report_unconfigure "Hermes Agent hook" unconfigure_hermes
+    report_unconfigure "Posit Assistant hook" unconfigure_posit_assistant
 
     # Remove Aider config
     if [ "$aider_configured" -eq 1 ] && unconfigure_aider; then

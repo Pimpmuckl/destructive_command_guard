@@ -2700,23 +2700,35 @@ fn evaluate_batch_line(
             error: Some("Not a supported shell tool invocation or missing command".to_string()),
         };
     };
-    let command = extracted_command.command;
-
-    // Evaluate the command
+    // Batched envelopes (VS Code Agent Host `toolCalls`) carry additional
+    // shell commands that must each be evaluated independently; the first
+    // non-allow decision speaks for the whole line (issue #252).
     let project_path = std::env::current_dir().ok();
-    let eval_result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
-        &command,
-        enabled_keywords,
-        ordered_packs,
-        keyword_index,
-        compiled_overrides,
-        allowlists,
-        heredoc_settings,
-        None,
-        project_path.as_deref(), // scope path-aware allowlist entries (#186)
-        None,                    // No deadline for batch mode
-        extracted_command.dialect,
-    );
+    let mut eval_result = None;
+    for (command, dialect) in
+        std::iter::once((extracted_command.command, extracted_command.dialect))
+            .chain(extracted_command.additional_commands)
+    {
+        let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+            &command,
+            enabled_keywords,
+            ordered_packs,
+            keyword_index,
+            compiled_overrides,
+            allowlists,
+            heredoc_settings,
+            None,
+            project_path.as_deref(), // scope path-aware allowlist entries (#186)
+            None,                    // No deadline for batch mode
+            dialect,
+        );
+        let decisive = !matches!(result.decision, EvaluationDecision::Allow);
+        eval_result = Some(result);
+        if decisive {
+            break;
+        }
+    }
+    let eval_result = eval_result.expect("the primary command is always evaluated");
 
     match eval_result.decision {
         EvaluationDecision::Allow => BatchHookOutput {

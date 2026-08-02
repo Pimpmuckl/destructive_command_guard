@@ -15,12 +15,12 @@ trust to well-behaved agents while maintaining strict controls for unknown ones.
 | Codex CLI | Environment | `CODEX_CLI=1` |
 | Gemini CLI | Environment | `GEMINI_CLI=1` |
 | GitHub Copilot CLI | Environment | `COPILOT_CLI=1` or `COPILOT_AGENT_START_TIME_SEC` |
-| VS Code Copilot Chat | Hook payload | `tool_name` is `runTerminalCommand`, `run_in_terminal`, or `runInTerminal` |
+| VS Code Copilot Chat | Hook payload | `tool_name` is `runTerminalCommand`, `run_in_terminal`, or `runInTerminal`; the Agent Host's batched `toolCalls` envelope is also recognized, with every shell entry evaluated independently |
 | Cursor IDE | Environment | `CURSOR_IDE=1` (set by dcg's hook script) |
 | Hermes Agent | Environment | `HERMES_AGENT=1` or `HERMES_SESSION_ID` |
 | Grok (xAI) | Environment | `GROK_SESSION_ID`, `GROK_HOOK_EVENT`, or `GROK_WORKSPACE_ROOT` |
 | Pi | Environment | `PI_CODING_AGENT=true` |
-| Posit Assistant | Environment | `PA_PROJECT_DIR` (set in hook subprocesses; checked last so explicit agent markers win) |
+| Posit Assistant | Environment | `PA_PROJECT_DIR` (set in hook subprocesses; checked last among environment markers so agents with their own markers win — environment detection still precedes parent-process detection) |
 
 ## Detection Priority
 

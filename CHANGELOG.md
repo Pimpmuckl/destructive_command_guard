@@ -13,6 +13,62 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## Unreleased
 
+## [v0.9.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.9.1) -- 2026-08-02 [Release]
+
+### Fixed
+
+Adversarial review of the v0.9.0 changes surfaced and closed eight defects in
+the code that release introduced, plus long-standing installer test-harness
+rot:
+
+- **`mise exec` could hide destructive argv.** The wrapper-strip scan ran to
+  the first `--` anywhere, so `mise exec rm -rf / -- ok` evaluated only `ok`;
+  and an unmodeled option value could become an `echo` args-data command that
+  masked the rest of the segment (`mise exec -p echo rm -rf /`). The scan now
+  stops at the first bare word (mise's real command boundary) and an option
+  ends wrapper handling without enabling masking.
+- **Batched `toolCalls` entries are now evaluated independently.** Joining
+  the batch with newlines let an entry ending in an unterminated quote or
+  trailing backslash swallow the next entry's destructive command. Every
+  entry (including the singular `toolCall` when both fields are present) is
+  evaluated on its own with its own dialect; the first non-allow decision
+  answers the request. The `dcg hook` batch subcommand gained the same
+  per-entry semantics.
+- **Malformed `toolCalls` shapes no longer abort the whole payload parse.**
+  A non-array value or junk entry previously failed `HookInput`
+  deserialization entirely, silently skipping evaluation of an otherwise
+  well-formed `tool_input` command. The field is now tolerantly
+  deserialized; batch entry gating also accepts nameless-with-args,
+  `run_command`, and `CommandLine`-keyed entries, mirroring the singular
+  path.
+- **The Posit Assistant protocol steer is scoped to its own tools.** With
+  `PA_PROJECT_DIR` set, a Gemini payload without an event name and the bare
+  `run_shell_command` Copilot fallback were answered in Claude shape; the
+  gate now also requires a `bash`/`powershell`-family tool name.
+- **Subshell bindings no longer prove outer variables.** A `for` header (or
+  assignment) inside `$( )`, backticks, or `<( )` could satisfy the #242
+  constant-propagation proof for an outer `$VAR` whose real value comes from
+  the ambient environment (`x=$(for f in a b; …); mv $f d/`). Nested
+  segments are no longer binding sources.
+- **`+=`, array-element, and glob-bearing assignments refuse the variable
+  proof.** `f+=c`, `f[0]=/etc`, and quoted glob values (`f='/et?'`, which
+  expands at unquoted use time) all slipped past the literal-binding scan.
+- **Glued `-c` payloads starting with punctuation are detected again.** The
+  #256 cluster narrowing required a fully alphanumeric chunk, so
+  `-c"/bin/sh …"` (decoding to `-c/bin/sh …`) was no longer treated as an
+  inline-code flag; the leading alphanumeric run is now the cluster.
+- **Installer test harness can fail again.** The bats function-extraction
+  helpers left `set +e` active in the test shell, so every assertion in the
+  install/uninstall suites was inert; the helpers now restore errexit, tests
+  no longer call the GitHub API per test, and the newly live assertions
+  exposed and fixed a BSD-sed incompatibility in the installer's
+  "already configured" detection, an unquoted Copilot hook path (spaced
+  install dirs were non-idempotent and un-uninstallable), a hang when a pty
+  has no operator (prompts now time out to their default), an
+  empty-settings-file failure in the Posit configure path, swallowed
+  uninstaller warnings, and a PowerShell uninstaller dropping user-authored
+  empty matcher groups.
+
 ## [v0.9.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.9.0) -- 2026-08-02 [Release]
 
 ### Added
@@ -46,8 +102,10 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   `dcg explain` / `dcg test` aborted (`byte index is not a char boundary`)
   when a PowerShell backtick — and, by the same defect, a cmd.exe caret or
   POSIX backslash — was immediately followed by a non-ASCII character, e.g.
-  `s`中`. Every escape scanner now advances by the escaped character's real
-  UTF-8 width via one shared boundary-safe helper (21 call sites).
+  `s`中`. Every escape scanner that slices string content now advances by
+  the escaped character's real UTF-8 width via one shared boundary-safe
+  helper (21 call sites; byte-comparison-only scanners keep their fixed
+  advance, which cannot panic).
 - **Wrapper prefixes no longer defeat data-flag masking (#257).**
   `mise exec -- git commit -m "… restore …"`, and the same command under
   `nice`, `time`, `nohup`, `stdbuf`, `timeout`, `ionice`, `setsid`, or

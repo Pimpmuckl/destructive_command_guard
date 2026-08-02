@@ -78,3 +78,14 @@ fn glued_short_flag_cluster_is_still_detected() {
     // an alphanumeric cluster containing `c`, so the payload is evaluated.
     denied("sh -c'echo hi; rm -rf /'");
 }
+
+#[test]
+fn glued_cluster_with_punctuation_leading_payload_is_still_detected() {
+    // A glued payload may begin with punctuation right after the flag letter
+    // (`-c"/bin/sh …"` decodes to `-c/bin/sh …`). The v0.9.0 narrowing to
+    // whole-chunk-alphanumeric clusters missed it, letting a dynamic
+    // executable with an inline-code flag through unverified (review
+    // regression). The leading alphanumeric run (`c`) must be the cluster.
+    denied("\"$(python3 /tmp/x.py)\" foo -c\"/bin/sh x\"");
+    denied("sh -c\"/bin/sh x; rm -rf /\"");
+}

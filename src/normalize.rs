@@ -1259,10 +1259,17 @@ fn busybox_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> Op
     (!applet.starts_with('-')).then_some(1)
 }
 
-/// `mise exec [TOOL@VERSION]... -- <command>...` (and the `mise x` alias)
-/// runs its trailing argv as a command. Only the explicit `--` form is
-/// stripped: without it, mise's tool-spec/command boundary is ambiguous
-/// (issue #257).
+/// `mise exec [TOOL@VERSION]... [--] <command>...` (and the `mise x` alias)
+/// runs its trailing argv as a command (issue #257).
+///
+/// In mise's grammar the wrapped command starts at the first bare word (no
+/// `@`, not `-`-leading) or after an explicit `--`; a *later* `--` belongs
+/// to the wrapped command's own argv (e.g. a git pathspec separator), so the
+/// scan must never run past a bare word (v0.9.0 review: scanning to the
+/// first `--` anywhere stripped `mise exec rm -rf / -- ok` down to `ok`).
+/// Options with modeled arity (`-C/--cd`, `-E/--env`, `-j/--jobs`) skip
+/// their value; an unknown `-`-leading option bails rather than guessing
+/// whether the following word is its value or the command.
 fn mise_exec_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> Option<usize> {
     let subcommand = wrapper_word(command, tokens, 1)?;
     if subcommand != "exec" && subcommand != "x" {
@@ -1273,7 +1280,41 @@ fn mise_exec_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> 
         if word == "--" {
             return (index + 1 < tokens.len()).then_some(index + 1);
         }
-        index += 1;
+        if wrapper_terminal_option(&word) {
+            return None;
+        }
+        if matches!(
+            word.as_str(),
+            "-C" | "--cd" | "-E" | "--env" | "-j" | "--jobs"
+        ) {
+            wrapper_word(command, tokens, index + 1)?;
+            index += 2;
+            continue;
+        }
+        if word.starts_with('-') {
+            if word
+                .strip_prefix("--")
+                .is_some_and(|rest| rest.contains('='))
+                || matches!(
+                    word.as_str(),
+                    "--raw" | "-v" | "--verbose" | "-q" | "--quiet"
+                )
+            {
+                // Glued `--opt=value` forms and known flags consume nothing.
+                index += 1;
+                continue;
+            }
+            // Unknown option: its arity is unmodeled, so the next word could
+            // be either its value or the command. Bail rather than guess.
+            return None;
+        }
+        if word.contains('@') {
+            // TOOL@VERSION spec.
+            index += 1;
+            continue;
+        }
+        // First bare word: the wrapped command starts here.
+        return (index < tokens.len()).then_some(index);
     }
     None
 }
@@ -4861,14 +4902,45 @@ mod tests {
     }
 
     #[test]
-    fn mise_without_explicit_dashdash_is_not_stripped() {
+    fn mise_exec_strips_at_the_first_bare_word_and_bails_on_unknown_options() {
         // Without `--`, mise's tool-spec/command boundary is ambiguous, so
         // the wrapper is left in place.
-        assert_eq!(strip_posix_execution_frontend("mise exec git status"), None);
+        // The wrapped command starts at the first bare word — mise's real
+        // grammar — so a later `--` is the command's own argv (v0.9.0
+        // review false negative: scanning to the first `--` anywhere
+        // stripped `mise exec rm -rf / -- ok` down to `ok`).
+        assert_eq!(
+            strip_posix_execution_frontend("mise exec git status"),
+            Some(("git status", "mise-exec"))
+        );
+        assert_eq!(
+            strip_posix_execution_frontend("mise exec rm -rf / -- ok"),
+            Some(("rm -rf / -- ok", "mise-exec"))
+        );
+        assert_eq!(
+            strip_posix_execution_frontend("mise exec node@20 git reset --hard -- ."),
+            Some(("git reset --hard -- .", "mise-exec"))
+        );
+        // Modeled option arity: `-C/--cd`, `-E/--env`, `-j/--jobs` consume
+        // their value, so the value cannot be mistaken for the command.
+        assert_eq!(
+            strip_posix_execution_frontend("mise exec --cd /tmp git status"),
+            Some(("git status", "mise-exec"))
+        );
+        // Unknown options bail: the next word could be their value.
+        assert_eq!(
+            strip_posix_execution_frontend("mise exec -p echo rm -rf /"),
+            None
+        );
         // Non-exec subcommands never wrap a command.
         assert_eq!(strip_posix_execution_frontend("mise install node"), None);
         // `--` with nothing after it wraps no command at all.
         assert_eq!(strip_posix_execution_frontend("mise exec --"), None);
+        // Terminal options print and exit; nothing is wrapped.
+        assert_eq!(
+            strip_posix_execution_frontend("mise exec --help -- foo"),
+            None
+        );
     }
 
     #[test]

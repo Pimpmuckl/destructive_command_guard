@@ -23,7 +23,7 @@ use destructive_command_guard::agent::{Agent, detect_agent};
 use destructive_command_guard::allowlist::LayeredAllowlist;
 use destructive_command_guard::cli::{self, Cli};
 // Exit codes are used by cli.rs for robot mode; main.rs uses them for hook mode errors
-use destructive_command_guard::config::Config;
+use destructive_command_guard::config::{CompiledOverrides, Config, HeredocSettings};
 #[cfg(test)]
 use destructive_command_guard::evaluator::evaluate_command_with_pack_order_deadline_at_path;
 use destructive_command_guard::evaluator::{
@@ -36,12 +36,13 @@ use destructive_command_guard::history::{
 };
 use destructive_command_guard::hook;
 use destructive_command_guard::load_default_allowlists;
+use destructive_command_guard::normalize::ShellDialect;
 #[cfg(test)]
 use destructive_command_guard::normalize::normalize_command;
 use destructive_command_guard::packs::load_external_packs;
 #[cfg(test)]
 use destructive_command_guard::packs::pack_aware_quick_reject;
-use destructive_command_guard::packs::{DecisionMode, REGISTRY};
+use destructive_command_guard::packs::{DecisionMode, EnabledKeywordIndex, REGISTRY};
 use destructive_command_guard::pending_exceptions::{PendingExceptionStore, log_maintenance};
 use destructive_command_guard::perf::{Deadline, HOOK_EVALUATION_BUDGET};
 // Import HookInput for parsing stdin JSON in hook mode
@@ -51,7 +52,7 @@ use destructive_command_guard::hook::HookInput;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::io::{self, IsTerminal};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 // Build metadata from vergen (set by build.rs)
@@ -472,6 +473,348 @@ fn load_effective_allowlists_for_agent(config: &Config, agent: &Agent) -> Layere
     apply_agent_allowlist_profile(config, agent, load_default_allowlists())
 }
 
+/// Outcome of one end-to-end hook-command evaluation.
+enum HookCommandOutcome {
+    /// The command may run and nothing was published to the hook client, so a
+    /// following batch entry can still be evaluated. Covers plain allows,
+    /// allowlist overrides, rebase-recovery conversions, and `Log`-mode
+    /// matches — all of which leave stdout untouched.
+    Allowed,
+    /// A protocol response (deny / ask / warn / indeterminate) was published.
+    /// Hook protocols are one-JSON-document streams, so the request must end
+    /// here: emitting a second decision document would corrupt the stream.
+    Responded,
+}
+
+/// Shared per-request state for evaluating hook commands.
+///
+/// The VS Code Agent Host batches several shell commands into one hook
+/// request (issue #252). Each entry is evaluated independently against this
+/// shared context — same config, allowlists, packs, and wall-clock
+/// [`Deadline`] — so a batch cannot buy itself extra evaluation budget.
+struct HookEvalContext<'a> {
+    config: &'a Config,
+    enabled_keywords: &'a [&'static str],
+    ordered_packs: &'a [String],
+    keyword_index: Option<&'a EnabledKeywordIndex>,
+    compiled_overrides: &'a CompiledOverrides,
+    allowlists: &'a LayeredAllowlist,
+    heredoc_settings: &'a HeredocSettings,
+    cwd_path: Option<&'a Path>,
+    working_dir: &'a str,
+    deadline: &'a Deadline,
+    hook_protocol: hook::HookProtocol,
+    history_agent_type: &'a str,
+    max_command_bytes: usize,
+}
+
+/// Evaluate one hook command end-to-end and publish the protocol response for
+/// any non-allow outcome.
+///
+/// This is the single evaluate-and-respond path for both the primary command
+/// and every additional `toolCalls[]` batch entry, so batch entries get
+/// byte-identical deny/ask/warn/indeterminate handling (the response mentions
+/// THAT command). `log_allow_history` is true only for the primary command:
+/// an all-allow request records exactly one history Allow row (for the
+/// primary), matching the pre-batch behavior, while decisive rows —
+/// deny/ask/warn/log outcomes, rebase-recovery conversions, and indeterminate
+/// deadline exits — are always recorded for the command that produced them.
+#[allow(clippy::too_many_lines)]
+fn evaluate_hook_command(
+    ctx: &HookEvalContext<'_>,
+    command: &str,
+    shell_dialect: ShellDialect,
+    history_writer: &mut Option<HistoryWriter>,
+    log_allow_history: bool,
+) -> HookCommandOutcome {
+    // Refuse oversized commands conservatively. The limit bounds every later
+    // parser and scanner, so truncating or treating the command as clean would
+    // let an attacker hide a destructive tail beyond the inspected prefix.
+    if command.len() > ctx.max_command_bytes {
+        let reason = format!(
+            "Command is {} bytes and exceeds limit {} bytes; DCG did not evaluate it. \
+             Reduce the command size or raise general.max_command_bytes after review.",
+            command.len(),
+            ctx.max_command_bytes
+        );
+        hook::output_indeterminate_for_protocol(ctx.hook_protocol, &reason);
+        return HookCommandOutcome::Responded;
+    }
+
+    if ctx.deadline.is_exceeded() {
+        handle_indeterminate_evaluation(
+            ctx.hook_protocol,
+            history_writer.as_mut(),
+            ctx.history_agent_type,
+            command,
+            ctx.working_dir,
+            "pre_evaluation",
+            ctx.deadline,
+        );
+        return HookCommandOutcome::Responded;
+    }
+
+    // Use the shared evaluator for hook mode parity with `dcg test`.
+    let eval_start = Instant::now();
+    let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+        command,
+        ctx.enabled_keywords,
+        ctx.ordered_packs,
+        ctx.keyword_index,
+        ctx.compiled_overrides,
+        ctx.allowlists,
+        ctx.heredoc_settings,
+        None,         // allow_once_audit
+        ctx.cwd_path, // project_path: scopes path-aware allowlist entries (#186)
+        Some(ctx.deadline),
+        shell_dialect,
+    );
+
+    // NOTE: External packs from custom_paths are now checked in evaluate_command()
+    // alongside built-in packs, so no separate fallback check is needed here.
+
+    let eval_duration = eval_start.elapsed();
+
+    if result.decision == EvaluationDecision::Indeterminate || result.skipped_due_to_budget {
+        handle_indeterminate_evaluation(
+            ctx.hook_protocol,
+            history_writer.as_mut(),
+            ctx.history_agent_type,
+            command,
+            ctx.working_dir,
+            "evaluation",
+            ctx.deadline,
+        );
+        return HookCommandOutcome::Responded;
+    }
+
+    if result.decision != EvaluationDecision::Deny {
+        if log_allow_history {
+            if let Some(writer) = history_writer.as_ref() {
+                let mut pack_id = None;
+                let mut pattern_name = None;
+                let mut allowlist_layer = None;
+
+                if let Some(override_) = result.allowlist_override.as_ref() {
+                    allowlist_layer = Some(override_.layer.label());
+                    pack_id = override_.matched.pack_id.as_deref();
+                    pattern_name = override_.matched.pattern_name.as_deref();
+                }
+
+                let entry = build_history_entry(
+                    ctx.history_agent_type,
+                    command,
+                    ctx.working_dir,
+                    HistoryOutcome::Allow,
+                    eval_duration,
+                    pack_id,
+                    pattern_name,
+                    allowlist_layer,
+                );
+                writer.log(entry);
+            }
+        }
+        return HookCommandOutcome::Allowed;
+    }
+
+    let Some(ref info) = result.pattern_info else {
+        // Fail open: structurally unexpected, but hook safety wins.
+        if log_allow_history {
+            if let Some(writer) = history_writer.as_ref() {
+                let entry = build_history_entry(
+                    ctx.history_agent_type,
+                    command,
+                    ctx.working_dir,
+                    HistoryOutcome::Allow,
+                    eval_duration,
+                    None,
+                    None,
+                    None,
+                );
+                writer.log(entry);
+            }
+        }
+        return HookCommandOutcome::Allowed;
+    };
+
+    let pack = info.pack_id.as_deref();
+    let mode =
+        destructive_command_guard::evaluator::resolve_effective_mode(ctx.config, command, &result)
+            .unwrap_or(DecisionMode::Deny);
+
+    let pattern = info.pattern_name.as_deref();
+    let explanation = info.explanation.as_deref();
+
+    // Rebase-recovery unblock (issue #104), applied per command.
+    //
+    // Before emitting a hard deny, check whether this is one of the narrow
+    // "recovery" patterns (`checkout-discard`, `restore-worktree`, etc.)
+    // AND a recovery signal is active: either a rebase is in progress
+    // (`.git/rebase-merge/` or `.git/rebase-apply/`) or a short-lived
+    // `dcg rebase-recover` permit was issued. If yes, convert the deny
+    // into an allow with a stderr note and (for the permit case) consume
+    // the cookie so subsequent unrelated commands stay blocked.
+    //
+    // Safety: only fires when BOTH (a) the matched pattern is on the
+    // small recovery allowlist, AND (b) a recovery signal is active.
+    // Outside this narrow window the original deny path is unchanged. The
+    // conversion leaves stdout untouched, so later batch entries are still
+    // evaluated.
+    if matches!(mode, DecisionMode::Deny) {
+        if let Some(cwd_ref) = ctx.cwd_path {
+            if let Some(reason) = destructive_command_guard::rebase_recovery::should_allow_recovery(
+                cwd_ref, pack, pattern,
+            ) {
+                // Consume the permit if that's why we allowed (single-shot).
+                if matches!(
+                    reason,
+                    destructive_command_guard::rebase_recovery::RecoveryReason::ActivePermit(_)
+                ) {
+                    destructive_command_guard::rebase_recovery::consume_permit(cwd_ref);
+                }
+                // Inform on stderr (visible to the agent and to humans).
+                // Stays silent when stderr isn't a TTY and robot mode is on,
+                // but the message itself is always safe to emit.
+                eprintln!(
+                    "[dcg] Allowing `{}` → rebase-recovery mode ({})",
+                    pattern.unwrap_or("<unknown>"),
+                    reason.label()
+                );
+                if let Some(writer) = history_writer.as_ref() {
+                    let entry = build_history_entry(
+                        ctx.history_agent_type,
+                        command,
+                        ctx.working_dir,
+                        HistoryOutcome::Allow,
+                        eval_duration,
+                        pack,
+                        pattern,
+                        Some("rebase-recovery"),
+                    );
+                    writer.log(entry);
+                }
+                return HookCommandOutcome::Allowed;
+            }
+        }
+    }
+
+    if let Some(writer) = history_writer.as_ref() {
+        let outcome = match mode {
+            DecisionMode::Deny | DecisionMode::Ask => HistoryOutcome::Deny,
+            DecisionMode::Warn => HistoryOutcome::Warn,
+            DecisionMode::Log => HistoryOutcome::Allow,
+        };
+        let entry = build_history_entry(
+            ctx.history_agent_type,
+            command,
+            ctx.working_dir,
+            outcome,
+            eval_duration,
+            pack,
+            pattern,
+            None,
+        );
+        writer.log(entry);
+    }
+
+    match mode {
+        DecisionMode::Deny | DecisionMode::Ask => {
+            let store_path = PendingExceptionStore::default_path(ctx.cwd_path);
+            let store = PendingExceptionStore::new(store_path);
+            let reason = match (pack, pattern) {
+                (Some(pack_id), Some(pattern_name)) => {
+                    format!("{pack_id}:{pattern_name} - {}", info.reason)
+                }
+                _ => info.reason.clone(),
+            };
+
+            let mut allow_once_info: Option<hook::AllowOnceInfo> = None;
+            if let Ok((record, maintenance)) = store.record_block(
+                command,
+                ctx.working_dir,
+                &reason,
+                &ctx.config.logging.redaction,
+                false,
+                Some(format!("{:?}", info.source)),
+                None,
+            ) {
+                allow_once_info = Some(hook::AllowOnceInfo {
+                    code: record.short_code,
+                    full_hash: record.full_hash,
+                });
+                if let Some(log_file) = ctx.config.general.log_file.as_deref() {
+                    let _ = log_maintenance(log_file, maintenance, "record_block");
+                }
+            }
+
+            let branch_ctx = if ctx.config.git_awareness.should_show_branch_in_output() {
+                result.branch_context.as_ref()
+            } else {
+                None
+            };
+            if mode == DecisionMode::Ask {
+                hook::output_review_request_for_protocol(
+                    ctx.hook_protocol,
+                    command,
+                    &info.reason,
+                    pack,
+                    pattern,
+                    explanation,
+                    allow_once_info.as_ref(),
+                    info.matched_span.as_ref(),
+                    info.severity,
+                    None, // confidence not yet available in PatternMatch
+                    info.suggestions,
+                    branch_ctx,
+                );
+            } else {
+                hook::output_denial_for_protocol(
+                    ctx.hook_protocol,
+                    command,
+                    &info.reason,
+                    pack,
+                    pattern,
+                    explanation,
+                    allow_once_info.as_ref(),
+                    info.matched_span.as_ref(),
+                    info.severity,
+                    None, // confidence not yet available in PatternMatch
+                    info.suggestions,
+                    branch_ctx,
+                );
+            }
+
+            // Log if configured
+            if let Some(log_file) = &ctx.config.general.log_file {
+                let _ = hook::log_blocked_command(log_file, command, &info.reason, pack);
+            }
+
+            // Review-capable clients receive ask; all others receive their
+            // ordinary blocking response. Returning normally lets
+            // `HistoryWriter::Drop` flush the buffered audit entry.
+            HookCommandOutcome::Responded
+        }
+        DecisionMode::Warn => {
+            hook::output_warning_for_protocol(
+                ctx.hook_protocol,
+                command,
+                &info.reason,
+                pack,
+                pattern,
+                explanation,
+            );
+            HookCommandOutcome::Responded
+        }
+        DecisionMode::Log => {
+            // Silent allow; optionally log to file for history.
+            if let Some(log_file) = &ctx.config.general.log_file {
+                let _ = hook::log_blocked_command(log_file, command, &info.reason, pack);
+            }
+            HookCommandOutcome::Allowed
+        }
+    }
+}
+
 // NOTE: Denial output functions (format_denial_message, print_colorful_warning, deny)
 // are now in the hook module. Use hook::output_denial() for all denial responses.
 
@@ -664,26 +1007,15 @@ fn main() {
     let Some(extracted_command) = hook::extract_command_with_context(&hook_input) else {
         return;
     };
-    let command = extracted_command.command;
-    let hook_protocol = extracted_command.protocol;
-    let shell_dialect = extracted_command.dialect;
+    let hook::ExtractedHookCommand {
+        command,
+        protocol: hook_protocol,
+        dialect: shell_dialect,
+        additional_commands,
+    } = extracted_command;
     let history_agent_type = history_agent_type_for_protocol(hook_protocol, &detected_agent);
     let effective_agent = effective_agent_for_hook_protocol(hook_protocol, &detected_agent);
-
-    // Refuse oversized commands conservatively. The limit bounds every later
-    // parser and scanner, so truncating or treating the command as clean would
-    // let an attacker hide a destructive tail beyond the inspected prefix.
     let max_command_bytes = config.general.max_command_bytes();
-    if command.len() > max_command_bytes {
-        let reason = format!(
-            "Command is {} bytes and exceeds limit {} bytes; DCG did not evaluate it. \
-             Reduce the command size or raise general.max_command_bytes after review.",
-            command.len(),
-            max_command_bytes
-        );
-        hook::output_indeterminate_for_protocol(hook_protocol, &reason);
-        return;
-    }
 
     // Load layered allowlists (project/user/system). Missing/invalid files are treated
     // as empty for hook safety; allowlist decisions are only consulted on matches.
@@ -743,267 +1075,57 @@ fn main() {
         }
     }
 
-    if deadline.is_exceeded() {
-        handle_indeterminate_evaluation(
-            hook_protocol,
-            history_writer.as_mut(),
-            history_agent_type,
-            &command,
-            &working_dir,
-            "pre_evaluation",
-            &deadline,
-        );
-        return;
-    }
-
-    // Use the shared evaluator for hook mode parity with `dcg test`.
-    let eval_start = Instant::now();
-    let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
-        &command,
-        &enabled_keywords,
-        &ordered_packs,
-        keyword_index.as_ref(),
-        &compiled_overrides,
-        &allowlists,
-        &heredoc_settings,
-        None,                // allow_once_audit
-        cwd_path.as_deref(), // project_path: scopes path-aware allowlist entries (#186)
-        Some(&deadline),
-        shell_dialect,
-    );
-
-    // NOTE: External packs from custom_paths are now checked in evaluate_command()
-    // alongside built-in packs, so no separate fallback check is needed here.
-
-    let eval_duration = eval_start.elapsed();
-
-    if result.decision == EvaluationDecision::Indeterminate || result.skipped_due_to_budget {
-        handle_indeterminate_evaluation(
-            hook_protocol,
-            history_writer.as_mut(),
-            history_agent_type,
-            &command,
-            &working_dir,
-            "evaluation",
-            &deadline,
-        );
-        return;
-    }
-
-    if result.decision != EvaluationDecision::Deny {
-        if let Some(writer) = history_writer.as_ref() {
-            let mut pack_id = None;
-            let mut pattern_name = None;
-            let mut allowlist_layer = None;
-
-            if let Some(override_) = result.allowlist_override.as_ref() {
-                allowlist_layer = Some(override_.layer.label());
-                pack_id = override_.matched.pack_id.as_deref();
-                pattern_name = override_.matched.pattern_name.as_deref();
-            }
-
-            let entry = build_history_entry(
-                history_agent_type,
-                &command,
-                &working_dir,
-                HistoryOutcome::Allow,
-                eval_duration,
-                pack_id,
-                pattern_name,
-                allowlist_layer,
-            );
-            writer.log(entry);
-        }
-        return;
-    }
-
-    let Some(ref info) = result.pattern_info else {
-        // Fail open: structurally unexpected, but hook safety wins.
-        if let Some(writer) = history_writer.as_ref() {
-            let entry = build_history_entry(
-                history_agent_type,
-                &command,
-                &working_dir,
-                HistoryOutcome::Allow,
-                eval_duration,
-                None,
-                None,
-                None,
-            );
-            writer.log(entry);
-        }
-        return;
+    let eval_context = HookEvalContext {
+        config: &config,
+        enabled_keywords: &enabled_keywords,
+        ordered_packs: &ordered_packs,
+        keyword_index: keyword_index.as_ref(),
+        compiled_overrides: &compiled_overrides,
+        allowlists: &allowlists,
+        heredoc_settings: &heredoc_settings,
+        cwd_path: cwd_path.as_deref(),
+        working_dir: &working_dir,
+        deadline: &deadline,
+        hook_protocol,
+        history_agent_type,
+        max_command_bytes,
     };
 
-    let pack = info.pack_id.as_deref();
-    let mode =
-        destructive_command_guard::evaluator::resolve_effective_mode(&config, &command, &result)
-            .unwrap_or(DecisionMode::Deny);
-
-    let pattern = info.pattern_name.as_deref();
-    let explanation = info.explanation.as_deref();
-
-    // Rebase-recovery unblock (issue #104).
-    //
-    // Before emitting a hard deny, check whether this is one of the narrow
-    // "recovery" patterns (`checkout-discard`, `restore-worktree`, etc.)
-    // AND a recovery signal is active: either a rebase is in progress
-    // (`.git/rebase-merge/` or `.git/rebase-apply/`) or a short-lived
-    // `dcg rebase-recover` permit was issued. If yes, convert the deny
-    // into an allow with a stderr note and (for the permit case) consume
-    // the cookie so subsequent unrelated commands stay blocked.
-    //
-    // Safety: only fires when BOTH (a) the matched pattern is on the
-    // small recovery allowlist, AND (b) a recovery signal is active.
-    // Outside this narrow window the original deny path is unchanged.
-    if matches!(mode, DecisionMode::Deny) {
-        if let Some(cwd_ref) = cwd_path.as_deref() {
-            if let Some(reason) = destructive_command_guard::rebase_recovery::should_allow_recovery(
-                cwd_ref, pack, pattern,
-            ) {
-                // Consume the permit if that's why we allowed (single-shot).
-                if matches!(
-                    reason,
-                    destructive_command_guard::rebase_recovery::RecoveryReason::ActivePermit(_)
-                ) {
-                    destructive_command_guard::rebase_recovery::consume_permit(cwd_ref);
-                }
-                // Inform on stderr (visible to the agent and to humans).
-                // Stays silent when stderr isn't a TTY and robot mode is on,
-                // but the message itself is always safe to emit.
-                eprintln!(
-                    "[dcg] Allowing `{}` → rebase-recovery mode ({})",
-                    pattern.unwrap_or("<unknown>"),
-                    reason.label()
-                );
-                if let Some(writer) = history_writer.as_ref() {
-                    let entry = build_history_entry(
-                        history_agent_type,
-                        &command,
-                        &working_dir,
-                        HistoryOutcome::Allow,
-                        eval_duration,
-                        pack,
-                        pattern,
-                        Some("rebase-recovery"),
-                    );
-                    writer.log(entry);
-                }
-                return;
-            }
-        }
-    }
-
-    if let Some(writer) = history_writer.as_ref() {
-        let outcome = match mode {
-            DecisionMode::Deny | DecisionMode::Ask => HistoryOutcome::Deny,
-            DecisionMode::Warn => HistoryOutcome::Warn,
-            DecisionMode::Log => HistoryOutcome::Allow,
-        };
-        let entry = build_history_entry(
-            history_agent_type,
+    // Evaluate the primary command; any published response (deny / ask /
+    // warn / indeterminate) ends the hook request.
+    if matches!(
+        evaluate_hook_command(
+            &eval_context,
             &command,
-            &working_dir,
-            outcome,
-            eval_duration,
-            pack,
-            pattern,
-            None,
-        );
-        writer.log(entry);
+            shell_dialect,
+            &mut history_writer,
+            true,
+        ),
+        HookCommandOutcome::Responded
+    ) {
+        return;
     }
 
-    match mode {
-        DecisionMode::Deny | DecisionMode::Ask => {
-            let store_path = PendingExceptionStore::default_path(cwd_path.as_deref());
-            let store = PendingExceptionStore::new(store_path);
-            let reason = match (pack, pattern) {
-                (Some(pack_id), Some(pattern_name)) => {
-                    format!("{pack_id}:{pattern_name} - {}", info.reason)
-                }
-                _ => info.reason.clone(),
-            };
-
-            let mut allow_once_info: Option<hook::AllowOnceInfo> = None;
-            if let Ok((record, maintenance)) = store.record_block(
-                &command,
-                &working_dir,
-                &reason,
-                &config.logging.redaction,
+    // VS Code Agent Host batches (issue #252): every remaining batch entry is
+    // evaluated independently, each with its own dialect, against the same
+    // shared wall-clock deadline (`evaluate_hook_command` re-checks remaining
+    // budget before evaluating). Joining the entries into one string let an
+    // entry ending in an unterminated quote or trailing backslash swallow —
+    // and thereby mask — the next entry's destructive command, so instead the
+    // first non-allow entry publishes exactly the protocol response the
+    // primary would have, naming that entry's command.
+    for (batch_command, batch_dialect) in &additional_commands {
+        if matches!(
+            evaluate_hook_command(
+                &eval_context,
+                batch_command,
+                *batch_dialect,
+                &mut history_writer,
                 false,
-                Some(format!("{:?}", info.source)),
-                None,
-            ) {
-                allow_once_info = Some(hook::AllowOnceInfo {
-                    code: record.short_code,
-                    full_hash: record.full_hash,
-                });
-                if let Some(log_file) = config.general.log_file.as_deref() {
-                    let _ = log_maintenance(log_file, maintenance, "record_block");
-                }
-            }
-
-            let branch_ctx = if config.git_awareness.should_show_branch_in_output() {
-                result.branch_context.as_ref()
-            } else {
-                None
-            };
-            if mode == DecisionMode::Ask {
-                hook::output_review_request_for_protocol(
-                    hook_protocol,
-                    &command,
-                    &info.reason,
-                    pack,
-                    pattern,
-                    explanation,
-                    allow_once_info.as_ref(),
-                    info.matched_span.as_ref(),
-                    info.severity,
-                    None, // confidence not yet available in PatternMatch
-                    info.suggestions,
-                    branch_ctx,
-                );
-            } else {
-                hook::output_denial_for_protocol(
-                    hook_protocol,
-                    &command,
-                    &info.reason,
-                    pack,
-                    pattern,
-                    explanation,
-                    allow_once_info.as_ref(),
-                    info.matched_span.as_ref(),
-                    info.severity,
-                    None, // confidence not yet available in PatternMatch
-                    info.suggestions,
-                    branch_ctx,
-                );
-            }
-
-            // Log if configured
-            if let Some(log_file) = &config.general.log_file {
-                let _ = hook::log_blocked_command(log_file, &command, &info.reason, pack);
-            }
-
-            // Review-capable clients receive ask; all others receive their
-            // ordinary blocking response. Returning normally lets
-            // `HistoryWriter::Drop` flush the buffered audit entry.
-        }
-        DecisionMode::Warn => {
-            hook::output_warning_for_protocol(
-                hook_protocol,
-                &command,
-                &info.reason,
-                pack,
-                pattern,
-                explanation,
-            );
-        }
-        DecisionMode::Log => {
-            // Silent allow; optionally log to file for history.
-            if let Some(log_file) = &config.general.log_file {
-                let _ = hook::log_blocked_command(log_file, &command, &info.reason, pack);
-            }
+            ),
+            HookCommandOutcome::Responded
+        ) {
+            return;
         }
     }
 }

@@ -354,6 +354,10 @@ fn try_parse_hook_json(line: &str, max_command_bytes: Option<usize>) -> Option<P
             error: command_error_for_hook_input(&hook_input),
         });
     };
+    // Simulation replays one command per log line; a batched `toolCalls`
+    // envelope contributes only its primary command to the statistics. The
+    // live hook path evaluates every batch entry (issue #252) — this is a
+    // deliberate stats-only simplification, not an enforcement gap.
     let command = extracted_command.command;
 
     // Check command length limit

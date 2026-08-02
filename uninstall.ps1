@@ -232,19 +232,26 @@ function Remove-DcgHooksFromJsonFile {
       return $false
     }
 
+    $entryRemoved = $false
     $filtered = @()
     foreach ($hook in (Get-JsonArray $inner)) {
       if (Test-DcgHookCommand $hook) {
         $removed = $true
+        $entryRemoved = $true
       } else {
         $filtered += $hook
       }
     }
 
-    if ($filtered.Count -gt 0) {
+    if ($entryRemoved) {
+      # Drop the group only when removing dcg's hooks EMPTIED it. A matcher
+      # group the user wrote with an originally-empty "hooks": [] — or one
+      # that keeps non-dcg hooks — survives untouched (matches uninstall.sh:
+      # bash prunes only `inner and not filtered` groups).
+      if ($filtered.Count -eq 0) { continue }
       Set-ObjectPropertyValue $entry "hooks" $filtered
-      $newPreToolUse += $entry
     }
+    $newPreToolUse += $entry
   }
 
   if (-not $removed) { return $false }

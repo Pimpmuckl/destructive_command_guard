@@ -1498,6 +1498,7 @@ enum WrapperState {
     /// the wrapped command (issue #257).
     MiseExec {
         awaiting_subcommand: bool,
+        pending_value: bool,
     },
 }
 
@@ -1576,6 +1577,7 @@ impl WrapperState {
             }),
             "mise" => Some(Self::MiseExec {
                 awaiting_subcommand: true,
+                pending_value: false,
             }),
             other => LauncherKind::from_basename(other).map(|kind| Self::Launcher {
                 kind,
@@ -1688,12 +1690,14 @@ impl WrapperState {
             }
             Self::MiseExec {
                 awaiting_subcommand,
+                pending_value,
             } => {
                 if awaiting_subcommand {
                     return if matches!(token, "exec" | "x") {
                         (
                             Self::MiseExec {
                                 awaiting_subcommand: false,
+                                pending_value: false,
                             },
                             true,
                         )
@@ -1702,18 +1706,60 @@ impl WrapperState {
                         (Self::None, false)
                     };
                 }
+                if pending_value {
+                    // The previous modeled option consumes this token.
+                    return (
+                        Self::MiseExec {
+                            awaiting_subcommand: false,
+                            pending_value: false,
+                        },
+                        true,
+                    );
+                }
                 if token == "--" {
                     // The wrapped command starts at the next token.
                     return (Self::None, true);
                 }
-                if token.starts_with('-') || token.contains('@') {
-                    // Exec options and TOOL@VERSION specs precede the command.
+                if token.contains('@') {
+                    // TOOL@VERSION specs precede the command.
                     return (
                         Self::MiseExec {
                             awaiting_subcommand: false,
+                            pending_value: false,
                         },
                         true,
                     );
+                }
+                if matches!(token, "-C" | "--cd" | "-E" | "--env" | "-j" | "--jobs") {
+                    return (
+                        Self::MiseExec {
+                            awaiting_subcommand: false,
+                            pending_value: true,
+                        },
+                        true,
+                    );
+                }
+                if token.starts_with("--") && token.contains('=')
+                    || matches!(token, "--raw" | "-v" | "--verbose" | "-q" | "--quiet")
+                {
+                    // Glued `--opt=value` forms and known flags consume
+                    // nothing further.
+                    return (
+                        Self::MiseExec {
+                            awaiting_subcommand: false,
+                            pending_value: false,
+                        },
+                        true,
+                    );
+                }
+                if token.starts_with('-') {
+                    // Unknown option: its arity is unmodeled, so the next
+                    // word could be its value rather than the command
+                    // (`mise exec -p echo rm -rf /` must not make `echo` the
+                    // segment command and mask the `rm` as args-data). Let
+                    // the option itself end wrapper handling — it is not a
+                    // registry command, so nothing downstream is masked.
+                    return (Self::None, false);
                 }
                 // In mise's grammar the first bare word without `@` starts
                 // the wrapped command.

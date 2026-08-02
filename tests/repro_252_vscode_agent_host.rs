@@ -7,6 +7,19 @@
 //! with each entry's `args` JSON-encoded as a string. Before the fix the
 //! envelope deserialized without any recognized command and the hook silently
 //! failed open.
+//!
+//! Follow-up regressions covered here (v0.9.0 hardening):
+//! - **Batch masking**: batch entries used to be joined with `"\n"` into one
+//!   string, so an entry ending in an unterminated quote or a trailing
+//!   backslash swallowed the following entry during tokenization and hid its
+//!   destructive command (fail-open). Entries are now extracted and evaluated
+//!   independently, each with its own dialect.
+//! - **Parse abort**: a `toolCalls` value in a non-array shape used to abort
+//!   the whole `HookInput` parse, failing open even though `tool_input`
+//!   carried a perfectly parseable destructive command.
+//! - **Entry gating**: nameless entries with args, agy's `run_command` name,
+//!   and `CommandLine`-style args keys used to be skipped by the batch path
+//!   even though the singular `toolCall` path accepted all three.
 
 use destructive_command_guard::hook::{
     HookInput, HookProtocol, detect_protocol, extract_command_with_context,
@@ -35,6 +48,10 @@ fn documented_envelope_extracts_inner_command_and_dialect() {
     assert_eq!(extracted.command, r"Remove-Item -Recurse -Force C:\src");
     assert_eq!(extracted.protocol, HookProtocol::ClaudeCompatible);
     assert_eq!(extracted.dialect, ShellDialect::PowerShell);
+    assert!(
+        extracted.additional_commands.is_empty(),
+        "a single-entry batch has no additional commands"
+    );
 }
 
 #[test]
@@ -54,10 +71,12 @@ fn stringified_and_object_args_both_extract() {
 }
 
 #[test]
-fn batch_extracts_every_shell_call_joined_by_newline() {
+fn batch_extracts_every_shell_call_as_separate_command() {
     // A non-shell tool call in the batch is skipped; both bash calls are
-    // evaluated (a single destructive entry must deny the whole batch, so
-    // both commands must be visible to the evaluator).
+    // extracted as INDEPENDENT commands (never joined into one string, which
+    // would let quoting in one entry mask the next) so the hook driver
+    // evaluates each one and a single destructive entry denies the whole
+    // batch.
     let input = parse(
         r#"{"sessionId":"s","cwd":"/w","toolCalls":[
             {"name":"readFile","args":{"path":"/w/a.txt"}},
@@ -67,13 +86,20 @@ fn batch_extracts_every_shell_call_joined_by_newline() {
     );
     let extracted =
         extract_command_with_context(&input).expect("batched bash calls must extract commands");
-    assert_eq!(extracted.command, "echo one\necho two");
+    assert_eq!(extracted.command, "echo one");
     assert_eq!(extracted.dialect, ShellDialect::Posix);
     assert_eq!(extracted.protocol, HookProtocol::ClaudeCompatible);
+    assert_eq!(
+        extracted.additional_commands,
+        vec![("echo two".to_string(), ShellDialect::Posix)]
+    );
 }
 
 #[test]
-fn mixed_shell_batch_falls_back_to_unknown_dialect() {
+fn mixed_shell_batch_keeps_per_entry_dialects() {
+    // Each batch entry keeps its OWN proven dialect. The old design joined
+    // the commands and downgraded mixed batches to a single Unknown-dialect
+    // string; per-entry evaluation makes that both unnecessary and wrong.
     let input = parse(
         r#"{"sessionId":"s","toolCalls":[
             {"name":"bash","args":{"command":"echo posix"}},
@@ -82,11 +108,137 @@ fn mixed_shell_batch_falls_back_to_unknown_dialect() {
     );
     let extracted =
         extract_command_with_context(&input).expect("mixed batch must still extract commands");
-    assert_eq!(extracted.command, "echo posix\nWrite-Output ps");
+    assert_eq!(extracted.command, "echo posix");
+    assert_eq!(extracted.dialect, ShellDialect::Posix);
     assert_eq!(
-        extracted.dialect,
-        ShellDialect::Unknown,
-        "mixed shells must keep the conservative all-dialect view"
+        extracted.additional_commands,
+        vec![("Write-Output ps".to_string(), ShellDialect::PowerShell)]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Bug 1 (batch masking): unit-level extraction assertions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unterminated_quote_entry_cannot_mask_the_next_entry() {
+    // Entry one ends in an unterminated double quote. Joined with "\n" the
+    // quote absorbed entry two, so `rm -rf /` was never seen as a command of
+    // its own and the batch was allowed. Per-entry extraction must yield two
+    // separate commands.
+    let input = parse(
+        r#"{"sessionId":"s","cwd":"/w","toolCalls":[
+            {"name":"bash","args":"{\"command\":\"echo \\\"start of a note\"}"},
+            {"name":"bash","args":"{\"command\":\"rm -rf /\"}"}
+        ]}"#,
+    );
+    let extracted = extract_command_with_context(&input).expect("batch must extract");
+    assert_eq!(extracted.command, "echo \"start of a note");
+    assert_eq!(
+        extracted.additional_commands,
+        vec![("rm -rf /".to_string(), ShellDialect::Posix)],
+        "the destructive second entry must survive as its own command"
+    );
+}
+
+#[test]
+fn trailing_backslash_entry_cannot_mask_the_next_entry() {
+    // Same masking mechanism via line continuation: a trailing backslash
+    // would have glued the next joined line onto the first command.
+    let input = parse(
+        r#"{"sessionId":"s","toolCalls":[
+            {"name":"bash","args":{"command":"echo continued \\"}},
+            {"name":"bash","args":{"command":"rm -rf /"}}
+        ]}"#,
+    );
+    let extracted = extract_command_with_context(&input).expect("batch must extract");
+    assert_eq!(extracted.command, "echo continued \\");
+    assert_eq!(
+        extracted.additional_commands,
+        vec![("rm -rf /".to_string(), ShellDialect::Posix)]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Bug 2 (typed field parse abort): tolerant `toolCalls` deserialization
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tool_calls_object_shape_still_denies_via_tool_input() {
+    // `toolCalls` in a non-array shape must not abort the whole HookInput
+    // parse: pre-v0.9.0 this payload denied via tool_input, and a parse abort
+    // fails open.
+    let json = r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /"},"toolCalls":{"0":{}}}"#;
+    let input: HookInput =
+        serde_json::from_str(json).expect("non-array toolCalls must not abort the parse");
+    assert!(input.tool_calls.is_none());
+    let extracted =
+        extract_command_with_context(&input).expect("tool_input path must still extract");
+    assert_eq!(extracted.command, "rm -rf /");
+    assert!(extracted.additional_commands.is_empty());
+}
+
+#[test]
+fn tool_calls_array_with_unfit_entries_keeps_the_fitting_ones() {
+    let input = parse(
+        r#"{"toolCalls":[42,"junk",{"name":"bash","args":{"command":"rm -rf /"}},{"name":7}]}"#,
+    );
+    let extracted =
+        extract_command_with_context(&input).expect("the fitting entry must still extract");
+    assert_eq!(extracted.command, "rm -rf /");
+}
+
+// ---------------------------------------------------------------------------
+// Bug 3 (batch gating stricter than the singular path)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn nameless_batch_entry_with_args_extracts_its_command() {
+    let input = parse(r#"{"toolCalls":[{"args":{"command":"rm -rf /"}}]}"#);
+    let extracted = extract_command_with_context(&input)
+        .expect("a nameless entry with args mirrors the singular toolCall posture");
+    assert_eq!(extracted.command, "rm -rf /");
+    assert_eq!(extracted.dialect, ShellDialect::Unknown);
+}
+
+#[test]
+fn run_command_batch_entry_extracts_its_command() {
+    // agy's shell tool name inside a batched entry.
+    let input =
+        parse(r#"{"toolCalls":[{"name":"run_command","args":{"CommandLine":"rm -rf /"}}]}"#);
+    let extracted =
+        extract_command_with_context(&input).expect("run_command entries must be evaluated");
+    assert_eq!(extracted.command, "rm -rf /");
+}
+
+#[test]
+fn command_line_style_args_keys_extract_in_batch_entries() {
+    for key in ["CommandLine", "commandLine", "Command"] {
+        let json = format!(
+            r#"{{"toolCalls":[{{"name":"powershell","args":{{"{key}":"Remove-Item -Recurse -Force C:\\src"}}}}]}}"#
+        );
+        let input = parse(&json);
+        let extracted = extract_command_with_context(&input)
+            .unwrap_or_else(|| panic!("{key} args key must extract"));
+        assert_eq!(extracted.command, r"Remove-Item -Recurse -Force C:\src");
+        assert_eq!(extracted.dialect, ShellDialect::PowerShell);
+    }
+}
+
+#[test]
+fn singular_tool_call_alongside_batch_is_appended_as_an_entry() {
+    let input = parse(
+        r#"{
+            "toolCalls":[{"name":"bash","args":{"command":"git status"}}],
+            "toolCall":{"name":"run_command","args":{"CommandLine":"rm -rf /"}}
+        }"#,
+    );
+    let extracted = extract_command_with_context(&input).expect("must extract");
+    assert_eq!(extracted.command, "git status");
+    assert_eq!(
+        extracted.additional_commands,
+        vec![("rm -rf /".to_string(), ShellDialect::Unknown)],
+        "the singular toolCall's command must also be evaluated"
     );
 }
 
@@ -138,8 +290,14 @@ fn singular_tool_call_envelope_still_detects_antigravity() {
 }
 
 // ---------------------------------------------------------------------------
-// Binary-level coverage: the real dcg hook denies a destructive batch
+// Binary-level coverage: the real dcg hook denies destructive batches
 // ---------------------------------------------------------------------------
+//
+// Bug 4 (the PA_PROJECT_DIR protocol misroute) is covered by inline unit
+// tests in src/hook.rs: they need the crate-private ENV_LOCK / EnvVarGuard
+// helpers, which are not visible from an integration test, and integration
+// tests cannot mutate the environment safely (`std::env::set_var` is unsafe
+// and racy under the parallel test runner).
 
 /// Path to the dcg binary (same workspace-relative discovery as
 /// tests/codex_hook_protocol.rs).
@@ -151,18 +309,13 @@ fn dcg_binary() -> std::path::PathBuf {
     path
 }
 
-#[test]
-fn destructive_bash_batch_is_denied_on_stdout_with_exit_zero() {
+/// Spawn the real dcg binary in hook mode with a hermetic environment and
+/// return its output. Isolated HOME/TMPDIR so parallel tests never share
+/// history or pending-exception state (mirrors codex_hook_protocol.rs).
+fn run_hook(payload: &str) -> std::process::Output {
     use std::io::Write as _;
     use std::process::{Command, Stdio};
 
-    let payload = r#"{"sessionId":"s","cwd":"/w","toolCalls":[
-        {"name":"bash","args":"{\"command\":\"git status\"}"},
-        {"name":"bash","args":"{\"command\":\"rm -rf /\"}"}
-    ]}"#;
-
-    // Hermetic spawn: isolated HOME/TMPDIR so parallel tests never share
-    // history or pending-exception state (mirrors codex_hook_protocol.rs).
     let home = tempfile::tempdir().expect("failed to create hermetic HOME");
     let tmp = home.path().join("tmp");
     std::fs::create_dir_all(&tmp).expect("failed to create hermetic TMPDIR");
@@ -191,21 +344,83 @@ fn destructive_bash_batch_is_denied_on_stdout_with_exit_zero() {
         .expect("stdin must be piped")
         .write_all(payload.as_bytes())
         .expect("failed to write hook payload");
-    let output = child.wait_with_output().expect("failed to wait for dcg");
+    child.wait_with_output().expect("failed to wait for dcg")
+}
 
+/// Assert a Claude-shaped deny on stdout with exit code 0.
+fn assert_denied(output: &std::process::Output, context: &str) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
         output.status.code(),
         Some(0),
-        "Agent Host consumes Claude-shaped output; deny must use exit 0.\nstdout: {stdout}\nstderr: {stderr}"
+        "{context}: Agent Host consumes Claude-shaped output; deny must use exit 0.\nstdout: {stdout}\nstderr: {stderr}"
     );
     assert!(
         stdout.contains("\"permissionDecision\""),
-        "deny must be a Claude-compatible stdout JSON payload.\nstdout: {stdout}\nstderr: {stderr}"
+        "{context}: deny must be a Claude-compatible stdout JSON payload.\nstdout: {stdout}\nstderr: {stderr}"
     );
     assert!(
         stdout.contains("\"deny\""),
-        "the destructive batch entry must deny the whole batch.\nstdout: {stdout}\nstderr: {stderr}"
+        "{context}: the destructive batch entry must deny the whole batch.\nstdout: {stdout}\nstderr: {stderr}"
     );
+}
+
+#[test]
+fn destructive_bash_batch_is_denied_on_stdout_with_exit_zero() {
+    let payload = r#"{"sessionId":"s","cwd":"/w","toolCalls":[
+        {"name":"bash","args":"{\"command\":\"git status\"}"},
+        {"name":"bash","args":"{\"command\":\"rm -rf /\"}"}
+    ]}"#;
+    assert_denied(&run_hook(payload), "benign-then-destructive batch");
+}
+
+#[test]
+fn unterminated_quote_masking_batch_is_denied() {
+    // Bug 1 end-to-end: the first entry's unterminated double quote used to
+    // absorb the second entry after the "\n" join, so the destructive command
+    // was never tokenized and the batch was ALLOWED.
+    let payload = r#"{"sessionId":"s","cwd":"/w","toolCalls":[
+        {"name":"bash","args":"{\"command\":\"echo \\\"start of a note\"}"},
+        {"name":"bash","args":"{\"command\":\"rm -rf /\"}"}
+    ]}"#;
+    assert_denied(&run_hook(payload), "unterminated-quote masking batch");
+}
+
+#[test]
+fn unterminated_quote_masking_batch_reversed_order_is_denied() {
+    let payload = r#"{"sessionId":"s","cwd":"/w","toolCalls":[
+        {"name":"bash","args":"{\"command\":\"rm -rf /\"}"},
+        {"name":"bash","args":"{\"command\":\"echo \\\"start of a note\"}"}
+    ]}"#;
+    assert_denied(&run_hook(payload), "destructive-first masking batch");
+}
+
+#[test]
+fn benign_batch_stays_silent_with_exit_zero() {
+    let payload = r#"{"sessionId":"s","cwd":"/w","toolCalls":[
+        {"name":"bash","args":"{\"command\":\"git status\"}"},
+        {"name":"bash","args":"{\"command\":\"echo hi\"}"}
+    ]}"#;
+    let output = run_hook(payload);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "benign batch must exit 0.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "an all-allow batch must stay silent on stdout.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+#[test]
+fn tool_calls_object_shape_payload_is_denied_via_tool_input() {
+    // Bug 2 end-to-end: this payload used to abort HookInput parsing and
+    // fail open even though tool_input carried `rm -rf /`.
+    let payload =
+        r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /"},"toolCalls":{"0":{}}}"#;
+    assert_denied(&run_hook(payload), "toolCalls-as-object payload");
 }
