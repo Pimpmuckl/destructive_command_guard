@@ -1692,6 +1692,39 @@ impl WrapperState {
                 awaiting_subcommand,
                 pending_value,
             } => {
+                if pending_value {
+                    // The previous modeled option consumes this token.
+                    return (
+                        Self::MiseExec {
+                            awaiting_subcommand,
+                            pending_value: false,
+                        },
+                        true,
+                    );
+                }
+                // Option handling is shared with the normalizer's mise model
+                // so the two engines cannot diverge (v0.9.1 review). Options
+                // are recognized before `@`-bearing words: a token starting
+                // with `-` is an option even when it contains `@`. Global
+                // flags may precede the subcommand (`mise -v exec -- cmd`).
+                if crate::normalize::mise_option_takes_separate_value(token) {
+                    return (
+                        Self::MiseExec {
+                            awaiting_subcommand,
+                            pending_value: true,
+                        },
+                        true,
+                    );
+                }
+                if crate::normalize::mise_flag_consumes_nothing(token) {
+                    return (
+                        Self::MiseExec {
+                            awaiting_subcommand,
+                            pending_value: false,
+                        },
+                        true,
+                    );
+                }
                 if awaiting_subcommand {
                     return if matches!(token, "exec" | "x") {
                         (
@@ -1702,23 +1735,24 @@ impl WrapperState {
                             true,
                         )
                     } else {
-                        // `mise <other-subcommand>` is not an exec wrapper.
+                        // `mise <other-subcommand>` (or an unknown global
+                        // option) is not an exec wrapper.
                         (Self::None, false)
                     };
-                }
-                if pending_value {
-                    // The previous modeled option consumes this token.
-                    return (
-                        Self::MiseExec {
-                            awaiting_subcommand: false,
-                            pending_value: false,
-                        },
-                        true,
-                    );
                 }
                 if token == "--" {
                     // The wrapped command starts at the next token.
                     return (Self::None, true);
+                }
+                if token.starts_with('-') {
+                    // Unknown option (including `-c/--command`, an inline
+                    // shell string): its arity is unmodeled, so the next
+                    // word could be its value rather than the command
+                    // (`mise exec -p echo rm -rf /` must not make `echo` the
+                    // segment command and mask the `rm` as args-data). Let
+                    // the option itself end wrapper handling — it is not a
+                    // registry command, so nothing downstream is masked.
+                    return (Self::None, false);
                 }
                 if token.contains('@') {
                     // TOOL@VERSION specs precede the command.
@@ -1730,39 +1764,8 @@ impl WrapperState {
                         true,
                     );
                 }
-                if matches!(token, "-C" | "--cd" | "-E" | "--env" | "-j" | "--jobs") {
-                    return (
-                        Self::MiseExec {
-                            awaiting_subcommand: false,
-                            pending_value: true,
-                        },
-                        true,
-                    );
-                }
-                if token.starts_with("--") && token.contains('=')
-                    || matches!(token, "--raw" | "-v" | "--verbose" | "-q" | "--quiet")
-                {
-                    // Glued `--opt=value` forms and known flags consume
-                    // nothing further.
-                    return (
-                        Self::MiseExec {
-                            awaiting_subcommand: false,
-                            pending_value: false,
-                        },
-                        true,
-                    );
-                }
-                if token.starts_with('-') {
-                    // Unknown option: its arity is unmodeled, so the next
-                    // word could be its value rather than the command
-                    // (`mise exec -p echo rm -rf /` must not make `echo` the
-                    // segment command and mask the `rm` as args-data). Let
-                    // the option itself end wrapper handling — it is not a
-                    // registry command, so nothing downstream is masked.
-                    return (Self::None, false);
-                }
-                // In mise's grammar the first bare word without `@` starts
-                // the wrapped command.
+                // In mise's grammar the first bare word starts the wrapped
+                // command.
                 (Self::None, false)
             }
         }

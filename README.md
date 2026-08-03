@@ -939,7 +939,7 @@ curl -fsSL "https://raw.githubusercontent.com/Pimpmuckl/destructive_command_guar
 Install specific version:
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Pimpmuckl/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --version v0.9.1-codexpp.1
+curl -fsSL "https://raw.githubusercontent.com/Pimpmuckl/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --version v0.9.2-codexpp.1
 ```
 
 Install to /usr/local/bin (system-wide, requires sudo):
@@ -1005,7 +1005,7 @@ repository's known-good `nightly-2026-06-06` pin; the included
 rustup toolchain install nightly-2026-06-06
 
 # Install the tagged source reproducibly
-cargo +nightly-2026-06-06 install --locked --git https://github.com/Pimpmuckl/destructive_command_guard --tag v0.9.1-codexpp.1 destructive_command_guard
+cargo +nightly-2026-06-06 install --locked --git https://github.com/Pimpmuckl/destructive_command_guard --tag v0.9.2-codexpp.1 destructive_command_guard
 ```
 
 ### Manual build
@@ -1029,7 +1029,7 @@ dcg update
 Optional flags mirror the installer scripts (examples):
 
 ```bash
-dcg update --version v0.9.1-codexpp.1
+dcg update --version v0.9.2-codexpp.1
 dcg update --system
 dcg update --verify
 dcg update --verify --no-configure  # binary only; preserve existing hook wiring

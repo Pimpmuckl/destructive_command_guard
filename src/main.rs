@@ -163,6 +163,19 @@ fn effective_agent_for_hook_protocol(
 const INDETERMINATE_HISTORY_PACK: &str = "dcg.internal";
 const INDETERMINATE_HISTORY_PATTERN: &str = "evaluation-deadline";
 
+/// The indeterminate reason published when a command exceeds
+/// `general.max_command_bytes`.
+///
+/// Shared by the pre-writer primary-command refusal and the per-entry batch
+/// refusal so the two sites cannot drift: both must emit identical bytes.
+fn format_oversized_command_reason(command_len: usize, max_command_bytes: usize) -> String {
+    format!(
+        "Command is {command_len} bytes and exceeds limit {max_command_bytes} bytes; \
+         DCG did not evaluate it. Reduce the command size or raise \
+         general.max_command_bytes after review."
+    )
+}
+
 fn format_indeterminate_reason(stage: &str, budget: Duration) -> String {
     format!(
         "DCG could not complete safety evaluation within {}ms (stage: {stage}); \
@@ -473,17 +486,80 @@ fn load_effective_allowlists_for_agent(config: &Config, agent: &Agent) -> Layere
     apply_agent_allowlist_profile(config, agent, load_default_allowlists())
 }
 
-/// Outcome of one end-to-end hook-command evaluation.
-enum HookCommandOutcome {
-    /// The command may run and nothing was published to the hook client, so a
-    /// following batch entry can still be evaluated. Covers plain allows,
-    /// allowlist overrides, rebase-recovery conversions, and `Log`-mode
-    /// matches — all of which leave stdout untouched.
-    Allowed,
-    /// A protocol response (deny / ask / warn / indeterminate) was published.
-    /// Hook protocols are one-JSON-document streams, so the request must end
-    /// here: emitting a second decision document would corrupt the stream.
-    Responded,
+/// A hook command whose evaluation resolved to the deny family
+/// (deny / ask / warn), carrying everything needed to publish the protocol
+/// response later — after every batch entry has been resolved.
+struct ResolvedDenyFamily {
+    command: String,
+    result: destructive_command_guard::evaluator::EvaluationResult,
+    mode: DecisionMode,
+    eval_duration: Duration,
+}
+
+/// Outcome of resolving (evaluating, mode-resolving, and rebase-recovery
+/// checking) one hook command, WITHOUT publishing any protocol response.
+///
+/// Responses are deferred because hook protocols are one-JSON-document
+/// streams and a `toolCalls[]` batch may contain several non-allow entries:
+/// answering mid-batch would both risk emitting two decision documents and —
+/// the confirmed fail-open — end the request on a Warn entry with later
+/// destructive entries UNEVALUATED. All entries are resolved first, then
+/// exactly one response is chosen by [`outcome_rank`] precedence.
+enum ResolvedCommandOutcome {
+    /// Entry may run; stdout untouched. Covers plain allows, allowlist
+    /// overrides, rebase-recovery conversions, and `Log`-mode matches (the
+    /// latter two log their own history rows at resolve time, as before).
+    /// Carries the would-be history Allow row (built only when history is
+    /// enabled and only for plain allows) so an all-allow request can record
+    /// exactly one Allow row for the primary command.
+    Allow(Option<Box<CommandEntry>>),
+    /// Command exceeds `max_command_bytes` and cannot be evaluated. Publishes
+    /// the size-limit indeterminate message (no history row, as before).
+    OversizedCommand { command_len: usize },
+    /// The shared wall-clock deadline was exhausted before or while
+    /// evaluating this entry. Publishes the conservative indeterminate
+    /// response — never a silent allow of unscanned entries.
+    DeadlineExhausted {
+        command: String,
+        stage: &'static str,
+    },
+    /// Deny / Ask / Warn candidate awaiting decisive selection.
+    DenyFamily(Box<ResolvedDenyFamily>),
+}
+
+/// Precedence ranks for decisive-response selection across a batch.
+/// Higher wins; ties keep the earliest entry (scan order).
+const RANK_ALLOW: u8 = 0;
+const RANK_WARN: u8 = 1;
+const RANK_ASK: u8 = 2;
+const RANK_INDETERMINATE: u8 = 3;
+const RANK_DENY: u8 = 4;
+
+/// Rank a deny-family decision mode: Deny > Ask > Warn.
+///
+/// Indeterminate outcomes rank between Deny and Ask (see [`outcome_rank`]): a
+/// proven destructive entry must deny even if another entry could not be
+/// evaluated, while an unevaluated entry must escalate over ask/warn/allow.
+const fn deny_family_rank(mode: DecisionMode) -> u8 {
+    match mode {
+        DecisionMode::Deny => RANK_DENY,
+        DecisionMode::Ask => RANK_ASK,
+        DecisionMode::Warn => RANK_WARN,
+        // Log-mode entries are fully handled at resolve time and never enter
+        // the deny-family candidate set; ranked as allow for exhaustiveness.
+        DecisionMode::Log => RANK_ALLOW,
+    }
+}
+
+/// Precedence of a resolved outcome: Deny > Indeterminate > Ask > Warn >
+/// Log/Allow.
+fn outcome_rank(outcome: &ResolvedCommandOutcome) -> u8 {
+    match outcome {
+        ResolvedCommandOutcome::Allow(_) => RANK_ALLOW,
+        ResolvedCommandOutcome::OversizedCommand { .. }
+        | ResolvedCommandOutcome::DeadlineExhausted { .. } => RANK_INDETERMINATE,
+        ResolvedCommandOutcome::DenyFamily(resolved) => deny_family_rank(resolved.mode),
+    }
 }
 
 /// Shared per-request state for evaluating hook commands.
@@ -508,50 +584,38 @@ struct HookEvalContext<'a> {
     max_command_bytes: usize,
 }
 
-/// Evaluate one hook command end-to-end and publish the protocol response for
-/// any non-allow outcome.
+/// Resolve one hook command end-to-end WITHOUT publishing a protocol
+/// response.
 ///
-/// This is the single evaluate-and-respond path for both the primary command
-/// and every additional `toolCalls[]` batch entry, so batch entries get
-/// byte-identical deny/ask/warn/indeterminate handling (the response mentions
-/// THAT command). `log_allow_history` is true only for the primary command:
-/// an all-allow request records exactly one history Allow row (for the
-/// primary), matching the pre-batch behavior, while decisive rows —
-/// deny/ask/warn/log outcomes, rebase-recovery conversions, and indeterminate
-/// deadline exits — are always recorded for the command that produced them.
+/// This is the single evaluate-and-resolve path for both the primary command
+/// and every additional `toolCalls[]` batch entry: evaluation, per-entry mode
+/// resolution, and the per-entry rebase-recovery conversion all happen here,
+/// so the decisive selection afterwards compares RESOLVED outcomes. Resolve-
+/// time side effects deliberately kept from the old flow: rebase-recovery
+/// conversions log their history row (and stderr note) immediately, and
+/// `Log`-mode matches log their history row and optional file log
+/// immediately — both are stdout-silent and never mask later entries.
 #[allow(clippy::too_many_lines)]
-fn evaluate_hook_command(
+fn resolve_hook_command(
     ctx: &HookEvalContext<'_>,
     command: &str,
     shell_dialect: ShellDialect,
-    history_writer: &mut Option<HistoryWriter>,
-    log_allow_history: bool,
-) -> HookCommandOutcome {
+    history_writer: Option<&HistoryWriter>,
+) -> ResolvedCommandOutcome {
     // Refuse oversized commands conservatively. The limit bounds every later
     // parser and scanner, so truncating or treating the command as clean would
     // let an attacker hide a destructive tail beyond the inspected prefix.
     if command.len() > ctx.max_command_bytes {
-        let reason = format!(
-            "Command is {} bytes and exceeds limit {} bytes; DCG did not evaluate it. \
-             Reduce the command size or raise general.max_command_bytes after review.",
-            command.len(),
-            ctx.max_command_bytes
-        );
-        hook::output_indeterminate_for_protocol(ctx.hook_protocol, &reason);
-        return HookCommandOutcome::Responded;
+        return ResolvedCommandOutcome::OversizedCommand {
+            command_len: command.len(),
+        };
     }
 
     if ctx.deadline.is_exceeded() {
-        handle_indeterminate_evaluation(
-            ctx.hook_protocol,
-            history_writer.as_mut(),
-            ctx.history_agent_type,
-            command,
-            ctx.working_dir,
-            "pre_evaluation",
-            ctx.deadline,
-        );
-        return HookCommandOutcome::Responded;
+        return ResolvedCommandOutcome::DeadlineExhausted {
+            command: command.to_string(),
+            stage: "pre_evaluation",
+        };
     }
 
     // Use the shared evaluator for hook mode parity with `dcg test`.
@@ -576,65 +640,56 @@ fn evaluate_hook_command(
     let eval_duration = eval_start.elapsed();
 
     if result.decision == EvaluationDecision::Indeterminate || result.skipped_due_to_budget {
-        handle_indeterminate_evaluation(
-            ctx.hook_protocol,
-            history_writer.as_mut(),
-            ctx.history_agent_type,
-            command,
-            ctx.working_dir,
-            "evaluation",
-            ctx.deadline,
-        );
-        return HookCommandOutcome::Responded;
+        return ResolvedCommandOutcome::DeadlineExhausted {
+            command: command.to_string(),
+            stage: "evaluation",
+        };
     }
 
     if result.decision != EvaluationDecision::Deny {
-        if log_allow_history {
-            if let Some(writer) = history_writer.as_ref() {
-                let mut pack_id = None;
-                let mut pattern_name = None;
-                let mut allowlist_layer = None;
+        // Build the would-be Allow history row only when history is enabled;
+        // the caller logs it only when this entry is the primary and the
+        // whole request resolves all-allow.
+        let allow_row = history_writer.map(|_| {
+            let mut pack_id = None;
+            let mut pattern_name = None;
+            let mut allowlist_layer = None;
 
-                if let Some(override_) = result.allowlist_override.as_ref() {
-                    allowlist_layer = Some(override_.layer.label());
-                    pack_id = override_.matched.pack_id.as_deref();
-                    pattern_name = override_.matched.pattern_name.as_deref();
-                }
-
-                let entry = build_history_entry(
-                    ctx.history_agent_type,
-                    command,
-                    ctx.working_dir,
-                    HistoryOutcome::Allow,
-                    eval_duration,
-                    pack_id,
-                    pattern_name,
-                    allowlist_layer,
-                );
-                writer.log(entry);
+            if let Some(override_) = result.allowlist_override.as_ref() {
+                allowlist_layer = Some(override_.layer.label());
+                pack_id = override_.matched.pack_id.as_deref();
+                pattern_name = override_.matched.pattern_name.as_deref();
             }
-        }
-        return HookCommandOutcome::Allowed;
+
+            Box::new(build_history_entry(
+                ctx.history_agent_type,
+                command,
+                ctx.working_dir,
+                HistoryOutcome::Allow,
+                eval_duration,
+                pack_id,
+                pattern_name,
+                allowlist_layer,
+            ))
+        });
+        return ResolvedCommandOutcome::Allow(allow_row);
     }
 
     let Some(ref info) = result.pattern_info else {
         // Fail open: structurally unexpected, but hook safety wins.
-        if log_allow_history {
-            if let Some(writer) = history_writer.as_ref() {
-                let entry = build_history_entry(
-                    ctx.history_agent_type,
-                    command,
-                    ctx.working_dir,
-                    HistoryOutcome::Allow,
-                    eval_duration,
-                    None,
-                    None,
-                    None,
-                );
-                writer.log(entry);
-            }
-        }
-        return HookCommandOutcome::Allowed;
+        let allow_row = history_writer.map(|_| {
+            Box::new(build_history_entry(
+                ctx.history_agent_type,
+                command,
+                ctx.working_dir,
+                HistoryOutcome::Allow,
+                eval_duration,
+                None,
+                None,
+                None,
+            ))
+        });
+        return ResolvedCommandOutcome::Allow(allow_row);
     };
 
     let pack = info.pack_id.as_deref();
@@ -643,7 +698,6 @@ fn evaluate_hook_command(
             .unwrap_or(DecisionMode::Deny);
 
     let pattern = info.pattern_name.as_deref();
-    let explanation = info.explanation.as_deref();
 
     // Rebase-recovery unblock (issue #104), applied per command.
     //
@@ -680,7 +734,7 @@ fn evaluate_hook_command(
                     pattern.unwrap_or("<unknown>"),
                     reason.label()
                 );
-                if let Some(writer) = history_writer.as_ref() {
+                if let Some(writer) = history_writer {
                     let entry = build_history_entry(
                         ctx.history_agent_type,
                         command,
@@ -693,10 +747,88 @@ fn evaluate_hook_command(
                     );
                     writer.log(entry);
                 }
-                return HookCommandOutcome::Allowed;
+                return ResolvedCommandOutcome::Allow(None);
             }
         }
     }
+
+    if mode == DecisionMode::Log {
+        // Silent allow with its own audit row; never a response candidate, so
+        // it can never mask later batch entries.
+        if let Some(writer) = history_writer {
+            let entry = build_history_entry(
+                ctx.history_agent_type,
+                command,
+                ctx.working_dir,
+                HistoryOutcome::Allow,
+                eval_duration,
+                pack,
+                pattern,
+                None,
+            );
+            writer.log(entry);
+        }
+        if let Some(log_file) = &ctx.config.general.log_file {
+            let _ = hook::log_blocked_command(log_file, command, &info.reason, pack);
+        }
+        return ResolvedCommandOutcome::Allow(None);
+    }
+
+    ResolvedCommandOutcome::DenyFamily(Box::new(ResolvedDenyFamily {
+        command: command.to_string(),
+        result,
+        mode,
+        eval_duration,
+    }))
+}
+
+/// Publish the single protocol response for the decisive resolved outcome,
+/// with its history row — the decisive entry's row, exactly as the
+/// single-command flow records it.
+#[allow(clippy::too_many_lines)]
+fn publish_decisive_response(
+    ctx: &HookEvalContext<'_>,
+    outcome: ResolvedCommandOutcome,
+    history_writer: &mut Option<HistoryWriter>,
+) {
+    let resolved = match outcome {
+        // Never selected as decisive; the caller only publishes non-allow
+        // outcomes.
+        ResolvedCommandOutcome::Allow(_) => return,
+        ResolvedCommandOutcome::OversizedCommand { command_len } => {
+            let reason = format_oversized_command_reason(command_len, ctx.max_command_bytes);
+            hook::output_indeterminate_for_protocol(ctx.hook_protocol, &reason);
+            return;
+        }
+        ResolvedCommandOutcome::DeadlineExhausted { command, stage } => {
+            handle_indeterminate_evaluation(
+                ctx.hook_protocol,
+                history_writer.as_mut(),
+                ctx.history_agent_type,
+                &command,
+                ctx.working_dir,
+                stage,
+                ctx.deadline,
+            );
+            return;
+        }
+        ResolvedCommandOutcome::DenyFamily(resolved) => resolved,
+    };
+
+    let ResolvedDenyFamily {
+        command,
+        result,
+        mode,
+        eval_duration,
+    } = *resolved;
+    let Some(ref info) = result.pattern_info else {
+        // Unreachable by construction: resolve_hook_command only builds a
+        // DenyFamily when pattern_info is present.
+        return;
+    };
+    let pack = info.pack_id.as_deref();
+    let pattern = info.pattern_name.as_deref();
+    let explanation = info.explanation.as_deref();
 
     if let Some(writer) = history_writer.as_ref() {
         let outcome = match mode {
@@ -706,7 +838,7 @@ fn evaluate_hook_command(
         };
         let entry = build_history_entry(
             ctx.history_agent_type,
-            command,
+            &command,
             ctx.working_dir,
             outcome,
             eval_duration,
@@ -730,7 +862,7 @@ fn evaluate_hook_command(
 
             let mut allow_once_info: Option<hook::AllowOnceInfo> = None;
             if let Ok((record, maintenance)) = store.record_block(
-                command,
+                &command,
                 ctx.working_dir,
                 &reason,
                 &ctx.config.logging.redaction,
@@ -755,7 +887,7 @@ fn evaluate_hook_command(
             if mode == DecisionMode::Ask {
                 hook::output_review_request_for_protocol(
                     ctx.hook_protocol,
-                    command,
+                    &command,
                     &info.reason,
                     pack,
                     pattern,
@@ -770,7 +902,7 @@ fn evaluate_hook_command(
             } else {
                 hook::output_denial_for_protocol(
                     ctx.hook_protocol,
-                    command,
+                    &command,
                     &info.reason,
                     pack,
                     pattern,
@@ -786,32 +918,25 @@ fn evaluate_hook_command(
 
             // Log if configured
             if let Some(log_file) = &ctx.config.general.log_file {
-                let _ = hook::log_blocked_command(log_file, command, &info.reason, pack);
+                let _ = hook::log_blocked_command(log_file, &command, &info.reason, pack);
             }
 
             // Review-capable clients receive ask; all others receive their
             // ordinary blocking response. Returning normally lets
             // `HistoryWriter::Drop` flush the buffered audit entry.
-            HookCommandOutcome::Responded
         }
         DecisionMode::Warn => {
             hook::output_warning_for_protocol(
                 ctx.hook_protocol,
-                command,
+                &command,
                 &info.reason,
                 pack,
                 pattern,
                 explanation,
             );
-            HookCommandOutcome::Responded
         }
-        DecisionMode::Log => {
-            // Silent allow; optionally log to file for history.
-            if let Some(log_file) = &ctx.config.general.log_file {
-                let _ = hook::log_blocked_command(log_file, command, &info.reason, pack);
-            }
-            HookCommandOutcome::Allowed
-        }
+        // Unreachable: Log-mode entries are handled at resolve time.
+        DecisionMode::Log => {}
     }
 }
 
@@ -1017,6 +1142,25 @@ fn main() {
     let effective_agent = effective_agent_for_hook_protocol(hook_protocol, &detected_agent);
     let max_command_bytes = config.general.max_command_bytes();
 
+    // Refuse an oversized single-command request before ANY per-request
+    // machinery exists — allowlist loading, pack expansion, and especially the
+    // history writer, whose construction creates the database, spawns a worker
+    // thread, and installs a shutdown handler. A payload dcg refuses to
+    // evaluate must not be able to provoke that work (it did not before the
+    // batch refactor moved the check behind the writer).
+    //
+    // Requests that carry additional batch entries deliberately fall through
+    // to the per-entry check inside `resolve_hook_command`: the other entries
+    // are still evaluable, and a proven Deny there must outrank this
+    // indeterminate answer rather than be pre-empted by it. Both sites format
+    // the reason through `format_oversized_command_reason`, so the emitted
+    // bytes are identical either way.
+    if additional_commands.is_empty() && command.len() > max_command_bytes {
+        let reason = format_oversized_command_reason(command.len(), max_command_bytes);
+        hook::output_indeterminate_for_protocol(hook_protocol, &reason);
+        return;
+    }
+
     // Load layered allowlists (project/user/system). Missing/invalid files are treated
     // as empty for hook safety; allowlist decisions are only consulted on matches.
     // Use the hook protocol when it identifies the agent more reliably than env/process
@@ -1091,41 +1235,58 @@ fn main() {
         max_command_bytes,
     };
 
-    // Evaluate the primary command; any published response (deny / ask /
-    // warn / indeterminate) ends the hook request.
-    if matches!(
-        evaluate_hook_command(
+    // Resolve EVERY command in the request before publishing anything (issue
+    // #252 batches): each entry is evaluated independently, with its own
+    // dialect, against the same shared wall-clock deadline. Responding
+    // mid-batch was a confirmed fail-open — a Warn-mode entry ended the
+    // request with later destructive entries unevaluated — and also risked
+    // emitting two decision documents on one-JSON-document protocols.
+    // Exactly one response is chosen afterwards by precedence:
+    // Deny > Indeterminate > Ask > Warn > Log/Allow (ties keep scan order).
+    let mut decisive: Option<ResolvedCommandOutcome> = None;
+    let mut primary_allow_row: Option<Box<CommandEntry>> = None;
+
+    for (index, (entry_command, entry_dialect)) in std::iter::once((command, shell_dialect))
+        .chain(additional_commands)
+        .enumerate()
+    {
+        let outcome = resolve_hook_command(
             &eval_context,
-            &command,
-            shell_dialect,
-            &mut history_writer,
-            true,
-        ),
-        HookCommandOutcome::Responded
-    ) {
-        return;
+            &entry_command,
+            entry_dialect,
+            history_writer.as_ref(),
+        );
+        match outcome {
+            ResolvedCommandOutcome::Allow(row) => {
+                if index == 0 {
+                    primary_allow_row = row;
+                }
+            }
+            other => {
+                // Nothing outranks a Deny, and once the shared deadline is
+                // exhausted every later entry would resolve DeadlineExhausted
+                // too — stop scanning for both. Oversized entries keep the
+                // scan going: later entries remain evaluable and a proven
+                // Deny outranks the indeterminate answer.
+                let stop = outcome_rank(&other) == RANK_DENY
+                    || matches!(other, ResolvedCommandOutcome::DeadlineExhausted { .. });
+                if decisive.as_ref().map_or(RANK_ALLOW, outcome_rank) < outcome_rank(&other) {
+                    decisive = Some(other);
+                }
+                if stop {
+                    break;
+                }
+            }
+        }
     }
 
-    // VS Code Agent Host batches (issue #252): every remaining batch entry is
-    // evaluated independently, each with its own dialect, against the same
-    // shared wall-clock deadline (`evaluate_hook_command` re-checks remaining
-    // budget before evaluating). Joining the entries into one string let an
-    // entry ending in an unterminated quote or trailing backslash swallow —
-    // and thereby mask — the next entry's destructive command, so instead the
-    // first non-allow entry publishes exactly the protocol response the
-    // primary would have, naming that entry's command.
-    for (batch_command, batch_dialect) in &additional_commands {
-        if matches!(
-            evaluate_hook_command(
-                &eval_context,
-                batch_command,
-                *batch_dialect,
-                &mut history_writer,
-                false,
-            ),
-            HookCommandOutcome::Responded
-        ) {
-            return;
+    if let Some(outcome) = decisive {
+        publish_decisive_response(&eval_context, outcome, &mut history_writer);
+    } else if let Some(entry) = primary_allow_row {
+        // All-allow request: record exactly one history Allow row, for the
+        // primary command, matching the single-command flow.
+        if let Some(writer) = history_writer.as_ref() {
+            writer.log(*entry);
         }
     }
 }
@@ -1379,6 +1540,33 @@ mod tests {
             "reason: {reason}"
         );
         assert!(reason.contains("hook_timeout_ms"), "reason: {reason}");
+    }
+
+    #[test]
+    fn decisive_precedence_is_deny_indeterminate_ask_warn_allow() {
+        // The batch-response selection must escalate in exactly this order;
+        // anything weaker lets a low-severity entry mask a stronger one
+        // (the confirmed fail-open was a Warn entry ending the request
+        // before a destructive sibling was evaluated).
+        assert!(deny_family_rank(DecisionMode::Deny) > RANK_INDETERMINATE);
+        assert!(RANK_INDETERMINATE > deny_family_rank(DecisionMode::Ask));
+        assert!(deny_family_rank(DecisionMode::Ask) > deny_family_rank(DecisionMode::Warn));
+        assert!(deny_family_rank(DecisionMode::Warn) > RANK_ALLOW);
+        // Log-mode entries never become response candidates.
+        assert_eq!(deny_family_rank(DecisionMode::Log), RANK_ALLOW);
+
+        // Both indeterminate flavors share the tier between Deny and Ask.
+        let oversized = ResolvedCommandOutcome::OversizedCommand { command_len: 99 };
+        let exhausted = ResolvedCommandOutcome::DeadlineExhausted {
+            command: "echo hi".to_string(),
+            stage: "evaluation",
+        };
+        assert_eq!(outcome_rank(&oversized), RANK_INDETERMINATE);
+        assert_eq!(outcome_rank(&exhausted), RANK_INDETERMINATE);
+        assert_eq!(
+            outcome_rank(&ResolvedCommandOutcome::Allow(None)),
+            RANK_ALLOW
+        );
     }
 
     mod top_level_dispatch_tests {

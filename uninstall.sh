@@ -1119,7 +1119,7 @@ report_unconfigure() {
     if [ -n "$output" ]; then
         printf '%s\n' "$output" | grep -v '^removed$' || true
     fi
-    if printf '%s\n' "$output" | grep -q "removed"; then
+    if printf '%s\n' "$output" | grep -q '^removed$'; then
         ok "Removed $label"
     fi
 }

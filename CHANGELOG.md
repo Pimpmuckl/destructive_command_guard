@@ -13,6 +13,51 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## Unreleased
 
+## [v0.9.2](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.9.2) -- 2026-08-02 [Release]
+
+### Fixed
+
+A second adversarial review pass over the v0.9.1 fixes (three reviewers,
+A/B-probed against the released binaries on both the all-dialect and real
+hook-path evaluation routes) surfaced and closed another round:
+
+- **A Warn-mode batch entry no longer masks later entries.** The per-entry
+  `toolCalls` evaluation responded at the first non-allow outcome, so a
+  Warn-mode entry (e.g. `git stash drop`) ended the request and every later
+  entry — including catastrophic ones — was silently allowed. The hook now
+  resolves every entry first and publishes exactly one response chosen by
+  precedence (Deny > Indeterminate > Ask > Warn > Allow), which also removes
+  a latent two-JSON-document protocol-corruption risk.
+- **A batch no longer hides destructive sibling fields.** A `toolCalls`
+  envelope that also carried a destructive `tool_input` or `tool_args`
+  command evaluated only the batch; the sibling commands are now appended as
+  additional entries.
+- **A non-shell-only batch no longer hijacks other agents' wire shapes.**
+  Any non-empty `toolCalls` array forced the Claude-compatible response, so
+  a Gemini/Hermes/Grok/Codex payload carrying a `readFile`-style batch got a
+  deny its parser drops; the Agent Host branch now requires a shell entry.
+- **mise is modeled at its real grammar.** Global flags before the
+  subcommand (`mise -v exec -- …`) bypassed the wrapper model entirely, and
+  post-subcommand flags outside the modeled six bailed into the argv-data
+  blind spot; both engines now share one option table (globals, booleans,
+  value-takers, glued `--opt=value`) sourced in `normalize`, closing the
+  known destructive-wrapped-command shapes on the Posix hook path.
+- **Constant-propagation hazard scan hardened.** `while read f`,
+  `{ read f; }`, `command read f`, `if read f`, `getopts`, `select`, and a
+  changed `IFS` all rebind or re-split variables invisibly to the first-word
+  scan and now refuse the proof; the `NAME[`/`NAME=` scan requires a real
+  word boundary so a regex class like `conf[ig]` or a jq program like
+  `.n[0]` no longer reads as a mutation of a short variable; glob-bearing
+  values are rejected only when a use site is unquoted (`f='a[b]'; mv "$f"
+  d/` allows again).
+- **Oversized single commands no longer construct history machinery.** The
+  v0.9.1 refactor moved the oversized refusal after history-writer setup, so
+  an oversized payload created the database and worker thread; the check is
+  back before construction with byte-identical output.
+- **install.ps1 quotes the Copilot hook binary path** (spaced Windows
+  profiles word-split at execution — the Unix side was fixed in v0.9.1), and
+  the uninstaller's success detection anchors its machine marker.
+
 ## [v0.9.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.9.1) -- 2026-08-02 [Release]
 
 ### Fixed

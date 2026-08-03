@@ -1259,23 +1259,85 @@ fn busybox_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> Op
     (!applet.starts_with('-')).then_some(1)
 }
 
-/// `mise exec [TOOL@VERSION]... [--] <command>...` (and the `mise x` alias)
-/// runs its trailing argv as a command (issue #257).
+/// A mise option that consumes the following token as its value. Shared with
+/// the sanitizer's `MiseExec` wrapper state so the two engines cannot
+/// diverge (v0.9.1 review). When a flag's arity is uncertain, model it as
+/// value-taking only when documented so: a boolean flag wrongly modeled as
+/// value-taking would swallow the real command word (a false negative),
+/// while a value-taking flag wrongly modeled as boolean merely evaluates the
+/// value as extra command text (a false positive).
+#[must_use]
+pub(crate) fn mise_option_takes_separate_value(word: &str) -> bool {
+    matches!(
+        word,
+        "-C" | "--cd" | "-E" | "--env" | "-j" | "--jobs" | "-P" | "--profile" | "--allow-net"
+    )
+}
+
+/// A mise flag (global or `exec`) that consumes nothing further, plus glued
+/// `--opt=value` forms.
+#[must_use]
+pub(crate) fn mise_flag_consumes_nothing(word: &str) -> bool {
+    word.strip_prefix("--")
+        .is_some_and(|rest| rest.contains('='))
+        || matches!(
+            word,
+            "--raw"
+                | "-v"
+                | "--verbose"
+                | "-q"
+                | "--quiet"
+                | "-y"
+                | "--yes"
+                | "-n"
+                | "--no"
+                | "--locked"
+                | "--silent"
+                | "--debug"
+                | "--trace"
+                | "--deny-net"
+                | "--deny-all"
+                | "--no-deps"
+                | "--fresh-env"
+        )
+}
+
+/// `mise [GLOBAL FLAGS] exec [TOOL@VERSION]... [--] <command>...` (and the
+/// `mise x` alias) runs its trailing argv as a command (issue #257).
 ///
-/// In mise's grammar the wrapped command starts at the first bare word (no
-/// `@`, not `-`-leading) or after an explicit `--`; a *later* `--` belongs
-/// to the wrapped command's own argv (e.g. a git pathspec separator), so the
-/// scan must never run past a bare word (v0.9.0 review: scanning to the
-/// first `--` anywhere stripped `mise exec rm -rf / -- ok` down to `ok`).
-/// Options with modeled arity (`-C/--cd`, `-E/--env`, `-j/--jobs`) skip
-/// their value; an unknown `-`-leading option bails rather than guessing
-/// whether the following word is its value or the command.
+/// Global flags may precede the subcommand (`mise -v exec -- cmd` — v0.9.1
+/// review false negative: the subcommand was only recognized at argv index
+/// 1). The wrapped command starts at the first bare word (no `@`, not
+/// `-`-leading) or after an explicit `--`; a *later* `--` belongs to the
+/// wrapped command's own argv (e.g. a git pathspec separator), so the scan
+/// must never run past a bare word. An unknown `-`-leading option bails
+/// rather than guessing whether the following word is its value or the
+/// command; `-c/--command` (an inline shell string) also bails.
 fn mise_exec_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> Option<usize> {
-    let subcommand = wrapper_word(command, tokens, 1)?;
+    let mut index = 1usize;
+    let subcommand = loop {
+        let word = wrapper_word(command, tokens, index)?;
+        if wrapper_terminal_option(&word) {
+            return None;
+        }
+        if mise_option_takes_separate_value(&word) {
+            wrapper_word(command, tokens, index + 1)?;
+            index += 2;
+            continue;
+        }
+        if mise_flag_consumes_nothing(&word) {
+            index += 1;
+            continue;
+        }
+        if word.starts_with('-') {
+            return None;
+        }
+        break word;
+    };
     if subcommand != "exec" && subcommand != "x" {
         return None;
     }
-    let mut index = 2usize;
+    index += 1;
     while let Some(word) = wrapper_word(command, tokens, index) {
         if word == "--" {
             return (index + 1 < tokens.len()).then_some(index + 1);
@@ -1283,29 +1345,19 @@ fn mise_exec_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> 
         if wrapper_terminal_option(&word) {
             return None;
         }
-        if matches!(
-            word.as_str(),
-            "-C" | "--cd" | "-E" | "--env" | "-j" | "--jobs"
-        ) {
+        if mise_option_takes_separate_value(&word) {
             wrapper_word(command, tokens, index + 1)?;
             index += 2;
             continue;
         }
+        if mise_flag_consumes_nothing(&word) {
+            index += 1;
+            continue;
+        }
         if word.starts_with('-') {
-            if word
-                .strip_prefix("--")
-                .is_some_and(|rest| rest.contains('='))
-                || matches!(
-                    word.as_str(),
-                    "--raw" | "-v" | "--verbose" | "-q" | "--quiet"
-                )
-            {
-                // Glued `--opt=value` forms and known flags consume nothing.
-                index += 1;
-                continue;
-            }
-            // Unknown option: its arity is unmodeled, so the next word could
-            // be either its value or the command. Bail rather than guess.
+            // Unknown option (including `-c/--command`, whose payload is an
+            // inline shell string): arity/semantics unmodeled — bail rather
+            // than guess.
             return None;
         }
         if word.contains('@') {
@@ -1314,7 +1366,7 @@ fn mise_exec_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> 
             continue;
         }
         // First bare word: the wrapped command starts here.
-        return (index < tokens.len()).then_some(index);
+        return Some(index);
     }
     None
 }
@@ -4930,6 +4982,33 @@ mod tests {
         // Unknown options bail: the next word could be their value.
         assert_eq!(
             strip_posix_execution_frontend("mise exec -p echo rm -rf /"),
+            None
+        );
+        // Global flags precede the subcommand (v0.9.1 review).
+        assert_eq!(
+            strip_posix_execution_frontend("mise -v exec -- git status"),
+            Some(("git status", "mise-exec"))
+        );
+        assert_eq!(
+            strip_posix_execution_frontend("mise --cd /tmp exec git status"),
+            Some(("git status", "mise-exec"))
+        );
+        assert_eq!(
+            strip_posix_execution_frontend("mise -X exec -- git status"),
+            None
+        );
+        // Known boolean flags and value-taking flags after the subcommand.
+        assert_eq!(
+            strip_posix_execution_frontend("mise exec -y git status"),
+            Some(("git status", "mise-exec"))
+        );
+        assert_eq!(
+            strip_posix_execution_frontend("mise exec --allow-net github.com git status"),
+            Some(("git status", "mise-exec"))
+        );
+        // `-c/--command` carries an inline shell string; never strip past it.
+        assert_eq!(
+            strip_posix_execution_frontend("mise exec -c \"echo hi\""),
             None
         );
         // Non-exec subcommands never wrap a command.

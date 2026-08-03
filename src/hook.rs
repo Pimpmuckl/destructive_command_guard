@@ -599,10 +599,20 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
     // consumes Claude-shaped hook output through its Claude-hooks
     // compatibility layer (#184), so the Claude-compatible deny payload is
     // the documented answer shape.
+    //
+    // The branch is gated on the batch actually containing a SHELL entry —
+    // the same [`is_batch_shell_call`] predicate extraction and
+    // [`is_shell_hook_candidate`] use. A `toolCalls` array carrying only
+    // non-shell entries (`readFile`, `editFile`, …) is not proof of the Agent
+    // Host: another agent's envelope can carry one while its real shell
+    // command sits in `tool_input`, and answering that payload in Claude
+    // shape would hand Gemini/Hermes/Grok/Codex a deny document their parsers
+    // drop (a silent fail-open). Such a batch falls through to the ordinary
+    // markers below.
     if input
         .tool_calls
         .as_ref()
-        .is_some_and(|calls| !calls.is_empty())
+        .is_some_and(|calls| calls.iter().any(is_batch_shell_call))
     {
         return HookProtocol::ClaudeCompatible;
     }
@@ -1012,8 +1022,15 @@ pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCo
     // tokenization, masking its destructive command from the evaluator
     // (fail-open). The first extracted command is the primary; the rest ride
     // along in `additional_commands` for the hook driver to evaluate
-    // independently. A singular `toolCall` arriving alongside the batch is
-    // appended as one more entry so it cannot hide behind the plural field.
+    // independently.
+    //
+    // Every OTHER command-bearing field of the same envelope is appended as a
+    // further entry: a singular `toolCall`, `tool_input.command`, and
+    // `tool_args`. Returning on the batch alone let a destructive sibling in
+    // those fields ride along unevaluated — e.g. `{"tool_name":"Bash",
+    // "tool_input":{"command":"rm -rf /"},"toolCalls":[{"name":"bash",
+    // "args":"{\"command\":\"ls -la\"}"}]}` was silently allowed because the
+    // benign batch entry answered for the whole payload.
     if let Some(calls) = input.tool_calls.as_ref() {
         let mut commands: Vec<(String, ShellDialect)> = Vec::new();
         for call in calls {
@@ -1028,6 +1045,20 @@ pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCo
             if let Some(command) = extract_command_from_tool_call(tool_call) {
                 commands.push((command, dialect));
             }
+        }
+        if let Some(command) = input
+            .tool_input
+            .as_ref()
+            .and_then(extract_command_from_tool_input)
+        {
+            commands.push((command, dialect));
+        }
+        if let Some(command) = input
+            .tool_args
+            .as_ref()
+            .and_then(extract_command_from_tool_args)
+        {
+            commands.push((command, dialect));
         }
         let mut entries = commands.into_iter();
         if let Some((command, primary_dialect)) = entries.next() {
@@ -3615,6 +3646,106 @@ mod tests {
         .unwrap();
         assert!(!is_shell_hook_candidate(&non_shell));
         assert_eq!(extract_command_with_context(&non_shell), None);
+    }
+
+    #[test]
+    fn test_tool_input_and_tool_args_siblings_ride_along_with_a_batch() {
+        // Regression: extraction returned as soon as the batch yielded one
+        // command, so a destructive `tool_input`/`tool_args` sibling in the
+        // same envelope was never evaluated (silent allow).
+        let with_tool_input: HookInput = serde_json::from_str(
+            r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /"},
+                "toolCalls":[{"name":"bash","args":"{\"command\":\"ls -la\"}"}]}"#,
+        )
+        .unwrap();
+        let extracted = extract_command_with_context(&with_tool_input).expect("must extract");
+        assert_eq!(extracted.command, "ls -la");
+        assert_eq!(
+            extracted.additional_commands,
+            vec![("rm -rf /".to_string(), ShellDialect::Posix)],
+            "the tool_input sibling must ride along as another entry"
+        );
+
+        let with_tool_args: HookInput = serde_json::from_str(
+            r#"{"toolName":"bash","toolArgs":"{\"command\":\"rm -rf /\"}",
+                "toolCalls":[{"name":"bash","args":{"command":"ls -la"}}]}"#,
+        )
+        .unwrap();
+        let extracted = extract_command_with_context(&with_tool_args).expect("must extract");
+        assert_eq!(extracted.command, "ls -la");
+        assert_eq!(
+            extracted.additional_commands,
+            vec![("rm -rf /".to_string(), ShellDialect::Posix)],
+            "the tool_args sibling must ride along as another entry"
+        );
+    }
+
+    #[test]
+    fn test_non_shell_only_batch_leaves_protocol_detection_to_other_markers() {
+        // Regression: the toolCalls branch fired on ANY non-empty array, so a
+        // single non-shell entry rerouted another agent's payload into Claude
+        // wire shape — a deny document those parsers drop (fail-open).
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _no_posit_env = EnvVarGuard::remove("PA_PROJECT_DIR");
+        let _no_claude_env = EnvVarGuard::remove("CLAUDE_CODE");
+        let _no_claude_session_env = EnvVarGuard::remove("CLAUDE_SESSION_ID");
+
+        let decoy = r#""toolCalls":[{"name":"readFile","args":{"path":"/w/a.txt"}}]"#;
+        let cases = [
+            (
+                format!(
+                    r#"{{"hook_event_name":"BeforeTool","tool_name":"run_shell_command",
+                        "tool_input":{{"command":"rm -rf /"}},{decoy}}}"#
+                ),
+                HookProtocol::Gemini,
+            ),
+            (
+                format!(
+                    r#"{{"hook_event_name":"pre_tool_call","tool_name":"terminal",
+                        "tool_input":{{"command":"rm -rf /"}},{decoy}}}"#
+                ),
+                HookProtocol::Hermes,
+            ),
+            (
+                format!(
+                    r#"{{"hookEventName":"pre_tool_use","toolName":"run_terminal_cmd",
+                        "toolInput":{{"command":"rm -rf /"}},{decoy}}}"#
+                ),
+                HookProtocol::Grok,
+            ),
+            (
+                format!(
+                    r#"{{"hook_event_name":"PreToolUse","tool_name":"bash","turn_id":"turn-1",
+                        "tool_input":{{"command":"rm -rf /"}},{decoy}}}"#
+                ),
+                HookProtocol::Codex,
+            ),
+        ];
+
+        for (json, expected) in cases {
+            let input: HookInput = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                detect_protocol(&input),
+                expected,
+                "a non-shell-only batch must not hijack the protocol: {json}"
+            );
+            // The real command still comes from tool_input.
+            let extracted = extract_command_with_context(&input).expect("must extract");
+            assert_eq!(extracted.command, "rm -rf /");
+        }
+
+        // A genuine shell batch still identifies the Agent Host.
+        let shell_batch: HookInput = serde_json::from_str(
+            r#"{"sessionId":"s","toolCalls":[
+                {"name":"readFile","args":{"path":"/w/a.txt"}},
+                {"name":"bash","args":{"command":"ls"}}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            detect_protocol(&shell_batch),
+            HookProtocol::ClaudeCompatible
+        );
     }
 
     #[test]

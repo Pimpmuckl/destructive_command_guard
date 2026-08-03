@@ -19178,6 +19178,7 @@ fn statically_safe_variable_redirect(
             target = rest.trim_start();
         }
     }
+    let target_was_quoted = target.starts_with('"');
     let (token, trailing) = if let Some(rest) = target.strip_prefix('"') {
         let Some(end) = rest.find('"') else {
             return false;
@@ -19209,6 +19210,16 @@ fn statically_safe_variable_redirect(
     let Some(values) = resolved_variable_values(source, segment_ranges, segment_start, name) else {
         return false;
     };
+    // An unquoted target lets a glob-bearing value expand further at run
+    // time (shell-dependent), which the literal benign-path check cannot
+    // cover; double-quoted targets never glob.
+    if !target_was_quoted
+        && values
+            .iter()
+            .any(|value| value_expands_when_unquoted(value))
+    {
+        return false;
+    }
     values
         .iter()
         .all(|value| resolved_redirect_target_is_benign(&format!("{value}{suffix}")))
@@ -19316,7 +19327,7 @@ fn resolved_variable_values(
                 continue;
             }
         }
-        let first = segment.split_ascii_whitespace().next().unwrap_or("");
+        let first = hazard_first_word(segment);
         let may_mutate_shell_variables = matches!(
             first,
             "read"
@@ -19333,12 +19344,38 @@ fn resolved_variable_values(
                 | "readarray"
                 | "unset"
                 | "printf"
+                | "getopts"
+                | "select"
         );
-        if may_mutate_shell_variables || segment_text_may_assign(segment, name) {
+        // A changed IFS alters how an unquoted use word-splits, which the
+        // substitution proof cannot reproduce (v0.9.1 review).
+        if may_mutate_shell_variables
+            || segment_text_may_assign(segment, name)
+            || segment_text_may_assign(segment, "IFS")
+        {
             return None;
         }
     }
     values
+}
+
+/// First word of a segment with command-position prefixes stripped:
+/// control-flow openers (`while read f`), grouping (`{ read f`), negation,
+/// and the `command`/`builtin` wrappers all still run the mutating word in
+/// the parent shell (v0.9.1 review false negative — `while read f; …` was
+/// invisible to the first-word hazard scan).
+fn hazard_first_word(segment: &str) -> &str {
+    let mut words = segment.split_ascii_whitespace();
+    loop {
+        match words.next() {
+            Some(
+                "do" | "then" | "else" | "while" | "until" | "if" | "elif" | "{" | "!" | "command"
+                | "builtin" | "time",
+            ) => {}
+            Some(word) => return word,
+            None => return "",
+        }
+    }
 }
 
 /// Whether a segment range is nested inside another extracted segment (the
@@ -19354,10 +19391,32 @@ fn segment_range_is_nested(segment_ranges: &[(usize, usize)], start: usize, end:
 /// binding scan does not model: plain `NAME=`, append `NAME+=`, or an array
 /// element `NAME[…]=` (bash makes `$NAME` alias element 0, so `f[0]=/etc`
 /// changes what `$f` expands to).
+///
+/// Each occurrence of `NAME` must sit at a word boundary (start of segment
+/// or after a non-identifier byte): a raw substring scan turned ordinary
+/// text like the regex class in `rg "conf[ig]+"` into a mutation of `f`
+/// (v0.9.1 review false positive).
 fn segment_text_may_assign(segment: &str, name: &str) -> bool {
-    segment.contains(&format!("{name}="))
-        || segment.contains(&format!("{name}+="))
-        || segment.contains(&format!("{name}["))
+    let bytes = segment.as_bytes();
+    let mut search_from = 0usize;
+    while let Some(relative) = segment[search_from..].find(name) {
+        let start = search_from + relative;
+        // A shell assignment word can only start the segment or follow
+        // whitespace or a separator/opener — `.n[0]` in a jq program or
+        // `conf[ig]` in a regex is data, not an assignment.
+        let boundary = start == 0
+            || bytes.get(start - 1).is_some_and(|b| {
+                b.is_ascii_whitespace() || matches!(b, b';' | b'|' | b'&' | b'(' | b'{')
+            });
+        if boundary {
+            let after = &segment[start + name.len()..];
+            if after.starts_with('=') || after.starts_with("+=") || after.starts_with('[') {
+                return true;
+            }
+        }
+        search_from = start + 1;
+    }
+    false
 }
 
 /// Strip the reserved words that can directly precede a command inside
@@ -19453,12 +19512,17 @@ fn literal_assignment_value(raw: &str) -> Option<String> {
         }
         raw.to_string()
     };
-    // Glob metacharacters survive quoting in the *assignment* but expand when
-    // the variable is later used unquoted (pathname expansion runs after
-    // variable expansion), so `f='/et?'` can resolve to `/etc` at use time —
-    // a literal proof cannot cover that (issue #242 review).
-    (!value.is_empty() && !value.starts_with('~') && !value.contains(['*', '?', '[']))
-        .then_some(value)
+    (!value.is_empty() && !value.starts_with('~')).then_some(value)
+}
+
+/// Whether a proven value could expand further when the variable is used
+/// *unquoted*: pathname expansion runs after variable expansion, so
+/// `f='/et?'` can resolve to `/etc` at an unquoted use site. Double-quoted
+/// uses never glob, so callers apply this only when a use is unquoted
+/// (v0.9.1 review: rejecting glob values unconditionally denied benign
+/// quoted uses like `f='a[b]'; mv "$f" d/`).
+fn value_expands_when_unquoted(value: &str) -> bool {
+    value.contains(['*', '?', '['])
 }
 
 /// Would a *direct literal* redirect to this path be allowed today? Only the
@@ -19507,11 +19571,18 @@ fn parse_leading_posix_variable(token: &str) -> Option<(&str, usize)> {
 /// The single distinct variable name referenced by every `$` in the segment,
 /// provided each `$` begins a plain `$NAME` / `${NAME}` reference. Any other
 /// expansion syntax, or a second distinct name, refuses the proof.
-fn single_posix_variable_reference(segment: &str) -> Option<String> {
+fn single_posix_variable_reference(segment: &str) -> Option<(String, bool)> {
     let bytes = segment.as_bytes();
     let mut name: Option<&str> = None;
+    let mut all_references_double_quoted = true;
+    let mut in_double_quotes = false;
     let mut index = 0usize;
     while index < bytes.len() {
+        if bytes[index] == b'"' {
+            in_double_quotes = !in_double_quotes;
+            index += 1;
+            continue;
+        }
         if bytes[index] != b'$' {
             index += 1;
             continue;
@@ -19521,9 +19592,12 @@ fn single_posix_variable_reference(segment: &str) -> Option<String> {
             Some(existing) if existing != reference => return None,
             _ => name = Some(reference),
         }
+        if !in_double_quotes {
+            all_references_double_quoted = false;
+        }
         index += consumed;
     }
-    name.map(str::to_string)
+    name.map(|name| (name.to_string(), all_references_double_quoted))
 }
 
 /// Replace every `$NAME` / `${NAME}` reference in the segment with `value`.
@@ -19585,13 +19659,24 @@ fn statically_safe_loop_variable_mv(
     {
         return false;
     }
-    let Some(name) = single_posix_variable_reference(dialect_segment) else {
+    let Some((name, all_references_double_quoted)) =
+        single_posix_variable_reference(dialect_segment)
+    else {
         return false;
     };
     let Some(values) = resolved_variable_values(source, segment_ranges, segment_start, &name)
     else {
         return false;
     };
+    // Any unquoted use site lets a glob-bearing value expand further at run
+    // time, which the textual substitution cannot reproduce.
+    if !all_references_double_quoted
+        && values
+            .iter()
+            .any(|value| value_expands_when_unquoted(value))
+    {
+        return false;
+    }
     values.iter().all(|value| {
         if deadline.is_some_and(crate::perf::Deadline::is_exceeded) {
             return false;
@@ -31408,15 +31493,25 @@ mod tests {
     #[test]
     fn append_array_and_glob_assignments_refuse_the_variable_proof() {
         // `+=` and array-element assignment mutate `$NAME` without matching
-        // the plain `NAME=` scan, and quoted glob characters expand at
-        // unquoted use time — all three must refuse the literal proof
-        // (v0.9.0 review false negatives).
+        // the plain `NAME=` scan; glob-bearing values expand at *unquoted*
+        // use sites; `while read`/`{ read` rebind behind control-flow
+        // prefixes; and a changed IFS alters unquoted word splitting — all
+        // must refuse the literal proof (v0.9.0/v0.9.1 review false
+        // negatives).
         for command in [
             "f=/et; f+=c; mv $f d/",
             "f=a; f[0]=/etc; mv $f d/",
             "f='/et?'; mv $f d/",
             "f='/et*'; mv $f d/",
-            "for f in 'a?' b; do mv \"$f\" d/; done",
+            "for f in 'a?' b; do mv $f d/; done",
+            "f=/tmp/log; while read f; do :; done < in.txt; echo hi > \"$f\"",
+            "f=/tmp/log; while IFS= read -r f; do :; done < in.txt; echo hi > \"$f\"",
+            "f=/tmp/log; { read f; }; echo hi > \"$f\"",
+            "f=/tmp/log; command read f; echo hi > \"$f\"",
+            "f=/tmp/log; if read f; then :; fi; echo hi > \"$f\"",
+            "f=/tmp/log; getopts x f; echo hi > \"$f\"",
+            "IFS=:; f=/etc:x; mv $f d/",
+            "f=aa; while read f; do :; done < in.txt; mv $f d/",
         ] {
             let result = evaluate_with_pack_ids_in_dialect(
                 command,
@@ -31426,6 +31521,32 @@ mod tests {
             assert!(
                 result.is_denied(),
                 "mutating or glob-bearing binding must refuse the proof: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn word_boundary_hazards_and_quoted_glob_uses_stay_allowed() {
+        // The mutation-hazard scan requires `NAME` at a word boundary — a
+        // regex class like `conf[ig]` must not read as mutating `f` — and
+        // glob-bearing values are inert at double-quoted use sites
+        // (v0.9.1 review false positives).
+        for command in [
+            "f=/tmp/log; rg \"conf[ig]+\" .; echo hi > \"$f\"",
+            "f=a; grep -c \"perf[0-9]\" x.txt; mv \"$f\" d/",
+            "f='a[b]'; mv \"$f\" d/",
+            "f='/tmp/a[1].log'; echo hi > \"$f\"",
+            "for f in 'a?' b; do mv \"$f\" d/; done",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "boundary-safe text or quoted glob use must stay allowed: {command:?}: {:?}",
                 result.pattern_info
             );
         }
@@ -31446,6 +31567,15 @@ mod tests {
             "mise exec -p echo rm -rf /",
             "mise exec --cd echo git reset --hard",
             "mise x -p echo rm -rf /",
+            // Global flags precede the subcommand (v0.9.1 review).
+            "mise -v exec -- git reset --hard",
+            "mise -q exec -- git reset --hard",
+            "mise --cd /tmp exec -- git reset --hard",
+            "mise -C /tmp exec git reset --hard",
+            // Known boolean exec flags no longer bail past the command.
+            "mise exec -y git reset --hard",
+            "mise exec --locked git reset --hard",
+            "mise exec --allow-net github.com git reset --hard",
         ] {
             let result = evaluate_with_pack_ids_in_dialect(command, &packs, ShellDialect::Posix);
             assert!(

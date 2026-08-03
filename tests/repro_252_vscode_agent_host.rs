@@ -226,6 +226,82 @@ fn command_line_style_args_keys_extract_in_batch_entries() {
 }
 
 #[test]
+fn tool_input_sibling_of_a_batch_is_appended_as_an_entry() {
+    // Regression: extraction returned on the first batch command, so a
+    // destructive `tool_input` in the same envelope was never evaluated.
+    let input = parse(
+        r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /"},
+            "toolCalls":[{"name":"bash","args":"{\"command\":\"ls -la\"}"}]}"#,
+    );
+    let extracted = extract_command_with_context(&input).expect("must extract");
+    assert_eq!(extracted.command, "ls -la");
+    assert_eq!(
+        extracted.additional_commands,
+        vec![("rm -rf /".to_string(), ShellDialect::Posix)]
+    );
+}
+
+#[test]
+fn tool_args_sibling_of_a_batch_is_appended_as_an_entry() {
+    let input = parse(
+        r#"{"toolName":"bash","toolArgs":"{\"command\":\"rm -rf /\"}",
+            "toolCalls":[{"name":"bash","args":{"command":"ls -la"}}]}"#,
+    );
+    let extracted = extract_command_with_context(&input).expect("must extract");
+    assert_eq!(extracted.command, "ls -la");
+    assert_eq!(
+        extracted.additional_commands,
+        vec![("rm -rf /".to_string(), ShellDialect::Posix)]
+    );
+}
+
+#[test]
+fn non_shell_only_batch_does_not_hijack_another_agents_protocol() {
+    // A `toolCalls` array carrying only non-shell entries is not proof of the
+    // VS Code Agent Host; answering such a payload in Claude shape hands the
+    // real agent a deny document its parser drops.
+    let gemini = parse(
+        r#"{"hook_event_name":"BeforeTool","tool_name":"run_shell_command",
+            "tool_input":{"command":"rm -rf /"},
+            "toolCalls":[{"name":"readFile","args":{"path":"/w/a.txt"}}]}"#,
+    );
+    assert_eq!(detect_protocol(&gemini), HookProtocol::Gemini);
+
+    let hermes = parse(
+        r#"{"hook_event_name":"pre_tool_call","tool_name":"terminal",
+            "tool_input":{"command":"rm -rf /"},
+            "toolCalls":[{"name":"readFile","args":{"path":"/w/a.txt"}}]}"#,
+    );
+    assert_eq!(detect_protocol(&hermes), HookProtocol::Hermes);
+
+    let grok = parse(
+        r#"{"hookEventName":"pre_tool_use","toolName":"run_terminal_cmd",
+            "toolInput":{"command":"rm -rf /"},
+            "toolCalls":[{"name":"readFile","args":{"path":"/w/a.txt"}}]}"#,
+    );
+    assert_eq!(detect_protocol(&grok), HookProtocol::Grok);
+
+    let codex = parse(
+        r#"{"hook_event_name":"PreToolUse","tool_name":"bash","turn_id":"turn-1",
+            "tool_input":{"command":"rm -rf /"},
+            "toolCalls":[{"name":"readFile","args":{"path":"/w/a.txt"}}]}"#,
+    );
+    assert_eq!(detect_protocol(&codex), HookProtocol::Codex);
+
+    // A batch that does contain a shell entry still identifies the Agent Host.
+    let shell_batch = parse(
+        r#"{"sessionId":"s","toolCalls":[
+            {"name":"readFile","args":{"path":"/w/a.txt"}},
+            {"name":"bash","args":{"command":"ls"}}
+        ]}"#,
+    );
+    assert_eq!(
+        detect_protocol(&shell_batch),
+        HookProtocol::ClaudeCompatible
+    );
+}
+
+#[test]
 fn singular_tool_call_alongside_batch_is_appended_as_an_entry() {
     let input = parse(
         r#"{
@@ -309,10 +385,11 @@ fn dcg_binary() -> std::path::PathBuf {
     path
 }
 
-/// Spawn the real dcg binary in hook mode with a hermetic environment and
-/// return its output. Isolated HOME/TMPDIR so parallel tests never share
-/// history or pending-exception state (mirrors codex_hook_protocol.rs).
-fn run_hook(payload: &str) -> std::process::Output {
+/// Spawn the real dcg binary in hook mode with a hermetic environment (plus
+/// `extra_env`) and return its output. Isolated HOME/TMPDIR so parallel tests
+/// never share history or pending-exception state (mirrors
+/// codex_hook_protocol.rs).
+fn run_hook_with_env(payload: &str, extra_env: &[(&str, &str)]) -> std::process::Output {
     use std::io::Write as _;
     use std::process::{Command, Stdio};
 
@@ -321,7 +398,8 @@ fn run_hook(payload: &str) -> std::process::Output {
     std::fs::create_dir_all(&tmp).expect("failed to create hermetic TMPDIR");
     let system_path = std::env::var("PATH").unwrap_or_default();
 
-    let mut child = Command::new(dcg_binary())
+    let mut command = Command::new(dcg_binary());
+    command
         .env_clear()
         .env("PATH", &system_path)
         .env("HOME", home.path())
@@ -331,7 +409,11 @@ fn run_hook(payload: &str) -> std::process::Output {
         .env("TMP", &tmp)
         .env("NO_COLOR", "1")
         .env("DCG_HOOK_TIMEOUT_MS", "5000")
-        .env("DCG_HEREDOC_TIMEOUT_MS", "5000")
+        .env("DCG_HEREDOC_TIMEOUT_MS", "5000");
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -345,6 +427,11 @@ fn run_hook(payload: &str) -> std::process::Output {
         .write_all(payload.as_bytes())
         .expect("failed to write hook payload");
     child.wait_with_output().expect("failed to wait for dcg")
+}
+
+/// [`run_hook_with_env`] with no extra environment.
+fn run_hook(payload: &str) -> std::process::Output {
+    run_hook_with_env(payload, &[])
 }
 
 /// Assert a Claude-shaped deny on stdout with exit code 0.
@@ -423,4 +510,202 @@ fn tool_calls_object_shape_payload_is_denied_via_tool_input() {
     let payload =
         r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /"},"toolCalls":{"0":{}}}"#;
     assert_denied(&run_hook(payload), "toolCalls-as-object payload");
+}
+
+#[test]
+fn tool_input_decoy_batch_is_denied_end_to_end() {
+    // A benign batch entry must not answer for a destructive `tool_input`
+    // sibling in the same envelope.
+    let payload = r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /"},
+        "toolCalls":[{"name":"bash","args":"{\"command\":\"ls -la\"}"}]}"#;
+    assert_denied(&run_hook(payload), "tool_input decoy batch");
+}
+
+#[test]
+fn tool_args_decoy_batch_is_denied_end_to_end() {
+    let payload = r#"{"toolName":"bash","toolArgs":"{\"command\":\"rm -rf /\"}",
+        "toolCalls":[{"name":"bash","args":{"command":"ls -la"}}]}"#;
+    assert_denied(&run_hook(payload), "tool_args decoy batch");
+}
+
+#[test]
+fn non_shell_only_batch_keeps_gemini_wire_shape_end_to_end() {
+    // The deny must be Gemini's `{"decision":"deny",…}`; a Claude-shaped
+    // answer would be dropped by Gemini's parser (silent fail-open).
+    let payload = r#"{"session_id":"g","cwd":"/w","hook_event_name":"BeforeTool",
+        "tool_name":"run_shell_command","tool_input":{"command":"rm -rf /"},
+        "toolCalls":[{"name":"readFile","args":{"path":"/w/a.txt"}}]}"#;
+    let output = run_hook(payload);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "Gemini deny uses exit 0.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("\"decision\":\"deny\""),
+        "must keep Gemini's decision shape.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("hookSpecificOutput"),
+        "must NOT be answered in Claude wire shape.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+#[test]
+fn oversized_primary_command_creates_no_history_database() {
+    // The refusal must happen before the history writer exists: a payload dcg
+    // declines to evaluate must not create the database, spawn the worker
+    // thread, or install a shutdown handler.
+    let dir = tempfile::tempdir().expect("failed to create temp dir");
+    let config_path = dir.path().join("dcg-config.toml");
+    std::fs::write(&config_path, "[general]\nmax_command_bytes = 64\n")
+        .expect("failed to write DCG_CONFIG file");
+    let config_arg = config_path.to_str().expect("utf-8 path").to_string();
+
+    let oversized_db = dir.path().join("oversized-history.db");
+    let payload = format!(
+        r#"{{"tool_name":"Bash","tool_input":{{"command":"echo {}"}}}}"#,
+        "a".repeat(120)
+    );
+    let output = run_hook_with_env(
+        &payload,
+        &[
+            ("DCG_CONFIG", config_arg.as_str()),
+            ("DCG_HISTORY_ENABLED", "true"),
+            ("DCG_HISTORY_DB", oversized_db.to_str().expect("utf-8 path")),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("exceeds limit"),
+        "the oversized refusal must still be published.\nstdout: {stdout}"
+    );
+    assert!(
+        !oversized_db.exists(),
+        "an unevaluated oversized command must not create the history database"
+    );
+
+    // Control: an evaluated command with the same settings DOES create it,
+    // proving the assertion above is meaningful rather than vacuous.
+    let control_db = dir.path().join("control-history.db");
+    let control = run_hook_with_env(
+        r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /"}}"#,
+        &[
+            ("DCG_CONFIG", config_arg.as_str()),
+            ("DCG_HISTORY_ENABLED", "true"),
+            ("DCG_HISTORY_DB", control_db.to_str().expect("utf-8 path")),
+        ],
+    );
+    assert!(
+        String::from_utf8_lossy(&control.stdout).contains("\"deny\""),
+        "control payload must be denied"
+    );
+    assert!(
+        control_db.exists(),
+        "control: an evaluated command must create the history database"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Batch decisive-response precedence (Deny > Indeterminate > Ask > Warn >
+// Log/Allow). Regression for the confirmed fail-open where a Warn-mode entry
+// (core.git:stash-drop resolves to warn by default) answered the request
+// immediately and later destructive entries were never evaluated.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn warn_entry_then_destructive_entry_batch_is_denied() {
+    // Pre-fix behavior: the stash-drop warn ended the request (exit 0, warn
+    // on stderr, empty stdout) and `rm -rf /` was silently allowed.
+    let payload = r#"{"sessionId":"s","cwd":"/w","toolCalls":[
+        {"name":"bash","args":"{\"command\":\"git stash drop\"}"},
+        {"name":"bash","args":"{\"command\":\"rm -rf /\"}"}
+    ]}"#;
+    let output = run_hook(payload);
+    assert_denied(&output, "warn-then-destructive batch");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("dcg WARNING:"),
+        "exactly one response: the deny must not be accompanied by the \
+         non-decisive warn.\nstderr: {stderr}"
+    );
+}
+
+#[test]
+fn destructive_entry_then_warn_entry_batch_is_denied() {
+    let payload = r#"{"sessionId":"s","cwd":"/w","toolCalls":[
+        {"name":"bash","args":"{\"command\":\"rm -rf /\"}"},
+        {"name":"bash","args":"{\"command\":\"git stash drop\"}"}
+    ]}"#;
+    assert_denied(&run_hook(payload), "destructive-then-warn batch");
+}
+
+#[test]
+fn all_warn_batch_emits_the_warn_response_exactly_once() {
+    let payload = r#"{"sessionId":"s","cwd":"/w","toolCalls":[
+        {"name":"bash","args":"{\"command\":\"git stash drop\"}"},
+        {"name":"bash","args":"{\"command\":\"git stash drop stash@{1}\"}"}
+    ]}"#;
+    let output = run_hook(payload);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "warn is non-blocking; exit must be 0.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "Claude-shaped warn is stdout-silent (no blocking opinion).\nstdout: {stdout}"
+    );
+    assert_eq!(
+        stderr.matches("dcg WARNING:").count(),
+        1,
+        "an all-warn batch must publish exactly one warn response.\nstderr: {stderr}"
+    );
+}
+
+#[test]
+fn indeterminate_entry_outranks_a_warn_entry() {
+    // Entry 1 resolves to warn; entry 2 exceeds max_command_bytes (pinned
+    // small via DCG_CONFIG) and cannot be evaluated. The indeterminate answer
+    // must win over the warn — an unevaluated entry may hide anything, so a
+    // conservative "ask" beats a non-blocking warn.
+    let config_dir = tempfile::tempdir().expect("failed to create config dir");
+    let config_path = config_dir.path().join("dcg-config.toml");
+    std::fs::write(&config_path, "[general]\nmax_command_bytes = 64\n")
+        .expect("failed to write DCG_CONFIG file");
+
+    let long_arg = "a".repeat(80);
+    let payload = format!(
+        r#"{{"sessionId":"s","cwd":"/w","toolCalls":[
+            {{"name":"bash","args":{{"command":"git stash drop"}}}},
+            {{"name":"bash","args":{{"command":"echo {long_arg}"}}}}
+        ]}}"#
+    );
+    let output = run_hook_with_env(
+        &payload,
+        &[("DCG_CONFIG", config_path.to_str().expect("utf-8 path"))],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "indeterminate answers use exit 0.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("\"permissionDecision\":\"ask\""),
+        "the oversized entry must produce the conservative ask.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("exceeds limit"),
+        "the indeterminate reason must name the size limit.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("dcg WARNING:"),
+        "the non-decisive warn must not also be published.\nstderr: {stderr}"
+    );
 }

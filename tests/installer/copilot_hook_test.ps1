@@ -18,6 +18,9 @@ function New-TempRepo {
     $r
 }
 $dcgPath = 'C:\Users\me\.local\bin\dcg.exe'
+# The installer writes the shell-quoted form so spaced profile paths survive
+# shell-form hook execution (v0.9.1 review).
+$quotedDcgPath = '"' + $dcgPath + '"'
 
 Write-Host "Test 1: create (bash+powershell+cwd+timeoutSec) + idempotent"
 $r1 = New-TempRepo
@@ -29,8 +32,8 @@ try {
     $p = Get-Content -Raw $f | ConvertFrom-Json
     Check ($p.version -eq 1) "version=1"
     $e = $p.hooks.preToolUse[0]
-    Check ($e.bash -eq $dcgPath) "bash field = dcg path"
-    Check ($e.powershell -eq $dcgPath) "powershell field = dcg path (Windows support)"
+    Check ($e.bash -eq $quotedDcgPath) "bash field = quoted dcg path"
+    Check ($e.powershell -eq $quotedDcgPath) "powershell field = quoted dcg path (Windows support)"
     Check ($e.cwd -eq '.') "cwd = ."
     Check ($e.timeoutSec -eq 30) "timeoutSec = 30"
     $s2 = Configure-CopilotHook -DcgPath $dcgPath -CopilotHome $r1
@@ -54,7 +57,7 @@ try {
     $s = Configure-CopilotHook -DcgPath $dcgPath -CopilotHome $r2
     Check ($s -eq 'merged') "returns 'merged' (got '$s')"
     $p = Get-Content -Raw (Join-Path $hookDir 'dcg.json') | ConvertFrom-Json
-    Check ($p.hooks.preToolUse[0].bash -eq $dcgPath) "canonical dcg entry prepended (first)"
+    Check ($p.hooks.preToolUse[0].bash -eq $quotedDcgPath) "canonical dcg entry prepended (first)"
     # the entry that had bash=dcg + powershell=my-formatter: bash stripped, powershell kept
     $kept = @($p.hooks.preToolUse | Where-Object { $_.powershell -eq 'my-formatter' })[0]
     Check ($null -ne $kept) "entry with non-dcg powershell preserved"
@@ -101,7 +104,7 @@ try {
     $preKeys = @($p.hooks.PSObject.Properties.Name | Where-Object { $_.ToLowerInvariant() -eq 'pretooluse' })
     Check (($preKeys.Count -eq 1) -and ($preKeys[0] -ceq 'PreToolUse')) "exactly one hooks key, file's PascalCase spelling adopted (got: $($preKeys -join ', '))"
     $entries = @($p.hooks.PSObject.Properties['PreToolUse'].Value)
-    Check ($entries[0].bash -eq $dcgPath) "dcg entry prepended under the existing key"
+    Check ($entries[0].bash -eq $quotedDcgPath) "dcg entry prepended under the existing key"
     Check (@($entries | Where-Object { $_.bash -eq 'audit-pretool' }).Count -eq 1) "non-dcg entry intact"
     $s2 = Configure-CopilotHook -DcgPath $dcgPath -CopilotHome $r4
     Check ($s2 -eq 'already') "second run is idempotent under the adopted spelling (got '$s2')"

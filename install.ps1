@@ -838,10 +838,15 @@ function Configure-CopilotHook {
   $hookFile = Join-Path $hookDir "dcg.json"
   if (-not (Test-Path $hookDir)) { New-Item -ItemType Directory -Force -Path $hookDir | Out-Null }
 
+  # Quote the binary path: shell-form hooks word-split an unquoted spaced
+  # profile path (C:\Users\John Doe\...) at execution, the same failure the
+  # Unix installer fixed for spaced DEST dirs. Get-DcgCommandName already
+  # recognizes both quoted and legacy-unquoted forms for dedupe/uninstall.
+  $quotedDcgPath = '"' + $DcgPath + '"'
   $desired = [pscustomobject][ordered]@{
     type = "command"
-    bash = $DcgPath
-    powershell = $DcgPath
+    bash = $quotedDcgPath
+    powershell = $quotedDcgPath
     cwd = "."
     timeoutSec = 30
   }
