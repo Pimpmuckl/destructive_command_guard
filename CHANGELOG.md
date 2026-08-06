@@ -11,7 +11,150 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
-## Unreleased
+## [v0.9.4](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.9.4) -- 2026-08-05 [Release]
+
+A correctness and hardening release from a full issue-triage pass. It closes a
+class of fail-closed bypasses in the `#261` init-idiom warn path, restores four
+compose volume/force detections that global flags or combined short-flag
+clusters could slip past, and removes several false positives that were blocking
+ordinary safe workflows. No change to the evaluation hot path's asymptotics; a
+profiling campaign confirmed dcg already runs 35–90× inside its hook budget and
+produced a committed negative-evidence ledger rather than speculative tuning.
+
+### Security
+
+- **`eval`/`source` init-idiom WARN can no longer be used to smuggle a
+  destructive command (#261).** The curated init-idiom downgrade (which lets
+  `eval "$(ssh-agent -s)"` and `source <(kubectl completion bash)` warn instead
+  of hard-deny) was found across four adversarial fresh-eyes rounds to let a
+  destructive command run with only a warning by attaching to, or hiding behind,
+  a curated idiom. The warn is now locked to an allowlist-shaped box: it applies
+  only at command-substitution depth 0 (a curated idiom reached through a nested
+  substitution or heredoc recursion hard-denies at the consumption point), only
+  when the whole command is a single POSIX segment (a trailing `; rm -rf ~` or
+  any multi-segment/nested form keeps the hard denial), and only when the bytes
+  before the `eval`/`source` word are statically inert (no `(` `)`, backtick,
+  `<`, `>`, `|`, `&`, `;`, or newline) — closing the leading-assignment,
+  command-substitution, and process-substitution holes that a denylist kept
+  missing.
+- **Compose volume/force destruction is caught past global flags (#276).**
+  `containers.compose:down-volumes` (and `down-rmi-all`, `rm-volumes`,
+  `rm-force`) required the subcommand to immediately follow `compose`, so the
+  most ordinary dangerous form — `docker compose -f docker-compose.prod.yml
+  down -v`, which destroys named volumes (database data, uploads) — was
+  **allowed**. Each pattern now skips global options and their values with a
+  bounded, option-only walker before the subcommand, without letting a service
+  name or a `-f down.yml` filename value masquerade as the `down`/`rm`
+  subcommand.
+- **Combined short-flag clusters are caught (fresh-eyes finding).** The
+  volume/force guards required a standalone single-flag form, so pflag-style
+  combined clusters slipped through: `docker compose down -vt 5` and
+  `docker compose rm -fsv` remove volumes but were allowed when only
+  `containers.compose` was enabled. The guards now match a `down`/`rm`
+  short-flag cluster containing the target letter, enumerated to each
+  subcommand's real short flags (keeping matching linear — no lookbehind, no
+  ReDoS — and not firing on a `v`/`f` inside a long option like `--verbose`).
+- **Execution-frontend strip bail no longer weakens live hooks (#260).** When
+  an `env`/`nice`/`timeout`-style frontend strip fails on dynamic options, the
+  later `git` words now stay scan-required, so a live PreToolUse hook is never
+  weaker than `dcg test` on the same command.
+
+### Fixed
+
+- **Fixed `xargs`/`sh -c` templates that only consume record fields as data are
+  no longer denied (#272).** Positional-parameter masking now walks the template
+  with quote- and escape-awareness, masking bare `$N`/`${N}` records while still
+  refusing `$@`/`$*` aggregates, `${!indirect}`, `BASH_ARGV`/`ARGC`, and any
+  `${N…}` form with expansion modifiers. Two quote-scanner false negatives were
+  fixed alongside it: an apostrophe inside a double-quoted word can no longer
+  disable subsequent `$N` masking, and ANSI-C `$'…'` strings are skipped
+  atomically so their escaped quotes cannot corrupt quote-state tracking and
+  hide a `$0`.
+- **Safe variable redirects into a same-command `$(mktemp)` are allowed (#275).**
+  A synthetic scratch stand-in proves bare `mktemp` / `mktemp -d` targets
+  (`-d`/`-q` only; not `-p`/`-t`/`-u` or explicit templates), and a literal
+  suffix after the closing quote folds into the proven target so `"$D"/out.log`
+  works — while traversal and non-literal continuations still deny.
+- **Dynamic `git branch` hazards get their own remediation (#274).** An
+  unresolvable dynamic word that may expand into a delete/force flag now
+  attributes to `core.git:branch-dynamic-token` with a suggestion to quote the
+  name or add `--`, distinct from proven `branch-force-delete`.
+- **PowerShell expression statements are no longer misread as dynamic `git`
+  mutators (#273).** A statement beginning with a quote, variable, array, or
+  hashtable literal (with no `$( )`/`@( )` subexpression) cannot invoke its
+  first token as `git`, so it is not treated as a dynamic branch mutation.
+- **Printed `heredoc.<family>` rule ids can now be allowlisted (#162/#261).**
+  Embedded-code AST denials and `#261` unverifiable-sink rules attach synthetic
+  ids like `heredoc.posix:eval-dynamic`; pack-id validation now accepts exactly
+  `heredoc.<family>`, so the `dcg allowlist add …` command dcg itself prints
+  actually validates (bare `heredoc` stays invalid).
+- **Cross-OS hook paths are diagnosed, not silently missed (#264).** The CLI now
+  names a `C:\…\dcg.exe` hook path on Unix (and the reverse), so a cc-switch–style
+  cross-OS `settings.json` rematerialization is reported instead of a confusing
+  "hook not found".
+
+### Internal
+
+- Added a measurement-only `release-perf` cargo profile (frame pointers + line
+  tables for `samply`) and committed the cold-start profiling artifacts:
+  baseline fingerprint, per-phase differential attribution, a ranked hotspot
+  table, and a **negative-evidence ledger**. The disciplined outcome: no
+  isomorphism-safe optimization clears the Score ≥ 2.0 bar at acceptable
+  false-negative risk on a security matcher, so the evaluation path is unchanged.
+
+## [v0.9.3](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.9.3) -- 2026-08-05 [Release]
+
+### Fixed
+
+- **`install.ps1` now writes the Hermes hook where native Windows Hermes
+  actually reads it (#270).** `Configure-HermesHook` wrote
+  `%USERPROFILE%\.hermes\config.yaml`, but Hermes Agent on native Windows
+  resolves its data root from `HERMES_HOME` (which its own installer sets to
+  `%LOCALAPPDATA%\hermes`), defaulting to `%LOCALAPPDATA%\hermes` when unset —
+  it never reads `~/.hermes` there, so the installed hook silently never
+  fired. A new `Get-HermesConfigDir` resolver (`HERMES_HOME`, else
+  `%LOCALAPPDATA%\hermes` on Windows, else `~/.hermes`) is used by the
+  installer's write path, detection (`Detect-Agents` also now probes the
+  `hermes` CLI on PATH, matching `install.sh`), the printed config path, and
+  `uninstall.ps1` (which cleans both the resolved and the legacy
+  `~/.hermes` locations). `install.sh`/`uninstall.sh` gained the matching
+  `HERMES_HOME` override support on Unix.
+- **Force-clobber redirects no longer escape `redirect-truncate-root-home`
+  (#263).** `>|` is bash's force-clobber redirect — strictly stronger than `>`
+  because it defeats `noclobber` — but the segment splitter treated its `|` as
+  a pipeline separator, so `echo x >| /etc/passwd` was cut into `echo x >` and
+  `/etc/passwd` and the redirect never reached the rule that already covers
+  `>`, `1>`, `2>` and `&>`. Every FD-qualified spelling (`1>|`, `2>|`,
+  `{fd}>|`) was affected, including targets that would disable the guard
+  itself (`~/.claude/settings.json`, dcg's own `config.toml`). The splitter now
+  keeps an unescaped `>|` intact; a genuine pipe after a quoted or escaped `>`
+  still splits.
+- **`mise exec -c/--command` inline shell payloads are recursively evaluated
+  (#259).** `mise exec -c "<payload>"` hands the payload to a shell, but it was
+  span-classified as argv data of an unrecognised consumer and rode through.
+  It is now a Tier 1/Tier 2 inline-script wrapper like `sh -c`: the payload is
+  extracted and re-evaluated, so a destructive payload is denied and a benign
+  one (`mise exec -c "npm run build"`) stays allowed. Unlike the wrapper
+  stripper, the extractor does not bail on an unmodeled flag — one
+  unrecognised option must not disarm it.
+- **`install.sh` no longer aborts on stock macOS with cosign 3.x (#268).**
+  cosign 3.x dropped `--new-bundle-format` from `--help`, so the probe left
+  `bundle_format_args` empty; bash 3.2 treats an empty array expansion under
+  `set -u` as an unbound variable and killed the script mid-install. All array
+  expansions that can be empty now use the `${a[@]+"${a[@]}"}` guard, matching
+  the fix already applied to `scripts/e2e_test.sh`.
+- **`dcg allow-once <CODE>` no longer looks like it granted something it did
+  not (#262).** Without `--yes`, the confirmation prompt read from a stdin that
+  an agent-invoked process does not have, so it aborted on EOF *after* printing
+  a confirmation block that read like a completed grant. dcg now refuses before
+  printing anything, names `--yes` in the error, and leaves the code pending.
+
+### Added
+
+- **`--dialect` for `dcg explain` and `dcg test` (#269).** Opt into evaluating
+  a single shell dialect (`posix`, `ps`, `cmd`) instead of the all-dialect
+  default, so a diagnostic can reproduce the path the live PreToolUse hook
+  takes. Also settable via `DCG_DIALECT`.
 
 ## [v0.9.2](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.9.2) -- 2026-08-02 [Release]
 

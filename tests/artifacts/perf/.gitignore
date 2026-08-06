@@ -1,0 +1,4 @@
+# ephemeral profiler captures (large binaries); keep the written analysis
+*.json.gz
+hf_*.json
+cpu_*.json

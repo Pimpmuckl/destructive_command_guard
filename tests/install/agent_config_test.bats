@@ -106,13 +106,13 @@ EOF
     CLAUDE_SETTINGS="$HOME/.claude/settings.json"
     mkdir -p "$HOME/.claude"
 
-    # Create settings with dcg hook already present
+    # Create settings with dcg hook already present under the canonical matcher
     cat > "$CLAUDE_SETTINGS" << EOF
 {
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "Bash|PowerShell",
         "hooks": [
           {"type": "command", "command": "$DEST/dcg"}
         ]
@@ -133,6 +133,70 @@ EOF
     log_test "After: $after"
 
     # CLAUDE_STATUS should be "already"
+    [ "$CLAUDE_STATUS" = "already" ]
+}
+
+@test "configure_claude_code: migrates a legacy Bash-only dcg hook (#226)" {
+    log_test "Testing Claude Code legacy Bash matcher migration..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+    mkdir -p "$HOME/.claude"
+
+    # Pre-#226 registration: the matcher covers only Bash, so Claude Code's
+    # native-Windows PowerShell tool ran completely unguarded.
+    cat > "$CLAUDE_SETTINGS" << EOF
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {"type": "command", "command": "$DEST/dcg"},
+          {"type": "command", "command": "atuin history start"}
+        ]
+      }
+    ]
+  }
+}
+EOF
+
+    configure_claude_code "$CLAUDE_SETTINGS" "0"
+
+    log_test "CLAUDE_STATUS: $CLAUDE_STATUS"
+    log_test "After: $(cat "$CLAUDE_SETTINGS")"
+
+    # A legacy entry must be migrated, never reported as already current.
+    [ "$CLAUDE_STATUS" = "merged" ]
+
+    python3 - "$CLAUDE_SETTINGS" "$DEST/dcg" <<'PY'
+import json
+import sys
+
+settings_file, dcg_path = sys.argv[1:3]
+with open(settings_file, "r") as f:
+    settings = json.load(f)
+
+entries = settings["hooks"]["PreToolUse"]
+commands = [
+    hook.get("command")
+    for entry in entries
+    for hook in entry.get("hooks", [])
+    if isinstance(hook, dict)
+]
+
+# Exactly one dcg hook, hoisted first, under a matcher that covers PowerShell.
+assert commands.count(dcg_path) == 1, commands
+assert entries[0]["matcher"] == "Bash|PowerShell", entries
+assert entries[0]["hooks"][0]["command"] == dcg_path, entries
+# The user's own hook keeps its original, unwidened Bash matcher.
+bash_entries = [e for e in entries if e.get("matcher") == "Bash"]
+assert len(bash_entries) == 1, entries
+assert [h["command"] for h in bash_entries[0]["hooks"]] == ["atuin history start"], entries
+PY
+
+    # Re-running settles: the migrated shape is now current.
+    configure_claude_code "$CLAUDE_SETTINGS" "0"
     [ "$CLAUDE_STATUS" = "already" ]
 }
 
@@ -195,14 +259,12 @@ settings_file, dcg_path = sys.argv[1:3]
 with open(settings_file, "r") as f:
     settings = json.load(f)
 
-commands = []
-for entry in settings["hooks"]["PreToolUse"]:
-    if entry.get("matcher") == "Bash":
-        commands.extend(
-            hook.get("command")
-            for hook in entry.get("hooks", [])
-            if isinstance(hook, dict)
-        )
+commands = [
+    hook.get("command")
+    for entry in settings["hooks"]["PreToolUse"]
+    for hook in entry.get("hooks", [])
+    if isinstance(hook, dict)
+]
 
 assert commands[0] == dcg_path, commands
 assert commands.count(dcg_path) == 1, commands
@@ -247,11 +309,12 @@ settings_file, dcg_path = sys.argv[1:3]
 with open(settings_file, "r") as f:
     settings = json.load(f)
 
-commands = []
-for entry in settings["hooks"]["PreToolUse"]:
-    if entry.get("matcher") == "Bash":
-        for hook in entry.get("hooks", []):
-            commands.append(hook.get("command"))
+commands = [
+    hook.get("command")
+    for entry in settings["hooks"]["PreToolUse"]
+    for hook in entry.get("hooks", [])
+    if isinstance(hook, dict)
+]
 
 assert dcg_path in commands, commands
 assert "/opt/dcgrep/bin/scan" in commands, commands
@@ -313,7 +376,7 @@ EOF
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "Bash|PowerShell",
         "hooks": [
           {"type": "command", "command": "$DEST/dcg"}
         ]
@@ -347,7 +410,7 @@ EOF
 
     CLAUDE_SETTINGS="$HOME/.claude/settings.json"
     mkdir -p "$HOME/.claude"
-    printf '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"%s"}]}]}}\n' "$DEST/dcg" > "$CLAUDE_SETTINGS"
+    printf '{"hooks":{"PreToolUse":[{"matcher":"Bash|PowerShell","hooks":[{"type":"command","command":"%s"}]}]}}\n' "$DEST/dcg" > "$CLAUDE_SETTINGS"
 
     local no_python_path="$TEST_TMPDIR/no-python-bin"
     mkdir -p "$no_python_path"

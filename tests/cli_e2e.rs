@@ -812,6 +812,26 @@ mod allow_once_flow_tests {
             }
         }
 
+        /// Run a dcg CLI command with a non-terminal stdin, the shape an
+        /// agent-invoked `dcg allow-once <CODE>` has (#262).
+        fn run_cli_without_terminal(&self, args: &[&str]) -> std::process::Output {
+            Command::new(dcg_binary())
+                .env_clear()
+                .env("HOME", &self.home_dir)
+                .env("USERPROFILE", &self.home_dir)
+                .env("XDG_CONFIG_HOME", &self.xdg_config_dir)
+                .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+                .env("DCG_PENDING_EXCEPTIONS_PATH", &self.pending_path)
+                .env("DCG_ALLOW_ONCE_PATH", &self.allow_once_path)
+                .current_dir(self.temp.path())
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("run dcg cli")
+        }
+
         /// Run dcg CLI commands (not hook mode).
         fn run_cli(&self, args: &[&str]) -> std::process::Output {
             Command::new(dcg_binary())
@@ -951,6 +971,54 @@ mod allow_once_flow_tests {
         // Step 4: Run it again to verify reusable (not single-use)
         let result3 = env.run_hook(command);
         assert_is_allowed(&result3);
+    }
+
+    /// #262: without `--yes` and without a terminal, the confirmation can
+    /// never be answered. dcg must refuse *before* printing a confirmation
+    /// block that reads like a granted allowance, must say so on stderr, and
+    /// must leave the command blocked with the code still pending.
+    #[test]
+    fn allow_once_without_terminal_refuses_loudly_and_grants_nothing() {
+        let env = FlowTestEnv::new();
+        let command = "git reset --hard";
+
+        let denial = env.run_hook(command);
+        let stdout = assert_is_denial(&denial);
+        let code = extract_code_from_denial(&stdout).expect("should emit code");
+
+        let output = env.run_cli_without_terminal(&["allow-once", &code]);
+        let cli_stdout = String::from_utf8_lossy(&output.stdout);
+        let cli_stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            !output.status.success(),
+            "allow-once without a terminal must fail\nstdout: {cli_stdout}\nstderr: {cli_stderr}"
+        );
+        assert!(
+            cli_stderr.contains("--yes"),
+            "error must name the non-interactive escape hatch: {cli_stderr}"
+        );
+        assert!(
+            !cli_stdout.contains("Allow-once confirmation:")
+                && !cli_stdout.contains("Allow-once entry created"),
+            "no confirmation block may be printed for a refused grant: {cli_stdout}"
+        );
+
+        // The grant must not exist: the command is still blocked...
+        assert_is_denial(&env.run_hook(command));
+        // ...and the code is still pending, so the operator can retry.
+        let list = env.run_cli(&["allow-once", "list", "--json"]);
+        let listed: serde_json::Value =
+            serde_json::from_slice(&list.stdout).expect("allow-once list --json");
+        assert_eq!(
+            listed["allow_once"]["count"].as_u64(),
+            Some(0),
+            "no allow-once entry may have been written: {listed}"
+        );
+        assert!(
+            listed["pending"]["count"].as_u64().is_some_and(|n| n > 0),
+            "the pending code must survive a refused confirmation: {listed}"
+        );
     }
 
     #[test]

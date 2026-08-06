@@ -20,9 +20,15 @@ function New-TempHome {
 
 $savedPath = $env:PATH
 $savedGrok = $env:GROK_SESSION_ID
+$savedHermesHome = $env:HERMES_HOME
+$savedLocalAppData = $env:LOCALAPPDATA
+$savedOs = $env:OS
 try {
     $env:PATH = ''                 # no CLI probing leaks
     $env:GROK_SESSION_ID = $null
+    $env:HERMES_HOME = $null       # no Hermes home-resolution leaks (issue #270)
+    $env:LOCALAPPDATA = $null
+    $env:OS = $null
 
     Write-Host "Test 1: detects only the agents whose config dir is present"
     $h1 = New-TempHome
@@ -89,9 +95,26 @@ try {
     Check ($a4['Grok'] -eq $true) "Grok detected via GROK_SESSION_ID env"
     $env:GROK_SESSION_ID = $null
     Remove-Item -Recurse -Force $h4 -ErrorAction SilentlyContinue
+
+    Write-Host "Test 5: native-Windows Hermes (%LOCALAPPDATA%\hermes) detected without ~/.hermes (issue #270)"
+    $h5 = New-TempHome
+    $lad5 = Join-Path $h5 'AppData/Local'
+    New-Item -ItemType Directory -Force -Path (Join-Path $lad5 'hermes') | Out-Null
+    $env:OS = 'Windows_NT'
+    $env:LOCALAPPDATA = $lad5
+    $a5 = Detect-Agents -HomeDir $h5
+    Check ($a5['Hermes'] -eq $true) "Hermes detected via LOCALAPPDATA\hermes"
+    $env:OS = $null
+    $env:LOCALAPPDATA = $null
+    $a5b = Detect-Agents -HomeDir $h5
+    Check ($a5b['Hermes'] -eq $false) "Hermes NOT detected once the native dir is out of scope"
+    Remove-Item -Recurse -Force $h5 -ErrorAction SilentlyContinue
 } finally {
     $env:PATH = $savedPath
     $env:GROK_SESSION_ID = $savedGrok
+    $env:HERMES_HOME = $savedHermesHome
+    $env:LOCALAPPDATA = $savedLocalAppData
+    $env:OS = $savedOs
 }
 
 if ($script:failures -gt 0) { Write-Host "$script:failures FAILURE(S)" -ForegroundColor Red; exit 1 }
