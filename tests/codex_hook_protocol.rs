@@ -479,6 +479,52 @@ fn codex_ask_capability_selects_decision() {
         "ask",
         "an indeterminate Codex++ evaluation must reach Guardian review\n{outcome}"
     );
+
+    for (label, padding_bytes) in [("complete", 300 * 1024), ("scan-capped", 5 * 1024 * 1024)] {
+        let oversized_payload = serde_json::json!({
+            "tool_name": "Bash",
+            "permission_decision_ask_supported": true,
+            "tool_input": {
+                "command": format!("git reset --hard && # {}", "A".repeat(padding_bytes))
+            }
+        });
+        let outcome = run_hook_raw(&serde_json::to_vec(&oversized_payload).unwrap(), &[]);
+
+        assert_eq!(
+            outcome.stdout_json()["hookSpecificOutput"]["permissionDecision"],
+            "ask",
+            "an oversized Codex++ denial ({label}) must retain Guardian review\n{outcome}"
+        );
+    }
+
+    let marker_after_scan_cap = format!(
+        r#"{{"tool_name":"Bash","tool_input":{{"command":"git reset --hard && # {}"}},"permission_decision_ask_supported":true}}"#,
+        "A".repeat(5 * 1024 * 1024)
+    );
+    let outcome = run_hook_raw(marker_after_scan_cap.as_bytes(), &[]);
+    assert_eq!(
+        outcome.stdout_json()["hookSpecificOutput"]["permissionDecision"],
+        "ask",
+        "Codex++ capability after the scan cap must still reach Guardian review\n{outcome}"
+    );
+
+    let timeout_payload = format!(
+        r#"{{"tool_name":"Bash","permission_decision_ask_supported":true,"tool_input":{{"command":"{} git reset --hard"}},"padding":"{}"}}"#,
+        "git status; ".repeat(300_000),
+        "A".repeat(1024 * 1024)
+    );
+    let outcome = run_hook_raw(timeout_payload.as_bytes(), &[("DCG_HOOK_TIMEOUT_MS", "0")]);
+    let json = outcome.stdout_json();
+    assert_eq!(
+        json["hookSpecificOutput"]["permissionDecision"], "ask",
+        "oversized Codex++ timeout must reach Guardian review\n{outcome}"
+    );
+    assert!(
+        json["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("could not complete safety evaluation")),
+        "test must exercise the indeterminate timeout branch\n{outcome}"
+    );
 }
 
 #[test]
@@ -658,8 +704,21 @@ fn explicit_cmd_tool_decodes_carets_only_in_shell_syntax() {
     );
 }
 
+/// A *proven* Bash dialect must never reinterpret Windows escape syntax: a
+/// backtick or caret in the middle of a word is an ordinary byte to POSIX, so
+/// `` g`it … `` is not git.
+///
+/// The unknown dialect is a different question. Since #294 it is a deny-wins
+/// *union* rather than a synonym for POSIX: a generic terminal adapter has not
+/// proven which shell will run the command, so a payload that reconstructs a
+/// protected executable under cmd.exe or PowerShell must be blocked. The
+/// assertion below therefore flipped when #294's decoded-view keyword gate
+/// landed — the same flip already recorded for `g^it branch ^-d` in
+/// `src/cli.rs`'s batch test. The escape here is unquoted and so sits in an
+/// executable position; a caret inside quoted data does *not* reach the replay
+/// (see `tests/repro_294_unknown_dialect_pack_fanout.rs`).
 #[test]
-fn bash_and_unknown_tools_do_not_guess_windows_escape_syntax() {
+fn bash_does_not_guess_windows_escape_syntax_but_unknown_is_a_union() {
     for command in ["g`it branch -`d feature", "g^it branch ^-d feature"] {
         let bash_payload = serde_json::json!({
             "turn_id": "turn-bash-dialect",
@@ -686,8 +745,9 @@ fn bash_and_unknown_tools_do_not_guess_windows_escape_syntax() {
             &[("DCG_HOOK_TIMEOUT_MS", "5000")],
         );
         assert!(
-            unknown_outcome.is_allow_shape(),
-            "a generic terminal adapter must retain Unknown dialect for {command:?}\n{unknown_outcome}"
+            unknown_outcome.is_claude_block_shape(),
+            "#294: an unproven dialect must adopt the cmd/PowerShell reading that \
+             reconstructs `git branch -d` in {command:?}\n{unknown_outcome}"
         );
     }
 }

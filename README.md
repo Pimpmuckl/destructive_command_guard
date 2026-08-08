@@ -723,8 +723,9 @@ entries, opt into `general.fail_closed`, enable
 heredoc scanning, or turn off heredoc bounded fallbacks. Settings that grant
 trust or reduce coverage — including allow overrides, pack disables, custom
 pack paths, custom regex overrides (including block regexes), resource limits,
-language filters, agent profiles, and nested project overrides — are ignored
-during automatic discovery.
+language filters, agent profiles, nested project overrides, and per-rule
+[target-path exemptions](#per-rule-target-path-exemptions) — are ignored during
+automatic discovery.
 
 Automatic project discovery currently runs only where dcg can bind a direct
 regular file to the descriptor it actually reads (Unix, including macOS).
@@ -939,7 +940,7 @@ curl -fsSL "https://raw.githubusercontent.com/Pimpmuckl/destructive_command_guar
 Install specific version:
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Pimpmuckl/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --version v0.9.4-codexpp.1
+curl -fsSL "https://raw.githubusercontent.com/Pimpmuckl/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --version v0.10.0-codexpp.1
 ```
 
 Install to /usr/local/bin (system-wide, requires sudo):
@@ -1005,7 +1006,7 @@ repository's known-good `nightly-2026-06-06` pin; the included
 rustup toolchain install nightly-2026-06-06
 
 # Install the tagged source reproducibly
-cargo +nightly-2026-06-06 install --locked --git https://github.com/Pimpmuckl/destructive_command_guard --tag v0.9.4-codexpp.1 destructive_command_guard
+cargo +nightly-2026-06-06 install --locked --git https://github.com/Pimpmuckl/destructive_command_guard --tag v0.10.0-codexpp.1 destructive_command_guard
 ```
 
 ### Manual build
@@ -1029,7 +1030,7 @@ dcg update
 Optional flags mirror the installer scripts (examples):
 
 ```bash
-dcg update --version v0.9.4-codexpp.1
+dcg update --version v0.10.0-codexpp.1
 dcg update --system
 dcg update --verify
 dcg update --verify --no-configure  # binary only; preserve existing hook wiring
@@ -2641,6 +2642,87 @@ reason = "Build directories across projects"
 risk_acknowledged = true  # Required for pattern-based entries
 added_at = "2026-01-08T12:00:00Z"
 ```
+
+### Per-Rule Target-Path Exemptions
+
+Agent runtimes hand each job a scratch directory under `$HOME` — Claude Code
+uses `~/.claude/jobs/<id>/tmp`. An agent writing its own logs there trips
+`core.filesystem:redirect-truncate-root-home` and the `rm -rf` rules over and
+over, for a path that only the agent owns.
+
+`[overrides] allow` is the wrong tool for that: it matches the whole command,
+so a pattern written for the log write also admits
+`<safe-op> && git reset --hard`. A target exemption is narrower — it is
+evaluated *inside one rule's target check*:
+
+```toml
+[rules."core.filesystem:redirect-truncate-root-home"]
+exempt_target_globs = ["~/.claude/jobs/*/tmp/**"]
+
+[rules."core.filesystem:rm-rf-root-home"]
+exempt_target_globs = ["~/.claude/jobs/*/tmp/**"]
+```
+
+When that rule matches, dcg resolves the operation's target path. If the target
+is a literal path under one of the globs, **that one rule** does not fire.
+Every other rule still evaluates the complete command, so
+`echo x > ~/.claude/jobs/abc/tmp/log && git reset --hard` is still denied — by
+`core.git:reset-hard`, on its own merits.
+
+**Supported rules.** Target exemptions apply only where a literal target is
+actually resolvable. Configuring them anywhere else is inert, and
+`dcg doctor` warns about it rather than leaving you quietly unserved:
+
+| Rule | Target |
+|------|--------|
+| `core.filesystem:redirect-truncate-root-home` | The redirect target(s) |
+| `core.filesystem:rm-rf-general` | Every `rm` operand |
+| `core.filesystem:rm-rf-root-home` | Every `rm` operand |
+| `core.filesystem:rm-r-f-separate` | Every `rm` operand |
+| `core.filesystem:rm-r-f-separate-root-home` | Every `rm` operand |
+| `core.filesystem:rm-recursive-force` | Every `rm` operand |
+| `core.filesystem:rm-recursive-force-root-home` | Every `rm` operand |
+| `core.filesystem:rm-recursive-general` | Every `rm` operand |
+| `core.filesystem:rm-recursive-root-home` | Every `rm` operand |
+
+Note that `rm -rf ~/...` is attributed to `rm-rf-root-home`, not
+`rm-rf-general`: any `~`- or `/`-rooted operand is the Critical root/home rule.
+Check `dcg explain "<command>"` for the rule id you actually need.
+
+**Dynamic paths are never exempted.**
+`core.filesystem:redirect-truncate-dynamic-path` deliberately supports no
+exemptions. It exists precisely because the runtime target cannot be proven, so
+a glob over it would be a bypass, not a carve-out. `echo x > $DIR/log` stays
+denied no matter what is configured. The same rule applies inside the supported
+rules: a target containing a variable, command substitution, backtick, glob, or
+`%VAR%` is not a literal, and is never matched against an exemption glob.
+
+**Glob semantics.**
+
+- `~` and `~/` expand to the user's home directory; `~user` is not supported.
+- `*` matches within a single path component; `**` crosses separators.
+- Matching is case-sensitive on every platform, like the scan include/exclude
+  globs.
+- Matching is lexical only — no `stat`, no canonicalization, no symlink
+  resolution. A symlinked path is matched by its literal spelling, so a glob
+  over `~/.claude/jobs/*/tmp/**` does not follow a symlink planted inside it.
+- A target containing a `..` component is rejected outright rather than
+  resolved: `rm -rf ~/.claude/jobs/abc/tmp/../../../Documents` never matches.
+  Globs containing `..` are rejected at load.
+- An operation with several targets must prove *every* target exempt.
+  `rm -rf ~/.claude/jobs/abc/tmp/scratch ~/.ssh` stays denied.
+- Single-quoted `rm` operands are never exempted: the shell does not expand `~`
+  inside them, so the literal spelling names a different path.
+
+**Trust boundary.** A target exemption reduces coverage, so it follows the same
+rule as every other trust-reducing setting (see
+[Configuration Hierarchy](#configuration-hierarchy)): it is **ignored** when it
+comes from an automatically discovered `.dcg.toml`. It is honored from the
+system config, the user config, and an explicit `DCG_CONFIG` file.
+
+**Output.** A suppressed rule is an allow that came from configuration, so it
+is not silent: with `general.verbose = true`, dcg notes on stderr which rule
+matched, which target it saw, and which glob exempted it.
 
 ### Performance issues
 
