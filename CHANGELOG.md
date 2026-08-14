@@ -11,6 +11,215 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [Unreleased]
+
+## [v0.11.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.11.0) -- 2026-08-14 [Release]
+
+### Added
+
+- **macOS `diskutil` coverage in `system.disk` (#305).** `diskutil eraseDisk`,
+  `eraseVolume`, `reformat`, `zeroDisk`, `randomDisk`, and `secureErase` deny
+  as `diskutil-erase`; `partitionDisk`, `splitPartition`, `mergePartitions`,
+  and `resetFusion` as `diskutil-partition`; and `apfs
+  deleteContainer/deleteVolume/eraseVolume/deleteSnapshot` as
+  `diskutil-apfs-delete` — all Critical, all case-insensitive because diskutil
+  accepts any verb casing. Read-only verbs (`list`, `info`, `activity`,
+  `apfs list`/`listSnapshots`) stay allowed, and a read-only verb cannot mask
+  a chained destructive verb on the same line.
+- **The canonical fork bomb is blocked (#302).** `:(){ :|:& };:` and
+  word-named variants deny as `core.filesystem:fork-bomb` (Critical). The
+  regex uses backreferences to require the same identifier in all three
+  positions, so ordinary function definitions that pipe two *different*
+  commands do not match. Because the shape necessarily spans `|`, `&`, and
+  `;`, the rule joins the whole-command cross-segment pass, and the shell
+  function-definition operator `()` (pure syntax, invisible to span-based
+  keyword gating) is now a recognized quick-reject signal for the pack.
+  Differently shaped bombs (`while true; do (x) & done`) remain out of scope —
+  the regex family cannot enforce those without unbounded false positives.
+- **Proven timestamped sibling-backup `mv` is allowed (#308).** The exact
+  cross-harness installer shape — `STAMP=$(date +%Y%m%d%H%M%S);
+  BACKUP="<src>.backup-$STAMP"; mv "<src>" "$BACKUP"` — is a reversible
+  sibling rename: the destination is proven to be the source plus a
+  digits-only suffix, and the two assignments must be the segments
+  immediately before the `mv` so nothing can mutate them in between. Only
+  `mv-dynamic-path` and `mv-sensitive-source-root-home` are narrowed; any
+  deviation (a different substitution, non-sibling destination, mv options,
+  extra operands, an intervening segment, traversal, globs, unquoted
+  destination) keeps the fail-closed deny.
+
+
+- **`database.bigquery` pack — the `bq` CLI and GoogleSQL.** 11 CLI rules and
+  21 GoogleSQL rules. Three BigQuery specifics drive them, and each one makes a
+  naive port of the PostgreSQL/Snowflake packs wrong: a *dataset* is a `SCHEMA`
+  in GoogleSQL, so `DROP SCHEMA` is the dataset-level catastrophe rather than a
+  namespace tidy-up (Critical); GoogleSQL **requires** a `WHERE` clause on
+  `DELETE`/`UPDATE`, so `WHERE TRUE` is the idiomatic full-table spelling and a
+  `delete-without-where` rule modelled on PostgreSQL would never fire; and time
+  travel (2–7 days) is the only undo, so `--max_time_travel_hours` and
+  `SET OPTIONS(expiration_timestamp)` destroy the recovery path itself and are
+  destructive in their own right. BigQuery ML models get their own rule —
+  they are not covered by time travel and cost hours of training to rebuild.
+  CLI rules are scoped with `executables = ["bq"]` *and* a `bq`-anchored regex,
+  because `executables` is enforced in the evaluator rather than in
+  `Pack::check`. Opt-in like every other `database.*` pack; joins the
+  `careful_company_running_windows` preset; recommended automatically when a
+  project depends on `google-cloud-bigquery`, `@google-cloud/bigquery`,
+  `pandas-gbq`, or `sqlalchemy-bigquery`.
+
+  Evaluator wiring makes the pack *indirect*, so its unscoped GoogleSQL rules
+  cannot claim the SQL inside another client's invocation: `database.bigquery`
+  sorts first within tier 7, so without it `snow sql -q "DROP TABLE ..."` would
+  have been reported as a BigQuery rule. Regression cases pin both directions.
+
+  Implemented independently from the analysis in closed PR #295, per the
+  project's no-outside-merges policy.
+
+- **`dcg doctor --strict` (#296).** `doctor` exited `0` unconditionally, including
+  when it had just reported `"ok": false` — so `dcg doctor || handle_failure` was
+  dead code and a provisioning run got a green signal from a guard doctor itself
+  had classified as broken. `--strict` makes the exit status carry the verdict.
+  It is opt-in, matching `pack validate --strict`; the default stays `0` for
+  anyone already calling doctor in a pipeline.
+
+### Changed
+
+- **The block message no longer echoes the command twice (#299).** The command
+  appeared in both the `Tip: dcg explain "<cmd>"` line and a `Command: <cmd>`
+  line, making `len(permissionDecisionReason) = 2*len(command) + 499` exactly. A
+  hook decision lands in the agent's transcript and is replayed on every later
+  turn, so the second echo was paid for repeatedly while telling the reader
+  nothing the first did not — the agent just wrote that command. The `Tip:` copy
+  is kept because it is also actionable. No verdict changes.
+- **`platform.github` rules now carry explanations and suggestions (#300).** All
+  sixteen destructive rules were built with the 3-arg macro form, so every
+  denial rendered as "No additional explanation is available yet. See pack
+  documentation for details." Each rule now explains what is actually lost and
+  names the safer spelling — for the raw-API catch-all, that includes pointing at
+  the first-class `gh issue edit --remove-parent` / `--remove-sub-issue` verbs,
+  which dcg allows outright. A new pack test enforces this going forward.
+
+### Fixed
+
+- **`chown -R`/`chmod -R`/`setfacl -R` on bare `/` and `/home` now deny
+  (#301).** Two independent bugs in `system.permissions`: the protected-path
+  regex tail `(?:$|bin|...)\b` could never match a bare `/` (the `\b` after
+  the end-anchor has no word character to bound), and `/home` was missing
+  from the protected list entirely. `chmod-777` had masked the 777 case,
+  which is why the gap survived the obvious test. `/home` is scoped to the
+  home root or a whole single-user home (`/home`, `/home/user` — where
+  `~/.ssh` lives), so a routine `chmod -R /home/user/project` on a project
+  directory stays allowed while `chmod -R /home` (which locks out every
+  account) is blocked.
+- **`pnpm`/`npm`/`yarn` publish rules require subcommand position (#306).**
+  `pnpm run build; bun ./publish-snapshot.ts`, `pnpm run build --reporter
+  "publish"`, and `pnpm run build publish` no longer deny: `publish` must be
+  reachable through option tokens only, so argument data and later shell
+  segments are not publication. Because the pack regexes run on the sanitized
+  command — which has already stripped the quotes that distinguish
+  `pnpm --reporter "publish"` (a value) from `pnpm --reporter publish` — a
+  match is confirmed against the **original** command by a quoting-aware gate
+  (`invokes_publish_subcommand`): an unquoted `publish` in subcommand position
+  is publication, a quoted one is data. Real forms (`pnpm -r publish`,
+  `pnpm recursive publish`, `--filter <ws> publish`, `yarn workspace <ws>
+  publish`, `yarn npm publish`, `pnpm.cmd`) still deny, and an unquoted
+  option value named `publish` stays fail-closed, in every dialect. The
+  `*-dry-run` safe patterns are segment-bounded so a dry-run in one segment
+  cannot mask a later one.
+- **Single-quoted `$`/backtick/backslash in `mv` paths are literal (#307).**
+  `mv './$ROOT' /tmp/x` is data, not expansion: `mv-dynamic-path` stands
+  down only when *every* dynamic marker in the command is inside a POSIX
+  single-quoted span. One active marker anywhere — double quotes, unquoted
+  variables, a quote-manipulating backslash — keeps the deny.
+- **`dcg --robot test` honors the hook evaluation budget (#309).** Robot mode
+  is an agent-integration boundary, so it now enforces the configured
+  timeout and answers with bounded `{"decision":"indeterminate",
+  "source":"analysis_budget"}` JSON without requiring the human-facing
+  `--enforce-budget` diagnostic flag (which stays opt-in for interactive
+  `dcg test`).
+- **`pwsh --version`/`--help` and read-only `-c` variable expressions are
+  allowed (#304).** pwsh accepts exactly two GNU-style spellings, both
+  print-and-exit; they no longer land in the unknown-host-option refusal.
+  And a `-Command` payload that is exactly one variable read with property
+  accesses (`$PSVersionTable.PSVersion`, `$env:PATH`) invokes nothing, so it
+  no longer trips the runtime-expansion refusal — invoking, indexing,
+  subexpressions, or any second statement stays fail-closed. (`-File` was
+  already fixed on main; `SP=…; pwsh -c "…"` likewise.)
+- **Backing up the agent's hook config is a read, not tampering (#313).**
+  `Copy-Item ~/.claude/settings.json <backup>` no longer denies:
+  copy-family verbs moved out of `agent-hook-config-tamper` into a new
+  `agent-hook-config-overwrite` rule that fires only when the config path is
+  the *write* side (`-Destination` or positional destination). Deleting,
+  rewriting, moving, or renaming the live config still denies, as does
+  copying anything onto it.
+- **`bash -c` payloads keep their own quote context (#288 follow-up).**
+  `bash -lc 'grep -n "rm -rf /" notes.md'` was denied while the bare inner
+  command was correctly allowed: the match landed inside the inline payload,
+  whose `InlineCode` classification dropped the payload's internal quoting.
+  A core-rule match inside a POSIX-shell inline payload is now re-classified
+  against the payload itself, so it resolves exactly like the bare inner
+  command — and `bash -c 'rm -rf /'` still denies, because the payload
+  classifies it as live code.
+
+
+- **A pathological `gh` command line could fail OPEN.** The shared option-prefix
+  in `platform.github` used `\S+` for an option's value, which also matches a
+  flag token — so in `gh -a -b -c …` each token could parse either as a new
+  option or as the previous one's value, giving exponentially many parses.
+  These patterns carry a lookahead and therefore run on the backtracking
+  engine, where `CompiledRegex::is_match` maps a backtrack-limit error to
+  `false`. Adopted the unambiguous shape the database packs already use
+  (`[^-\s;&|][^\s;&|]*`).
+- **`dcg doctor`'s pretty renderer computed a wrong verdict**, which now
+  matters because `--strict` derives the exit status from it — and pretty is
+  what runs in CI, since rich output is disabled without a TTY. A failed
+  config write printed an error without counting it, and the Grok
+  "NOT REGISTERED" branch incremented `fixed` without ever incrementing
+  `issues`, corrupting the `issues == 0 || (fix && fixed == issues)`
+  arithmetic in both directions: masking a genuinely unfixed issue, and
+  reporting failure on a fully repaired machine.
+- **`doctor --fix` could buy off a problem it could not fix.** Creating the
+  default config counted a `fixed` with no matching `issues` (a missing config
+  is a *warning*, not an issue), so that one success cancelled a genuinely
+  unfixed issue through the `fixed == issues` equality: on a machine whose hook
+  was misconfigured and unwritable, `dcg doctor --fix --strict` reported "All
+  issues fixed!" and exited 0. Both renderers now count the issue each repair
+  resolves, and a test asserts `fixed <= issues`.
+- **`doctor --strict` gave different answers per `--format`.** The Grok
+  registration check existed only in the pretty renderer, so a machine with
+  Grok present and unwired exited 1 with `dcg doctor --strict` and 0 with
+  `--format json`. The check now lives in the shared report (`grok_hook`) and a
+  test pins that both renderers agree.
+- **`gh repo delete` recommended a command dcg itself blocks.** Its first
+  suggested alternative was `gh repo archive`, which the same pack denies, so
+  the agent bounced between two denials. The suggestions now lead with a
+  runnable command and say plainly that archiving is gated too. A pack test
+  asserts no rule's first suggestion is blocked by its own pack.
+- **`gh-api-delete-repo` is no longer a misnamed catch-all (#300).** The rule
+  matched *any* `gh api ... DELETE`, not repository deletion, while its name is
+  what surfaces as `rule_id` in the history DB, `dcg stats`, `dcg
+  suggest-allowlist`, and allowlist entries. The catch-all is now
+  `gh-api-delete-generic`, and `gh-api-delete-repo` matches what its name says:
+  `DELETE /repos/{owner}/{repo}`. Both are still denied, so no command changes
+  verdict. **Breaking for persisted state:** an allowlist or `[rules]` entry for
+  `platform.github:gh-api-delete-repo` now permits only repository deletion
+  rather than every raw-API DELETE — a tightening — and history rows written
+  before this release keep the old `rule_id`.
+
+- **False positives:** `pwsh -File <script.ps1>` (and its abbreviation `-f`) is
+  no longer denied as an unverifiable launcher envelope. `-File` was missing
+  from the PowerShell host-option table entirely, so it resolved to `Unknown`
+  and hit the fail-closed branch for unrecognized dash tokens — while the
+  positional `pwsh <script.ps1>` form, which is the same operation, and
+  `-Command`, which is strictly more dangerous, were both allowed. `-File` is
+  now a first-class option that ends host-option parsing (later tokens are
+  script arguments, not host options). `-File -` still refuses, because a
+  script read from stdin is no more inspectable than `-Command -`. Routing it
+  through the shared option table also means `pwsh -f -` is now recognized as
+  reading a script from stdin, which the previous exact-match `-file` check in
+  the pipeline analyzer missed.
+
+---
+
 ## [v0.10.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.10.0) -- 2026-08-07 [Release]
 
 A large correctness, feature, and hardening release from a full issue-triage

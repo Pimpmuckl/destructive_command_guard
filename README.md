@@ -242,6 +242,7 @@ it to `[packs] enabled` — see [Enable More Protection](#enable-more-protection
 - `database.sqlite` - Protects against destructive SQLite operations like DROP TABLE, DELETE without WHERE, and accidental data loss.
 - `database.snowflake` - Protects modern `snow sql` inline queries, files, stdin, nested sources, destructive data operations, pipelines, warehouses, and account privileges.
 - `database.supabase` - Protects against destructive Supabase CLI operations including database resets, migration rollbacks, function/secret/storage deletion, project removal, and infrastructure changes.
+- `database.bigquery` - Protects the `bq` CLI and GoogleSQL against dataset drops (`DROP SCHEMA`), table overwrites, unfiltered DML (`WHERE TRUE` is GoogleSQL's full-table idiom), and settings that shorten the time-travel recovery window.
 
 ### Container Packs
 - `containers.docker` - Protects against destructive Docker operations like system prune, volume prune, and force removal.
@@ -940,7 +941,7 @@ curl -fsSL "https://raw.githubusercontent.com/Pimpmuckl/destructive_command_guar
 Install specific version:
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Pimpmuckl/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --version v0.10.0-codexpp.1
+curl -fsSL "https://raw.githubusercontent.com/Pimpmuckl/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --version v0.11.0-codexpp.1
 ```
 
 Install to /usr/local/bin (system-wide, requires sudo):
@@ -1006,7 +1007,7 @@ repository's known-good `nightly-2026-06-06` pin; the included
 rustup toolchain install nightly-2026-06-06
 
 # Install the tagged source reproducibly
-cargo +nightly-2026-06-06 install --locked --git https://github.com/Pimpmuckl/destructive_command_guard --tag v0.10.0-codexpp.1 destructive_command_guard
+cargo +nightly-2026-06-06 install --locked --git https://github.com/Pimpmuckl/destructive_command_guard --tag v0.11.0-codexpp.1 destructive_command_guard
 ```
 
 ### Manual build
@@ -1030,7 +1031,7 @@ dcg update
 Optional flags mirror the installer scripts (examples):
 
 ```bash
-dcg update --version v0.10.0-codexpp.1
+dcg update --version v0.11.0-codexpp.1
 dcg update --system
 dcg update --verify
 dcg update --verify --no-configure  # binary only; preserve existing hook wiring
@@ -2668,6 +2669,18 @@ is a literal path under one of the globs, **that one rule** does not fire.
 Every other rule still evaluates the complete command, so
 `echo x > ~/.claude/jobs/abc/tmp/log && git reset --hard` is still denied — by
 `core.git:reset-hard`, on its own merits.
+
+**Wiring doctor into automation.** `dcg doctor` exits `0` by default, even when
+it reports `"ok": false` — so `dcg doctor || handle_failure` is dead code unless
+you ask for the verdict. Use `--strict` to make the exit status carry it:
+
+```bash
+dcg doctor --strict            # non-zero when checks fail
+dcg doctor --format json --strict
+```
+
+The default is unchanged so existing pipelines keep working, and both output
+formats answer identically.
 
 **Supported rules.** Target exemptions apply only where a literal target is
 actually resolvable. Configuring them anywhere else is inert, and

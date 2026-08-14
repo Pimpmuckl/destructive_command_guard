@@ -1947,6 +1947,111 @@ mod config_tests {
             "expected binary_path check in JSON output"
         );
     }
+
+    /// `dcg doctor || handle_failure` must not be dead code: when doctor
+    /// itself reports `ok: false`, `--strict` has to carry that verdict into
+    /// the exit status. Without the flag the default stays 0 for everyone
+    /// already calling doctor in a pipeline.
+    #[test]
+    fn doctor_strict_exit_code_agrees_with_the_reported_verdict() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (home_dir, xdg_config_dir, _bin_dir) = setup_doctor_env(&temp);
+
+        // Empty PATH reproduces the #240 condition the binary_path check
+        // exists to detect: the guard is not reachable from a non-interactive
+        // shell, so doctor reports an error.
+        let run = |args: &[&str]| {
+            Command::new(dcg_binary())
+                .env_clear()
+                .env("HOME", &home_dir)
+                .env("USERPROFILE", &home_dir)
+                .env("XDG_CONFIG_HOME", &xdg_config_dir)
+                .env("PATH", "")
+                .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+                .current_dir(temp.path())
+                .args(args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("run dcg doctor")
+        };
+
+        let plain = run(&["doctor", "--format", "json"]);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&String::from_utf8_lossy(&plain.stdout))
+                .expect("doctor JSON output should parse");
+        let reported_ok = parsed["ok"].as_bool().expect("ok field");
+
+        assert!(
+            plain.status.success(),
+            "without --strict doctor keeps its historical exit 0"
+        );
+
+        let strict = run(&["doctor", "--format", "json", "--strict"]);
+        assert_eq!(
+            strict.status.success(),
+            reported_ok,
+            "--strict exit status must match the reported ok field (ok={reported_ok})"
+        );
+
+        // The pretty renderer keeps its own check set, and it is the one that
+        // runs in CI (rich output is disabled without a TTY). Both renderers
+        // must answer the same question the same way, or `--strict` means
+        // something different depending on --format.
+        let strict_pretty = run(&["doctor", "--strict"]);
+        assert_eq!(
+            strict_pretty.status.success(),
+            strict.status.success(),
+            "--strict must agree between the pretty and json renderers\npretty stdout:\n{}\njson stdout:\n{}",
+            String::from_utf8_lossy(&strict_pretty.stdout),
+            String::from_utf8_lossy(&strict.stdout),
+        );
+    }
+
+    /// `--fix` must not let a repair of one problem cancel a DIFFERENT problem
+    /// it could not fix. The verdict is `issues == 0 || (fix && fixed ==
+    /// issues)`, so any `fixed` increment without a matching `issues`
+    /// increment silently buys off a real failure.
+    #[test]
+    fn doctor_fix_does_not_mask_an_unfixed_issue() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (home_dir, xdg_config_dir, _bin_dir) = setup_doctor_env(&temp);
+
+        // Empty PATH keeps `binary_path` broken and unfixable, while the
+        // missing user config is repairable — the two must not net out.
+        let output = Command::new(dcg_binary())
+            .env_clear()
+            .env("HOME", &home_dir)
+            .env("USERPROFILE", &home_dir)
+            .env("XDG_CONFIG_HOME", &xdg_config_dir)
+            .env("PATH", "")
+            .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+            .current_dir(temp.path())
+            .args(["doctor", "--fix", "--format", "json"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run dcg doctor --fix");
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&String::from_utf8_lossy(&output.stdout))
+                .expect("doctor JSON output should parse");
+        let issues = parsed["issues"].as_u64().expect("issues");
+        let fixed = parsed["fixed"].as_u64().expect("fixed");
+        let ok = parsed["ok"].as_bool().expect("ok");
+
+        assert!(
+            fixed <= issues,
+            "`fixed` must never exceed `issues`; a repair with no counted issue \
+             inflates the counter (issues={issues}, fixed={fixed})"
+        );
+        if ok {
+            assert_eq!(
+                fixed, issues,
+                "ok=true under --fix requires every counted issue to have been fixed"
+            );
+        }
+    }
 }
 
 // ============================================================================
@@ -2120,6 +2225,30 @@ mod hook_mode_tests {
         }
     }
 
+    /// The cwd spelling dcg will actually observe at runtime.
+    ///
+    /// dcg resolves its working directory with `std::env::current_dir()` on
+    /// every path that touches allow-once — recording a block
+    /// (`src/main.rs`), matching an entry (`src/evaluator.rs`), and redeeming
+    /// a code (`src/cli.rs`). `current_dir()` returns the *symlink-resolved*
+    /// path, so on macOS a `/var/folders/...` tempdir is seen as
+    /// `/private/var/folders/...`. `AllowOnceEntry::matches_scope` compares
+    /// paths for exact equality, so an entry written with the raw tempdir path
+    /// could never match, and these tests failed on macOS while passing on
+    /// Linux (where `/var` is not a symlink).
+    ///
+    /// This is a test-fidelity fix, not a product fix: all three production
+    /// paths derive the cwd the same way, so they agree with each other.
+    fn observed_cwd(path: &std::path::Path) -> std::path::PathBuf {
+        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        // `canonicalize` yields a `\\?\`-prefixed verbatim path on Windows,
+        // which `current_dir()` never produces; strip it so both agree.
+        match resolved.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+            Some(stripped) => std::path::PathBuf::from(stripped),
+            None => resolved,
+        }
+    }
+
     fn write_allow_once_entry(
         allow_once_path: &std::path::Path,
         cwd: &std::path::Path,
@@ -2128,7 +2257,7 @@ mod hook_mode_tests {
     ) {
         let now = fixed_timestamp();
         let redaction = redaction_config();
-        let cwd_str = cwd.to_string_lossy().into_owned();
+        let cwd_str = observed_cwd(cwd).to_string_lossy().into_owned();
 
         let pending = PendingExceptionRecord::new(
             now,

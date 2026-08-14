@@ -337,6 +337,9 @@ fn test_audit_backtracking_requirements() {
                 "unlink-tmpdir",
                 "unlink-tmpdir-brace",
                 "unlink-var-tmp",
+                // Backreferences enforce that the fork-bomb's three
+                // identifiers are the same token (issue #302).
+                "fork-bomb",
             ]),
         ),
         (
@@ -708,6 +711,7 @@ fn test_audit_backtracking_requirements() {
                 "gh-api-delete-actions-secret",
                 "gh-api-delete-actions-variable",
                 "gh-api-delete-deploy-key",
+                "gh-api-delete-generic",
                 "gh-api-delete-hook",
                 "gh-api-delete-release",
                 "gh-api-delete-repo",
@@ -1091,7 +1095,13 @@ fn test_audit_backtracking_requirements() {
         ),
         (
             "careful_company_running_windows.guardrails",
-            HashSet::from(["read-only-data-context"]),
+            HashSet::from([
+                "read-only-data-context",
+                // Destination-position detection needs lookaheads to keep a
+                // named -Destination value from running into later
+                // parameters (issue #313).
+                "agent-hook-config-overwrite",
+            ]),
         ),
         (
             "careful_company_running_windows.tunnel",

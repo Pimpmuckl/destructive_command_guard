@@ -1086,6 +1086,33 @@ pub(crate) fn filesystem_semantic_scan_required(command: &str, dialect: ShellDia
         || (dialect == ShellDialect::Cmd
             && command.contains('>')
             && command.contains(['%', '!', '^']))
+        // Fork-bomb reachability (issue #302): the `fork-bomb` rule matches a
+        // shell function-definition shape (`name() { … }`). The paren pair is
+        // pure syntax that keyword-based quick-reject cannot see, and POSIX
+        // permits whitespace inside it (`name ( )`), so a literal `()` keyword
+        // both costs a keyword slot and misses the spaced form. A space-
+        // tolerant scan here forces core.filesystem to run whenever an empty
+        // paren pair is present; the regex then does the precise matching.
+        || command_contains_empty_paren_pair(command)
+}
+
+/// True when the command contains `(` followed by only ASCII whitespace and
+/// then `)` — the empty parameter list of a shell function definition, the one
+/// piece of the fork-bomb shape that carries no executable keyword.
+fn command_contains_empty_paren_pair(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    let mut index = 0usize;
+    while let Some(open) = bytes[index..].iter().position(|&b| b == b'(') {
+        let mut cursor = index + open + 1;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if bytes.get(cursor) == Some(&b')') {
+            return true;
+        }
+        index = index + open + 1;
+    }
+    false
 }
 
 /// Refine the global substring index's candidate signal for core.filesystem.
@@ -3338,6 +3365,12 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - rm -f -r path\n\
              - rm -r -f -v path (verbose but still forced)\n\n\
              All carry the same risks as rm -rf: immediate, silent, irreversible deletion.\n\n\
+             This rule matches the -r/-f flag PAIR, not a filesystem path, so it also \
+             fires when `rm` is another tool's subcommand (`git rm -r -f`, \
+             `bq rm -r -f`). The recursive-force semantics still apply, but to that \
+             tool's objects — tracked files and index entries for git, a dataset and \
+             everything in it for bq — not to a directory tree. Enable that tool's pack \
+             for guidance written for it; this rule is the backstop when it is not.\n\n\
              Safer approach for temporary directories:\n\
              - rm -r -f /tmp/mydir    # Allowed - temp directories are safe\n\
              - Resolve and inspect $TMPDIR before using it as a deletion root\n\n\
@@ -3874,6 +3907,28 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Use append (`>>`) when preserving existing content is acceptable.",
             REDIRECT_TRUNCATE_SUGGESTIONS
         ),
+        // Classic fork bomb: a no-argument function whose body pipes itself
+        // into itself in the background, immediately invoked
+        // (`:(){ :|:& };:` and word-named variants). The backreferences
+        // enforce that all three identifiers are the same, which is what
+        // separates a fork bomb from an ordinary function definition — this
+        // deliberately selects the backtracking engine. Differently shaped
+        // bombs (`while true; do (x) & done`) are out of scope: the regex
+        // crate family cannot enforce those without unbounded false
+        // positives, and the canonical form is the one agents actually
+        // reproduce (issue #302).
+        destructive_pattern!(
+            "fork-bomb",
+            r"([A-Za-z0-9_:]+)\s*\(\s*\)\s*\{\s*\1\s*\|\s*\1\s*&\s*;?\s*\}\s*;\s*\1",
+            "This is a fork bomb: it recursively spawns processes until the system is unusable.",
+            Critical,
+            "A fork bomb defines a function that pipes itself into itself in the \
+             background and then calls it. Process count grows exponentially until \
+             the kernel can no longer schedule anything; the machine typically \
+             needs a hard reboot, losing all unsaved work in every application.\n\n\
+             There is no legitimate reason to run this shape. If you are testing \
+             process limits, use `ulimit -u` in a disposable VM or container."
+        ),
     ]
 }
 
@@ -3882,6 +3937,111 @@ mod tests {
     use super::*;
     use crate::packs::Severity;
     use crate::packs::test_helpers::*;
+
+    /// Issue #302: the canonical fork bomb and word-named variants are
+    /// blocked; ordinary function definitions that merely pipe two different
+    /// commands are not. Evaluator-level reachability is handled by
+    /// `filesystem_semantic_scan_required` (an empty paren pair forces the
+    /// pack), not by a pack keyword — see the empty_paren_pair tests and the
+    /// evaluator's `fork_bomb_denies_through_full_pipeline_issue_302`.
+    #[test]
+    fn fork_bomb_is_blocked_issue_302() {
+        let pack = create_pack();
+        // The fork-bomb rule spans shell separators, so it is matched
+        // whole-command (never through `Pack::check`, which is keyword-gated
+        // and per-segment). Test the compiled regex and the force check
+        // directly; the end-to-end deny is in the evaluator test.
+        let fork_bomb = pack
+            .destructive_patterns
+            .iter()
+            .find(|p| p.name == Some("fork-bomb"))
+            .expect("fork-bomb rule must exist");
+        for bomb in [
+            ":(){ :|:& };:",
+            "bomb(){ bomb|bomb& };bomb",
+            ": () { : | : & ; } ; :",
+            "b(){ b|b&;};b",
+            // Spaced paren pair — the literal `()` keyword missed this; the
+            // space-tolerant force check reaches it.
+            ":( ){ :|:& };:",
+        ] {
+            assert!(
+                filesystem_semantic_scan_required(bomb, ShellDialect::Posix),
+                "fork bomb must force the pack via semantic scan: {bomb}"
+            );
+            assert!(
+                fork_bomb.regex.is_match(bomb),
+                "fork-bomb regex must match: {bomb}"
+            );
+        }
+        // Same-shape functions piping two DIFFERENT commands are not bombs.
+        for benign in [
+            "serve(){ python|tee & };logs",
+            "f(){ a|b& };f",
+            "retry(){ curl -s x|jq . ; };retry",
+        ] {
+            assert!(
+                !fork_bomb.regex.is_match(benign),
+                "non-self-referential function must not match fork-bomb: {benign}"
+            );
+        }
+    }
+
+    /// The space-tolerant empty-paren detector that gives the fork-bomb rule
+    /// its evaluator reachability (issue #302).
+    #[test]
+    fn empty_paren_pair_detection_issue_302() {
+        for present in [":(){ :;}", "foo() {}", ":( ){ }", "x(  )", "arr=()", "$()"] {
+            assert!(
+                command_contains_empty_paren_pair(present),
+                "empty paren pair expected: {present}"
+            );
+        }
+        for absent in [
+            "echo hi", "(ls)", "foo(bar)", "$(date)", "$((1+1))", "a || b",
+        ] {
+            assert!(
+                !command_contains_empty_paren_pair(absent),
+                "no empty paren pair expected: {absent}"
+            );
+        }
+    }
+
+    /// The `-r`/`-f` rules match the FLAG PAIR, not an argv0, so they also
+    /// cover `rm` used as another tool's subcommand. That is deliberate and
+    /// load-bearing: `core.filesystem` is always on, whereas the packs that
+    /// would otherwise own these commands are opt-in (`database.bigquery`) or
+    /// nonexistent (there is no `git rm` rule in `core.git`). Scoping these
+    /// rules to `executables = ["rm"]` would read as a clean attribution fix
+    /// and silently turn all three of these into ALLOW.
+    ///
+    /// If you are here because you want that scoping (bead bd-pwvp), first add
+    /// the replacement coverage — otherwise this test is the record that you
+    /// removed a backstop.
+    #[test]
+    fn subcommand_rm_stays_covered_by_the_flag_pair_rules() {
+        let pack = create_pack();
+        for command in [
+            "rm -r -f /var/data/old",
+            "git rm -r -f src/legacy",
+            "bq rm -r -f my_project:my_dataset",
+        ] {
+            assert!(
+                pack.check(command).is_some(),
+                "core.filesystem must keep covering `{command}` — it is the \
+                 always-on backstop for recursive-force deletion"
+            );
+        }
+
+        // NOTE on layering: these regexes are `rm\s+...` with no argv0 anchor,
+        // so at the PACK level they also match inside a longer word —
+        // `pack.check("charm -r -f build")` returns Some. End to end those are
+        // correctly ALLOWED, because the evaluator resolves argv0 before the
+        // denial stands. Asserting `is_none()` here would therefore be
+        // testing the wrong layer, which is exactly the mistake that produced
+        // a false positive in the bigquery pack until its regexes were
+        // anchored. Tracked separately as a defense-in-depth cleanup.
+    }
 
     #[test]
     fn test_pack_creation() {

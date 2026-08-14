@@ -204,6 +204,10 @@ pub enum Command {
         #[arg(long)]
         fix: bool,
 
+        /// Exit non-zero when checks fail (for `dcg doctor || handle_failure`)
+        #[arg(long)]
+        strict: bool,
+
         /// Output format (pretty or json)
         #[arg(long, short, value_enum, default_value_t = DoctorFormat::Pretty, env = "DCG_FORMAT")]
         format: DoctorFormat,
@@ -2138,8 +2142,12 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     maybe_show_update_notice(&cli, &config, verbosity);
 
     match cli.command {
-        Some(Command::Doctor { fix, format }) => {
-            doctor(
+        Some(Command::Doctor {
+            fix,
+            strict,
+            format,
+        }) => {
+            let ok = doctor(
                 fix,
                 format,
                 &config,
@@ -2147,6 +2155,12 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     .as_deref()
                     .expect("doctor requested config source tracing"),
             );
+            // Opt-in, matching `pack validate --strict`. Exiting non-zero by
+            // default would be a behaviour change for everyone already calling
+            // doctor in a pipeline.
+            if strict && !ok {
+                std::process::exit(EXIT_DENIED);
+            }
         }
         Some(Command::Hook(cmd)) => {
             // `dcg hook` returns the process exit code (deny -> 1, parse halt
@@ -2286,7 +2300,13 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     no_heredoc_scan,
                     heredoc_timeout_ms,
                     heredoc_languages,
-                    enforce_budget,
+                    // Robot mode is an agent-integration boundary: callers
+                    // rely on the configured hook timeout so dcg answers with
+                    // a bounded `indeterminate` JSON verdict before the
+                    // parent's own timeout kills it. Only interactive human
+                    // `dcg test` keeps budget enforcement opt-in via
+                    // `--enforce-budget` (issue #309).
+                    enforce_budget || robot_mode,
                     force,
                     dialect,
                 );
@@ -5595,6 +5615,15 @@ fn detect_database_packs_from_deps(
             ],
         ),
         ("database.supabase", &["supabase", "@supabase/supabase-js"]),
+        (
+            "database.bigquery",
+            &[
+                "google-cloud-bigquery",
+                "@google-cloud/bigquery",
+                "pandas-gbq",
+                "sqlalchemy-bigquery",
+            ],
+        ),
     ];
 
     // Scan multiple dependency files
@@ -9792,26 +9821,31 @@ fn format_corpus_pretty(output: &CorpusOutput) -> String {
     result
 }
 
-/// Check installation, configuration, and hook registration
+/// Check installation, configuration, and hook registration.
+///
+/// Returns the same verdict the report carries in its `ok` field, so the
+/// caller can make the exit status agree with the diagnosis. Without this a
+/// `dcg doctor || handle_failure` guard is dead code: the tool would report
+/// that the guard is not guarding and still exit 0.
 fn doctor(
     fix: bool,
     format: DoctorFormat,
     config: &Config,
     config_sources: &[ConfigSourceOutcome],
-) {
+) -> bool {
     match format {
         DoctorFormat::Pretty => {
             #[cfg(feature = "rich-output")]
             {
                 if crate::output::should_use_rich_output() {
-                    doctor_rich(fix, config, config_sources);
+                    doctor_rich(fix, config, config_sources)
                 } else {
-                    doctor_pretty(fix, config, config_sources);
+                    doctor_pretty(fix, config, config_sources)
                 }
             }
             #[cfg(not(feature = "rich-output"))]
             {
-                doctor_pretty(fix, config, config_sources);
+                doctor_pretty(fix, config, config_sources)
             }
         }
         DoctorFormat::Json => doctor_json(fix, config, config_sources),
@@ -9820,7 +9854,7 @@ fn doctor(
 
 /// Human-readable doctor output (colored crate, non-rich fallback).
 #[allow(clippy::too_many_lines, clippy::unnecessary_unwrap)]
-fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutcome]) {
+fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutcome]) -> bool {
     use colored::Colorize;
 
     println!("{}", "dcg doctor".green().bold());
@@ -9828,6 +9862,7 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
 
     let mut issues = 0;
     let mut fixed = 0;
+    let mut wired_to_an_agent = true;
 
     // Check 1: Binary in PATH
     print!("Checking binary in PATH... ");
@@ -9849,6 +9884,7 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
         println!("{}", "NOT FOUND".yellow());
         println!("  ~/.claude/settings.json not found");
         println!("  This is normal if Claude Code hasn't been configured yet");
+        wired_to_an_agent = false;
     }
 
     // Check 3: Hook wiring (expanded diagnostics)
@@ -10008,6 +10044,18 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
             );
         } else {
             println!("{}", "NOT REGISTERED".yellow());
+            // Reached only when Grok is in use AND neither the native hook nor
+            // the Claude-compat path is wired — the guard is not guarding.
+            // This branch already incremented `fixed` on a successful repair;
+            // without the matching `issues` increment the summary verdict
+            // (`issues == 0 || (fix && fixed == issues)`) was corrupted in
+            // both directions: an unrelated unfixed issue could be masked, and
+            // a fully repaired machine could still report failure.
+            //
+            // `collect_doctor_report` carries the same check (id `grok_hook`)
+            // so `--strict` cannot give one answer for `--format json` and a
+            // different one here.
+            issues += 1;
             if fix {
                 println!("  Attempting native install...");
                 if install_grok_hook(false, false).is_ok() {
@@ -10059,9 +10107,20 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
                 match std::fs::write(&config_path, Config::generate_sample_config()) {
                     Ok(()) => {
                         println!("  {} Created: {}", "Fixed!".green(), config_path.display());
+                        // Count the issue this repair resolves — see the
+                        // matching comment in `collect_doctor_report`. An
+                        // uncounted `fixed` cancels a real unfixed issue in
+                        // the `fixed == issues` verdict.
+                        issues += 1;
                         fixed += 1;
                     }
                     Err(e) => {
+                        // Must count: `collect_doctor_report` counts the same
+                        // failure, and --strict now derives the exit status
+                        // from this counter. Leaving it uncounted made
+                        // `doctor --fix --strict` exit 0 on an unwritable
+                        // config dir while `--format json` exited non-zero.
+                        issues += 1;
                         println!("  {} Failed to create config: {e}", "Error".red());
                     }
                 }
@@ -10246,7 +10305,12 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
 
     println!();
     if issues == 0 {
-        println!("{}", "All checks passed!".green().bold());
+        let summary = if wired_to_an_agent {
+            "All checks passed!"
+        } else {
+            "All checks passed (guard not wired to any agent)"
+        };
+        println!("{}", summary.green().bold());
     } else if fix && fixed == issues {
         println!("{}", "All issues fixed!".green().bold());
     } else {
@@ -10260,19 +10324,21 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
             }
         );
     }
+    issues == 0 || (fix && fixed == issues)
 }
 
 const DOCTOR_SCHEMA_VERSION: u32 = 1;
 
-fn doctor_json(fix: bool, config: &Config, config_sources: &[ConfigSourceOutcome]) {
+fn doctor_json(fix: bool, config: &Config, config_sources: &[ConfigSourceOutcome]) -> bool {
     let report = collect_doctor_report(fix, config, config_sources);
     let json = serde_json::to_string_pretty(&report).expect("serialize doctor report");
     println!("{json}");
+    report.ok
 }
 
 /// Rich terminal doctor output using DcgConsole and markup.
 #[cfg(feature = "rich-output")]
-fn doctor_rich(fix: bool, config: &Config, config_sources: &[ConfigSourceOutcome]) {
+fn doctor_rich(fix: bool, config: &Config, config_sources: &[ConfigSourceOutcome]) -> bool {
     use crate::output::console::console;
 
     let report = collect_doctor_report(fix, config, config_sources);
@@ -10312,7 +10378,7 @@ fn doctor_rich(fix: bool, config: &Config, config_sources: &[ConfigSourceOutcome
     // Summary
     con.print("");
     if report.ok {
-        con.print("[green bold]All checks passed![/]");
+        con.print(&format!("[green bold]{}[/]", doctor_pass_summary(&report)));
     } else if report.fixed > 0 && report.fixed == report.issues {
         con.print("[green bold]All issues fixed![/]");
     } else {
@@ -10325,6 +10391,29 @@ fn doctor_rich(fix: bool, config: &Config, config_sources: &[ConfigSourceOutcome
                 String::new()
             }
         ));
+    }
+    report.ok
+}
+
+/// The pass-line for a clean report.
+///
+/// `warning`-status checks do not count toward `issues`, so a machine with dcg
+/// installed but wired into no agent at all reports `ok: true`. That is
+/// defensible — dcg is usable standalone — but a bare "All checks passed!"
+/// claims coverage that was never established. Say which of the two it is.
+///
+/// Only `doctor_rich` consumes this; `doctor_pretty` computes the same
+/// distinction from its own inline check state. Gated to match its single
+/// caller so a `--no-default-features` build does not see dead code.
+#[cfg(feature = "rich-output")]
+fn doctor_pass_summary(report: &DoctorReport) -> &'static str {
+    let wired = report.checks.iter().all(|check| {
+        !(check.id == "claude_settings" && check.status == DoctorCheckStatus::Warning)
+    });
+    if wired {
+        "All checks passed!"
+    } else {
+        "All checks passed (guard not wired to any agent)"
     }
 }
 
@@ -10529,6 +10618,15 @@ fn collect_doctor_report(
             } else {
                 match write_default_config() {
                     Ok(path) => {
+                        // Count the issue this repair resolves. The verdict is
+                        // `issues == 0 || (fix && fixed == issues)`, so a
+                        // `fixed` with no matching `issues` inflates the
+                        // counter and lets THIS success cancel a genuinely
+                        // unfixed issue elsewhere — `--fix --strict` would exit
+                        // 0 on a machine whose hook is still misconfigured.
+                        // Only counted under `--fix`; without it, a missing
+                        // config stays a Warning, so no new false alarm.
+                        issues += 1;
                         fixed += 1;
                         config_fixed = true;
                         (
@@ -10789,6 +10887,70 @@ fn collect_doctor_report(
                 fixed: false,
             });
         }
+    }
+
+    // Grok hook registration.
+    //
+    // This check used to exist only in `doctor_pretty`. That was tolerable
+    // while doctor's exit status was always 0, but `--strict` derives the exit
+    // status from whichever renderer ran — and the pretty one is what runs in
+    // CI, since rich output is disabled without a TTY. Without this, the same
+    // machine answered the same question two ways: `dcg doctor --strict`
+    // exited 1 while `dcg doctor --strict --format json` exited 0.
+    let grok_session_present = std::env::var_os("GROK_SESSION_ID").is_some()
+        || std::env::var_os("GROK_HOOK_EVENT").is_some()
+        || std::env::var_os("GROK_WORKSPACE_ROOT").is_some();
+    let grok_home = dirs::home_dir().map(|h| h.join(".grok"));
+    let grok_home_exists = grok_home.as_ref().is_some_and(|p| p.exists() && p.is_dir());
+    if grok_session_present || grok_home_exists {
+        let user_hook = grok_user_hook_path();
+        let claude_compat_exists = claude_settings_path().exists();
+        let mut grok_fixed = false;
+        let (status, message, remediation) = if user_hook.exists() {
+            (
+                DoctorCheckStatus::Ok,
+                format!("Native Grok hook found at {}", user_hook.display()),
+                None,
+            )
+        } else if claude_compat_exists && hook_diag.dcg_hook_count >= 1 {
+            // Wired via the Claude compatibility layer. Deliberately not an
+            // error: users who rely on compat should not be pestered.
+            (
+                DoctorCheckStatus::Ok,
+                "No native ~/.grok/hooks/dcg.json; Grok picks up dcg from the Claude \
+                 compatibility layer"
+                    .to_string(),
+                Some("Run 'dcg install --grok' for a native hook".to_string()),
+            )
+        } else {
+            // Grok is in use and the guard is wired NOWHERE for it.
+            issues += 1;
+            if fix && install_grok_hook(false, false).is_ok() {
+                fixed += 1;
+                grok_fixed = true;
+                (
+                    DoctorCheckStatus::Ok,
+                    format!("Installed native Grok hook at {}", user_hook.display()),
+                    None,
+                )
+            } else {
+                (
+                    DoctorCheckStatus::Error,
+                    "Grok is in use but dcg is registered neither natively nor via the \
+                     Claude compatibility layer"
+                        .to_string(),
+                    Some("Run 'dcg install --grok'".to_string()),
+                )
+            }
+        };
+        checks.push(DoctorCheck {
+            id: "grok_hook",
+            name: "Grok hook registration",
+            status,
+            message,
+            remediation,
+            fixed: grok_fixed,
+        });
     }
 
     DoctorReport {
@@ -12370,7 +12532,7 @@ fn launch_windows_update_worker_direct(
         let mut breakaway = runner_command(runner_path);
         breakaway.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB);
         match breakaway.spawn() {
-            Ok(_) => return Ok(()),
+            Ok(_) => Ok(()),
             Err(breakaway_error) => {
                 let mut detached = runner_command(runner_path);
                 detached.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
@@ -12380,7 +12542,7 @@ fn launch_windows_update_worker_direct(
                          detached worker failed ({detached_error})"
                     )
                 })?;
-                return Ok(());
+                Ok(())
             }
         }
     }
@@ -16936,7 +17098,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let runner = temp.path().join("run-update-after-exit.ps1");
         std::fs::write(&runner, WINDOWS_UPDATE_RUNNER).unwrap();
-        let parser_probe = r#"$tokens = $null
+        let parser_probe = r"$tokens = $null
 $errors = $null
 [Management.Automation.Language.Parser]::ParseFile(
   $env:DCG_UPDATE_RUNNER_PARSE_PATH,
@@ -16946,7 +17108,7 @@ $errors = $null
 if ($errors.Count -ne 0) {
   $errors | ForEach-Object { Write-Error ([string]$_) }
   exit 1
-}"#;
+}";
         let output = std::process::Command::new("powershell.exe")
             .arg("-NoProfile")
             .arg("-NonInteractive")
