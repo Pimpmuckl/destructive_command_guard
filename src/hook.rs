@@ -945,7 +945,9 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
     //     Claude uses PascalCase "PreToolUse", Copilot uses hyphenated
     //     "pre-tool-use" but only via the `event` field — never via
     //     `hookEventName`).
-    //   - toolName="run_terminal_cmd" (Grok's internal shell tool name).
+    //   - toolName="run_terminal_cmd" / "run_terminal_command" (Grok's
+    //     internal shell tool name; older builds use the abbreviated form,
+    //     current Grok Build documents the full spelling — issue #319).
     // Either signal alone is a strong Grok indicator. We deliberately do
     // NOT add a GROK_* env-var fallback: real Grok hook invocations always
     // emit both fields, so the wire-level check is sufficient, and an
@@ -953,7 +955,7 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
     // a shell that happens to live inside a Grok session (e.g. running
     // `cargo test` from a Grok-spawned terminal).
     let is_grok_event = hook_event_name == "pre_tool_use";
-    let is_grok_tool = tool_name == "run_terminal_cmd";
+    let is_grok_tool = tool_name == "run_terminal_cmd" || tool_name == "run_terminal_command";
     if (is_grok_event || is_grok_tool) && input.event.is_none() && input.tool_args.is_none() {
         return HookProtocol::Grok;
     }
@@ -1147,10 +1149,14 @@ pub(crate) fn is_supported_shell_tool(tool_name: Option<&str>) -> bool {
             // wrapper script which translates upstream to "Bash" before
             // invoking dcg, so the only path here is genuine Hermes input.
             | "terminal"
-            // Grok (xAI) shell tool. Grok aliases Claude-style "Bash" to its
-            // internal name `run_terminal_cmd` before invoking hooks, so the
-            // toolName field on the wire is always this canonical form.
+            // Grok (xAI) shell tool. Grok aliases Claude-style "Bash" to an
+            // internal terminal tool before invoking hooks. Older builds put
+            // `run_terminal_cmd` on the wire; current Grok Build documents
+            // `run_terminal_command` (issue #319). Accept both spellings —
+            // missing either one makes the hook silently fail open on the
+            // exact path Grok uses.
             | "run_terminal_cmd"
+            | "run_terminal_command"
         )
 }
 
@@ -1171,6 +1177,255 @@ pub(crate) fn shell_dialect_for_tool_name(tool_name: Option<&str>) -> ShellDiale
         "powershell" | "pwsh" => ShellDialect::PowerShell,
         "cmd" | "cmd.exe" => ShellDialect::Cmd,
         _ => ShellDialect::Unknown,
+    }
+}
+
+/// PowerShell approved verbs (the `Verb-Noun` cmdlet naming standard).
+///
+/// Compared case-insensitively against the verb half of a candidate cmdlet
+/// token. This is the full Microsoft approved-verb list rather than a
+/// destructive subset: the list only ever WIDENS a dialect to `Unknown`
+/// (fail-closed union), so an over-broad match costs one extra dialect's
+/// evaluation, while an omission re-opens the #322 hole for cmdlets built on
+/// that verb.
+const POWERSHELL_APPROVED_VERBS: &[&str] = &[
+    "add",
+    "approve",
+    "assert",
+    "backup",
+    "block",
+    "build",
+    "checkpoint",
+    "clear",
+    "close",
+    "compare",
+    "complete",
+    "compress",
+    "confirm",
+    "connect",
+    "convert",
+    "convertfrom",
+    "convertto",
+    "copy",
+    "debug",
+    "deny",
+    "deploy",
+    "disable",
+    "disconnect",
+    "dismount",
+    "edit",
+    "enable",
+    "enter",
+    "exit",
+    "expand",
+    "export",
+    "find",
+    "format",
+    "get",
+    "grant",
+    "group",
+    "hide",
+    "import",
+    "initialize",
+    "install",
+    "invoke",
+    "join",
+    "limit",
+    "lock",
+    "measure",
+    "merge",
+    "mount",
+    "move",
+    "new",
+    "open",
+    "optimize",
+    "out",
+    "ping",
+    "pop",
+    "protect",
+    "publish",
+    "push",
+    "read",
+    "receive",
+    "redo",
+    "register",
+    "remove",
+    "rename",
+    "repair",
+    "request",
+    "reset",
+    "resize",
+    "resolve",
+    "restart",
+    "restore",
+    "resume",
+    "revoke",
+    "save",
+    "search",
+    "select",
+    "send",
+    "set",
+    "show",
+    "skip",
+    "split",
+    "start",
+    "step",
+    "stop",
+    "submit",
+    "suspend",
+    "switch",
+    "sync",
+    "test",
+    "trace",
+    "unblock",
+    "undo",
+    "uninstall",
+    "unlock",
+    "unprotect",
+    "unpublish",
+    "unregister",
+    "update",
+    "use",
+    "wait",
+    "watch",
+    "write",
+];
+
+/// Return whether `token` has the shape of a PowerShell cmdlet invocation:
+/// `Verb-Noun` where the verb is on the approved-verb list and the noun is a
+/// single alphanumeric word.
+fn is_powershell_cmdlet_token(token: &str) -> bool {
+    let Some((verb, noun)) = token.split_once('-') else {
+        return false;
+    };
+    if verb.is_empty()
+        || noun.is_empty()
+        || !verb.bytes().all(|b| b.is_ascii_alphabetic())
+        || !noun.bytes().all(|b| b.is_ascii_alphanumeric())
+    {
+        return false;
+    }
+    POWERSHELL_APPROVED_VERBS
+        .iter()
+        .any(|approved| verb.eq_ignore_ascii_case(approved))
+}
+
+/// Windows destructive commands whose *bare name* collides with POSIX (`rm`,
+/// `del`) or is simply unknown to POSIX (`rd`, `ri`). The name alone is
+/// ambiguous, so widening additionally requires a Windows-shell-only argument
+/// shape (see [`segment_is_windows_alias_invocation`]).
+const WINDOWS_DESTRUCTIVE_ALIASES: &[&str] = &["rm", "ri", "del", "rd", "rmdir", "erase"];
+
+/// PowerShell `Remove-Item` parameter names used as the discriminator. A
+/// single-dash token whose name is a >=3-character prefix of one of these is
+/// unmistakably PowerShell: POSIX/GNU `rm` never accepts a single-dash
+/// multi-letter *word* (`-rf` is a short-flag cluster, not `-recurse`), and
+/// GNU long options use a double dash (`--recursive`). The 3-char floor keeps
+/// `-r`/`-f`/`-rf` (POSIX) from ever matching.
+const REMOVE_ITEM_PS_PARAM_WORDS: &[&str] = &[
+    "recurse",
+    "force",
+    "path",
+    "literalpath",
+    "include",
+    "exclude",
+    "filter",
+    "confirm",
+    "whatif",
+];
+
+/// Return whether `token` is a single-dash PowerShell parameter (`-Recurse`,
+/// `-Force`, `-Path`, …) rather than a POSIX short-flag cluster. Requires a
+/// single leading `-`, an all-alphabetic name of length >= 3, and that name to
+/// be a prefix of a known `Remove-Item` parameter.
+fn is_powershell_parameter_token(token: &str) -> bool {
+    let Some(name) = token.strip_prefix('-') else {
+        return false;
+    };
+    // A second dash means a GNU long option (`--recursive`), not PowerShell.
+    if name.starts_with('-') || name.len() < 3 || !name.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return false;
+    }
+    let lower = name.to_ascii_lowercase();
+    REMOVE_ITEM_PS_PARAM_WORDS
+        .iter()
+        .any(|word| word.starts_with(&lower))
+}
+
+/// Return whether `token` is the cmd.exe recursion switch `/s` (alone or
+/// stuck to `/q`). `/s` is the switch that makes `del`/`rd` catastrophic. A
+/// literal `/s` *can* be a POSIX absolute path, so this is only consulted
+/// after the segment already leads with a destructive alias, and widening to
+/// `Unknown` is the fail-closed direction: the worst case is that a bizarre
+/// POSIX `rm /s` gets the union-of-dialects evaluation (still allowed — no
+/// windows rule matches a bare `rm` with a `/s` operand), never a fail-open.
+/// Bare `/q`/`/f` do not recurse, so they are not widening triggers alone.
+fn is_cmd_switch_token(token: &str) -> bool {
+    matches!(token.to_ascii_lowercase().as_str(), "/s" | "/s/q" | "/q/s")
+}
+
+/// Return whether a single statement segment is a Windows-shell invocation of
+/// a destructive alias — either PowerShell (`rm -Recurse -Force …`) or cmd
+/// (`del /s /q …`, `rd /s …`). The bare alias is never enough; a
+/// Windows-shell-only argument shape must accompany it so a plain POSIX
+/// `rm -rf ./build` keeps the Posix dialect.
+///
+/// A bare `--` ends the scan: it is POSIX end-of-options, after which
+/// `-Recurse`/`/s` are filenames, not flags. PowerShell never spells options
+/// with `--`, so stopping there cannot miss a real PowerShell command while
+/// it does stop `rm -- -Recurse` (deleting a file literally named
+/// `-Recurse`) from being mis-widened.
+fn segment_is_windows_alias_invocation(segment: &str) -> bool {
+    let mut tokens = segment.split_whitespace();
+    let Some(first) = tokens.next() else {
+        return false;
+    };
+    let name = first
+        .to_ascii_lowercase()
+        .strip_suffix(".exe")
+        .map_or_else(|| first.to_ascii_lowercase(), str::to_string);
+    if !WINDOWS_DESTRUCTIVE_ALIASES.contains(&name.as_str()) {
+        return false;
+    }
+    tokens
+        .take_while(|token| *token != "--")
+        .any(|token| is_powershell_parameter_token(token) || is_cmd_switch_token(token))
+}
+
+/// Return whether any statement/pipeline segment of `command` is unmistakably
+/// Windows shell: a PowerShell cmdlet-shaped leading token (`Remove-Item …`,
+/// `… ; Clear-Content …`) or a destructive alias carrying a Windows-shell-only
+/// argument (`rm -Recurse -Force …`, `del /s /q …`).
+fn command_has_powershell_shape(command: &str) -> bool {
+    command
+        .split(['|', ';', '&', '\n', '\r', '(', '{'])
+        .any(|segment| {
+            segment
+                .split_whitespace()
+                .next()
+                .is_some_and(is_powershell_cmdlet_token)
+                || segment_is_windows_alias_invocation(segment)
+        })
+}
+
+/// Down-trust a `Bash`-labeled dialect when the command itself is
+/// unmistakably PowerShell.
+///
+/// VS Code's Agent Host transforms PowerShell tool calls before invoking
+/// PreToolUse hooks and puts `tool_name: "Bash"` on the wire (#322, #252), so
+/// dcg evaluated `Remove-Item -Recurse -Force` under the POSIX dialect —
+/// where a cmdlet is just an unknown binary — and failed open. The tool-name
+/// label is host-controlled and demonstrably wrong in the wild; when the
+/// command's own shape contradicts it, the honest dialect is `Unknown`, which
+/// evaluates the fail-closed union of every dialect. Explicit
+/// `powershell`/`pwsh`/`cmd` labels are never widened (they already evaluate
+/// the dialect the command will run under), and non-cmdlet POSIX commands are
+/// unaffected.
+pub fn refine_shell_dialect(command: &str, labeled: ShellDialect) -> ShellDialect {
+    if labeled == ShellDialect::Posix && command_has_powershell_shape(command) {
+        ShellDialect::Unknown
+    } else {
+        labeled
     }
 }
 
@@ -1318,12 +1573,17 @@ pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCo
                 continue;
             }
             if let Some(command) = call.args.as_ref().and_then(extract_command_from_tool_args) {
-                commands.push((command, shell_dialect_for_tool_name(call.name.as_deref())));
+                let entry_dialect = refine_shell_dialect(
+                    &command,
+                    shell_dialect_for_tool_name(call.name.as_deref()),
+                );
+                commands.push((command, entry_dialect));
             }
         }
         if let Some(tool_call) = input.tool_call.as_ref() {
             if let Some(command) = extract_command_from_tool_call(tool_call) {
-                commands.push((command, dialect));
+                let entry_dialect = refine_shell_dialect(&command, dialect);
+                commands.push((command, entry_dialect));
             }
         }
         if let Some(command) = input
@@ -1331,14 +1591,16 @@ pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCo
             .as_ref()
             .and_then(extract_command_from_tool_input)
         {
-            commands.push((command, dialect));
+            let entry_dialect = refine_shell_dialect(&command, dialect);
+            commands.push((command, entry_dialect));
         }
         if let Some(command) = input
             .tool_args
             .as_ref()
             .and_then(extract_command_from_tool_args)
         {
-            commands.push((command, dialect));
+            let entry_dialect = refine_shell_dialect(&command, dialect);
+            commands.push((command, entry_dialect));
         }
         let mut entries = commands.into_iter();
         if let Some((command, primary_dialect)) = entries.next() {
@@ -1354,6 +1616,7 @@ pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCo
     // Antigravity CLI (`agy`) nests the command under `toolCall.args.CommandLine`.
     if let Some(tool_call) = input.tool_call.as_ref() {
         if let Some(command) = extract_command_from_tool_call(tool_call) {
+            let dialect = refine_shell_dialect(&command, dialect);
             return Some(ExtractedHookCommand {
                 command,
                 protocol,
@@ -1365,6 +1628,7 @@ pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCo
 
     if let Some(tool_input) = input.tool_input.as_ref() {
         if let Some(command) = extract_command_from_tool_input(tool_input) {
+            let dialect = refine_shell_dialect(&command, dialect);
             return Some(ExtractedHookCommand {
                 command,
                 protocol,
@@ -1376,6 +1640,7 @@ pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCo
 
     if let Some(tool_args) = input.tool_args.as_ref() {
         if let Some(command) = extract_command_from_tool_args(tool_args) {
+            let dialect = refine_shell_dialect(&command, dialect);
             return Some(ExtractedHookCommand {
                 command,
                 protocol,
@@ -1685,7 +1950,16 @@ fn pattern_suggestion_alternatives(
         .iter()
         .filter(|suggestion| suggestion.platform.matches_current())
         .take(MAX_SUGGESTIONS)
-        .map(|suggestion| format!("{}: {}", suggestion.description, suggestion.command))
+        .map(|suggestion| {
+            if suggestion.gated {
+                format!(
+                    "{}: {}  (dcg gates this too — it needs explicit approval)",
+                    suggestion.description, suggestion.command
+                )
+            } else {
+                format!("{}: {}", suggestion.description, suggestion.command)
+            }
+        })
         .collect();
 
     if alternatives.is_empty() {
@@ -2767,6 +3041,139 @@ mod tests {
     }
 
     #[test]
+    fn test_322_powershell_shaped_command_widens_mislabeled_bash_dialect() {
+        // VS Code Agent Host transforms PowerShell tool calls and puts
+        // `tool_name: "Bash"` on the wire (#322/#252). A Posix-labeled
+        // command that is unmistakably PowerShell must evaluate as
+        // `Unknown` (fail-closed union of all dialects), not as Posix
+        // where a cmdlet is an inert unknown binary.
+        let json = r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"Remove-Item -LiteralPath .\\pipelines -Recurse -Force"}}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        let extracted = extract_command_with_context(&input).expect("shell command");
+        assert_eq!(extracted.dialect, ShellDialect::Unknown);
+
+        // Cmdlet later in a statement list still widens.
+        let json = r#"{"tool_name":"Bash","tool_input":{"command":"cd pipelines; Clear-Content secrets.txt"}}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        let extracted = extract_command_with_context(&input).expect("shell command");
+        assert_eq!(extracted.dialect, ShellDialect::Unknown);
+
+        // Ordinary POSIX commands keep the Posix dialect...
+        for command in [
+            "git status",
+            "ls -la",
+            "apt-get install jq",
+            "docker-compose up -d",
+            "add-apt-repository ppa:x/y",
+            "start-stop-daemon --stop --name foo",
+            "./remove-item",
+            "echo Remove-Item is a cmdlet | cat",
+        ] {
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Posix,
+                "must not widen plain POSIX command {command:?}"
+            );
+        }
+
+        // Destructive PowerShell/cmd ALIASES with a Windows-shell-only
+        // argument widen too (fresh-eyes follow-up to #322): the alias name
+        // alone is ambiguous with POSIX, but `-Recurse`/`-Force`/`/s` are not.
+        for command in [
+            "rm -Recurse -Force .\\pipelines",
+            "rm -Force -Recurse .\\pipelines",
+            "ri -Recurse C:\\build",
+            "del /s /q C:\\src",
+            "rd /s C:\\dir",
+            "rmdir /s /q .\\out",
+            "erase /q /s C:\\tmp",
+            "cd build; rm -Recurse -Force .\\dist",
+            "Del.exe /S /Q C:\\src",
+        ] {
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Unknown,
+                "Windows alias invocation must widen: {command:?}"
+            );
+        }
+
+        // But a plain POSIX invocation of the same aliases must NOT widen —
+        // `-rf`/`-r`/`-f` are short-flag clusters, not `-Recurse`, and a
+        // GNU long option uses a double dash.
+        for command in [
+            "rm -rf ./build",
+            "rm -r -f ./build",
+            "rm -fr /tmp/x",
+            "rm --recursive --force ./build",
+            "rm -rf --no-preserve-root /x",
+            "del file.txt",
+            "rm file.txt",
+            "rmdir emptydir",
+            // POSIX end-of-options: `-Recurse` here is a filename, not a flag,
+            // and PowerShell never spells options with `--`.
+            "rm -- -Recurse",
+            "rm -- -Force ./weird-file",
+        ] {
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Posix,
+                "plain POSIX alias usage must not widen: {command:?}"
+            );
+        }
+
+        // ...and explicit shell labels are never second-guessed.
+        assert_eq!(
+            refine_shell_dialect("Remove-Item x", ShellDialect::PowerShell),
+            ShellDialect::PowerShell
+        );
+        assert_eq!(
+            refine_shell_dialect("Remove-Item x", ShellDialect::Cmd),
+            ShellDialect::Cmd
+        );
+        assert_eq!(
+            refine_shell_dialect("Remove-Item x", ShellDialect::Unknown),
+            ShellDialect::Unknown
+        );
+    }
+
+    #[test]
+    fn test_322_cmdlet_token_shape() {
+        for token in [
+            "Remove-Item",
+            "remove-item",
+            "REMOVE-ITEM",
+            "Clear-Content",
+            "Set-ExecutionPolicy",
+            "Stop-Process",
+            "Format-Volume",
+            "Invoke-Expression",
+        ] {
+            assert!(
+                is_powershell_cmdlet_token(token),
+                "{token:?} must be recognized as a cmdlet"
+            );
+        }
+        for token in [
+            "apt-get",
+            "docker-compose",
+            "git-crypt",
+            "add-apt-repository",
+            "start-stop-daemon",
+            "-Recurse",
+            "remove-",
+            "-item",
+            "get-pip.py",
+            "remove_item",
+            "rm",
+        ] {
+            assert!(
+                !is_powershell_cmdlet_token(token),
+                "{token:?} must NOT be recognized as a cmdlet"
+            );
+        }
+    }
+
+    #[test]
     fn test_legacy_extraction_wrappers_match_typed_context() {
         let cases = [
             r#"{"tool_name":"Bash","tool_input":{"command":"echo hello"}}"#,
@@ -3650,6 +4057,37 @@ mod tests {
     }
 
     #[test]
+    fn test_grok_run_terminal_command_full_spelling_is_supported() {
+        // Grok Build's own hooks guide documents the shell tool as
+        // `run_terminal_command` (full spelling), not the abbreviated
+        // `run_terminal_cmd` dcg originally shipped with. Before issue #319
+        // this envelope was answered with a "skip" — a silent fail-open on
+        // the exact path Grok uses. Both spellings must classify as Grok,
+        // count as a supported shell tool, and yield the command.
+        let json = r#"{
+            "hookEventName":"pre_tool_use",
+            "toolName":"run_terminal_command",
+            "toolInput":{"command":"git reset --hard HEAD"},
+            "cwd":"/home/user/proj",
+            "workspaceRoot":"/home/user/proj"
+        }"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Grok);
+        assert!(is_supported_shell_tool(Some("run_terminal_command")));
+        let extracted = extract_command_with_context(&input).expect("shell command");
+        assert_eq!(extracted.command, "git reset --hard HEAD");
+        assert_eq!(extracted.protocol, HookProtocol::Grok);
+
+        // Tool name alone (no event marker) must also route to Grok.
+        let json = r#"{
+            "toolName":"run_terminal_command",
+            "toolInput":{"command":"echo hi"}
+        }"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Grok);
+    }
+
+    #[test]
     fn test_grok_full_envelope_camelcase() {
         // Realistic Grok payload, every documented field present.
         let json = r#"{
@@ -4392,6 +4830,26 @@ mod tests {
             vec![
                 "Save uncommitted changes: git stash",
                 "Preview untracked file cleanup: git clean -n"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_pattern_suggestion_alternatives_marks_gated_entries() {
+        let suggestions = [
+            PatternSuggestion::new("ls -la ~/x", "Verify the path"),
+            PatternSuggestion::gated("mv ~/x ~/x.deleted", "Soft-delete rename"),
+        ];
+
+        let alternatives = pattern_suggestion_alternatives("mv ~/x /tmp/y", true, &suggestions);
+
+        assert_eq!(
+            alternatives,
+            vec![
+                "Verify the path: ls -la ~/x".to_string(),
+                "Soft-delete rename: mv ~/x ~/x.deleted  \
+                 (dcg gates this too — it needs explicit approval)"
+                    .to_string(),
             ]
         );
     }

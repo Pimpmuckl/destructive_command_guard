@@ -372,6 +372,13 @@ detect_agents() {
     DETECTED_AGENTS+=("posit-assistant")
     POSIT_ASSISTANT_VERSION=$(try_version pa)
   fi
+
+  # OpenCode (opencode.ai) — global config at ${XDG_CONFIG_HOME:-~/.config}/opencode,
+  # optional `opencode` CLI on PATH.
+  if [[ -d "${XDG_CONFIG_HOME:-$HOME/.config}/opencode" ]] || command -v opencode &>/dev/null; then
+    DETECTED_AGENTS+=("opencode")
+    OPENCODE_VERSION=$(try_version opencode)
+  fi
 }
 
 print_detected_agents() {
@@ -434,6 +441,11 @@ print_detected_agents() {
           [[ -n "$POSIT_ASSISTANT_VERSION" ]] && ver_info=" (${POSIT_ASSISTANT_VERSION})"
           gum style --foreground 42 "  ✓ Posit Assistant${ver_info}"
           ;;
+        opencode)
+          local ver_info=""
+          [[ -n "$OPENCODE_VERSION" ]] && ver_info=" (${OPENCODE_VERSION})"
+          gum style --foreground 42 "  ✓ OpenCode${ver_info}"
+          ;;
       esac
     done
     echo ""
@@ -486,6 +498,11 @@ print_detected_agents() {
           local ver_info=""
           [[ -n "$POSIT_ASSISTANT_VERSION" ]] && ver_info=" (${POSIT_ASSISTANT_VERSION})"
           echo -e "  \033[0;32m✓\033[0m Posit Assistant${ver_info}"
+          ;;
+        opencode)
+          local ver_info=""
+          [[ -n "$OPENCODE_VERSION" ]] && ver_info=" (${OPENCODE_VERSION})"
+          echo -e "  \033[0;32m✓\033[0m OpenCode${ver_info}"
           ;;
       esac
     done
@@ -851,6 +868,26 @@ maybe_add_path() {
 
 DCG_SHELL_CHECK_MARKER="# dcg: warn if hook was silently removed"
 
+# Replace the managed dcg shell-check region (the marker line through the
+# first column-0 `fi`) in an RC file with the current snippet body. Used when
+# a marker is present but the block text is stale (issue #282's second act:
+# marker-only idempotence pinned users to the first snippet they ever got).
+# $1 = rc file, $2 = replacement text (snippet without its leading blank line).
+repair_shell_check_region() {
+  local rc="$1" body="$2" start end tmp
+  start=$( { grep -nF "$DCG_SHELL_CHECK_MARKER" "$rc" | head -n 1 | cut -d: -f1; } 2>/dev/null || true)
+  [ -n "$start" ] || return 1
+  end=$(awk -v s="$start" 'NR >= s && /^fi[ \t]*$/ { print NR; exit }' "$rc" 2>/dev/null || true)
+  [ -n "$end" ] || return 1
+  tmp=$(mktemp) || return 1
+  {
+    head -n $((start - 1)) "$rc"
+    printf '%s\n' "$body"
+    tail -n +"$((end + 1))" "$rc"
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  cat "$tmp" > "$rc" && rm -f "$tmp"
+}
+
 maybe_add_shell_check() {
   # Add a shell startup check that warns if the DCG hook has been silently
   # removed from ~/.claude/settings.json. Silent when present, fast (ms),
@@ -868,12 +905,28 @@ if command -v dcg &>/dev/null && command -v jq &>/dev/null; then
 fi
 EOFSNIPPET
   )
+  # The snippet minus its leading blank line: what a managed region should
+  # contain, used both as the is-current test and the repair replacement.
+  local body="${snippet#?}"
 
   local added=0
   for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
     if [ -e "$rc" ] && [ -w "$rc" ]; then
       if grep -qF "$DCG_SHELL_CHECK_MARKER" "$rc" 2>/dev/null; then
-        added=1  # Already present — don't trigger fallback
+        added=1  # Present — repair in place if the block text is stale
+        case "$(cat "$rc")" in
+          *"$body"*) ;;
+          *)
+            if repair_shell_check_region "$rc" "$body"; then
+              ok "Updated stale shell startup check in $rc"
+            else
+              # Region boundary unrecognizable — append a current block so at
+              # least the up-to-date check runs.
+              printf '%s\n' "$snippet" >> "$rc"
+              ok "Appended current shell startup check to $rc (old block not auto-removable)"
+            fi
+          ;;
+        esac
         continue
       fi
       printf '%s\n' "$snippet" >> "$rc"
@@ -1652,6 +1705,8 @@ HERMES_STATUS=""  # "created"|"merged"|"already"|"skipped"|"failed"
 HERMES_FAILURE_REASON=""
 POSIT_ASSISTANT_STATUS=""  # "created"|"merged"|"already"|"skipped"|"failed"
 POSIT_ASSISTANT_FAILURE_REASON=""
+OPENCODE_STATUS=""  # "created"|"merged"|"skipped"|"failed"|"conflict"
+OPENCODE_FAILURE_REASON=""
 POSIT_ASSISTANT_BACKUP=""
 CLAUDE_BACKUP=""
 GEMINI_BACKUP=""
@@ -3728,6 +3783,52 @@ EOFSET
   fi
 }
 
+configure_opencode() {
+  # OpenCode (opencode.ai) intercepts shell commands only through plugins, so
+  # dcg ships a native `tool.execute.before` plugin (#318). The freshly
+  # installed binary is the single source of truth for the plugin content:
+  # `dcg install --opencode` writes
+  # ${XDG_CONFIG_HOME:-~/.config}/opencode/plugins/dcg-guard.js with an
+  # ownership marker, refuses to overwrite a user-owned file of the same name,
+  # and `--force` refreshes a dcg-owned one (keeping the embedded binary path
+  # current across upgrades).
+  if ! is_agent_detected "opencode"; then
+    OPENCODE_STATUS="skipped"
+    return 0
+  fi
+
+  local dcg_bin="$DEST/dcg"
+  if [ ! -x "$dcg_bin" ]; then
+    OPENCODE_STATUS="failed"
+    OPENCODE_FAILURE_REASON="dcg binary not found at $dcg_bin"
+    return 1
+  fi
+
+  local plugin_path="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins/dcg-guard.js"
+  local existed=0
+  [ -f "$plugin_path" ] && existed=1
+
+  local output
+  if output=$("$dcg_bin" install --opencode --force 2>&1); then
+    if [ "$existed" -eq 1 ]; then
+      OPENCODE_STATUS="merged"
+    else
+      OPENCODE_STATUS="created"
+    fi
+    AUTO_CONFIGURED=1
+    return 0
+  fi
+
+  if printf '%s' "$output" | grep -q "was not generated by dcg"; then
+    OPENCODE_STATUS="conflict"
+    OPENCODE_FAILURE_REASON="existing $plugin_path is not dcg-owned"
+  else
+    OPENCODE_STATUS="failed"
+    OPENCODE_FAILURE_REASON=$(printf '%s' "$output" | tail -n 1)
+  fi
+  return 1
+}
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Run Auto-Configuration
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3801,6 +3902,9 @@ if [ "$NO_CONFIGURE" -eq 0 ]; then
 
   # Configure Posit Assistant (if installed)
   configure_posit_assistant
+
+  # Configure OpenCode (if installed)
+  configure_opencode
 else
   info "Skipping agent configuration (--no-configure)"
 fi
@@ -4048,6 +4152,29 @@ case "$POSIT_ASSISTANT_STATUS" in
       summary_lines+=("Posit Assistant: Configuration failed ($POSIT_ASSISTANT_FAILURE_REASON)")
     else
       summary_lines+=("Posit Assistant: Configuration failed")
+    fi
+    ;;
+esac
+
+case "$OPENCODE_STATUS" in
+  created)
+    summary_lines+=("OpenCode:    Installed native tool.execute.before plugin (dcg-guard.js)")
+    summary_lines+=("             Restart OpenCode to load it")
+    ;;
+  merged)
+    summary_lines+=("OpenCode:    Refreshed dcg-owned plugin (dcg-guard.js)")
+    ;;
+  skipped|"")
+    summary_lines+=("OpenCode:    Not installed (skipped)")
+    ;;
+  conflict)
+    summary_lines+=("OpenCode:    Skipped — existing dcg-guard.js is not dcg-owned ($OPENCODE_FAILURE_REASON)")
+    ;;
+  failed)
+    if [ -n "$OPENCODE_FAILURE_REASON" ]; then
+      summary_lines+=("OpenCode:    Configuration failed ($OPENCODE_FAILURE_REASON)")
+    else
+      summary_lines+=("OpenCode:    Configuration failed")
     fi
     ;;
 esac

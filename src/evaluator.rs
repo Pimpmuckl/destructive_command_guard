@@ -5428,6 +5428,42 @@ fn windows_launcher_envelopes(
     Ok((envelopes, all_segments_are_envelopes))
 }
 
+/// Deny an unverifiable launcher under a stable rule id, honoring an
+/// allowlist grant for that rule first (mirrors the
+/// `ExecutableTextSink::Unverified` handling). Returns `None` when the rule
+/// is allowlisted — the caller falls back to ordinary evaluation — recording
+/// the hit for audit output.
+fn launcher_unverified_denial(
+    rule: &str,
+    reason: &str,
+    allowlists: &LayeredAllowlist,
+    project_path: Option<&Path>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+) -> Option<EvaluationResult> {
+    let (pack_id, pattern_name) = split_ast_rule_id(rule);
+    if let Some(hit) = allowlists.match_rule_at_path(&pack_id, &pattern_name, project_path) {
+        if first_allowlist_hit.is_none() {
+            *first_allowlist_hit = Some((
+                PatternMatch {
+                    pack_id: Some(pack_id),
+                    pattern_name: Some(pattern_name),
+                    severity: Some(crate::packs::Severity::High),
+                    reason: reason.to_string(),
+                    source: MatchSource::HeredocAst,
+                    matched_span: None,
+                    matched_text_preview: None,
+                    explanation: None,
+                    suggestions: &[],
+                },
+                hit.layer,
+                hit.entry.reason.clone(),
+            ));
+        }
+        return None;
+    }
+    Some(EvaluationResult::denied_by_embedded_sink(rule, reason))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn evaluate_windows_launcher_envelopes(
     command: &str,
@@ -5509,9 +5545,15 @@ fn evaluate_windows_launcher_envelopes(
     ) {
         Ok(scan) => scan,
         Err(reason) => {
-            return Some(EvaluationResult::denied_by_legacy(&format!(
-                "Embedded shell launcher cannot be statically verified: {reason}"
-            )));
+            // Allowlisting the rule falls back to ordinary evaluation of the
+            // command; the launcher envelope itself contributes no decision.
+            return launcher_unverified_denial(
+                WINDOWS_LAUNCHER_UNVERIFIED_RULE,
+                &format!("Embedded shell launcher cannot be statically verified: {reason}"),
+                allowlists,
+                project_path,
+                first_allowlist_hit,
+            );
         }
     };
 
@@ -5874,9 +5916,20 @@ fn evaluate_obfuscated_posix_inline_launchers(
             match parse_obfuscated_posix_inline_launcher_segment(segment, max_payload_bytes) {
                 PosixInlineLauncherParse::NotLauncher => continue,
                 PosixInlineLauncherParse::Unverified(reason) => {
-                    return Some(EvaluationResult::denied_by_legacy(&format!(
-                        "Inline interpreter launcher cannot be statically verified: {reason}"
-                    )));
+                    if let Some(denial) = launcher_unverified_denial(
+                        POSIX_INLINE_LAUNCHER_UNVERIFIED_RULE,
+                        &format!(
+                            "Inline interpreter launcher cannot be statically verified: {reason}"
+                        ),
+                        allowlists,
+                        project_path,
+                        first_allowlist_hit,
+                    ) {
+                        return Some(denial);
+                    }
+                    // Allowlisted: this segment's launcher contributes no
+                    // decision; keep scanning the remaining segments.
+                    continue;
                 }
                 PosixInlineLauncherParse::Envelope(envelope) => envelope,
             };
@@ -6353,6 +6406,14 @@ const PROCESS_SUBSTITUTION_RULE: &str = "heredoc.posix.process-substitution";
 const SINK_ANALYSIS_BOUNDS_RULE: &str = "heredoc.shell.analysis-bounds";
 const POWERSHELL_IEX_RULE: &str = "heredoc.powershell.invoke-expression-dynamic";
 const POWERSHELL_SCRIPTBLOCK_RULE: &str = "heredoc.powershell.scriptblock-dynamic";
+/// A PowerShell/cmd launcher assembled through escaping, control prefixes, or
+/// dynamic expansion that the envelope parser cannot statically verify
+/// (#316/bd-l9jf: previously an unattributed `MatchSource::LegacyPattern`
+/// denial with `rule_id: null`, which nothing could allowlist or tune).
+const WINDOWS_LAUNCHER_UNVERIFIED_RULE: &str = "heredoc.shell.launcher-unverified";
+/// A POSIX inline interpreter launcher (`sh -c`, `python -c`, …) whose payload
+/// is assembled dynamically and cannot be statically verified (#316/bd-l9jf).
+const POSIX_INLINE_LAUNCHER_UNVERIFIED_RULE: &str = "heredoc.posix.inline-launcher-unverified";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ExecutableTextSink {
@@ -12438,7 +12499,13 @@ fn evaluate_command_in_single_dialect_view(
         Some(&nested_context),
         inherited_automated_stdin,
     );
-    if result.allowlist_override.is_none() {
+    // Attribute an ALLOW outcome to the recorded heredoc/launcher allowlist
+    // grant — but never let that attribution replace a pack denial or an
+    // indeterminate verdict. A grant scoped to e.g.
+    // `heredoc.shell:launcher-unverified` skips only that fail-closed check;
+    // `powershell -EncodedCommand … ; rm -rf /` must still be denied by the
+    // packs on its own merits (bd-l9jf whole-command leg).
+    if result.is_allowed() && result.allowlist_override.is_none() {
         if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
             return EvaluationResult::allowed_by_allowlist(matched, layer, reason);
         }
@@ -19603,9 +19670,38 @@ fn evaluate_packs_with_allowlists_at_depth(
             // the operator offset lies inside an inert quoted span (#225). The
             // anti-bypass forms keep the operator outside the quotes, so they
             // still match here.
+            //
+            // A match inside an inline interpreter payload (`sh -c "echo
+            // 'a => %s'"`, `python3 -c "print('a => %s')"`) re-derives quote
+            // context FROM THE PAYLOAD, exactly as the command-oriented rules
+            // do post-6f1aa5a: a `>` that the payload's own quoting proves to
+            // be string-literal bytes is not shell redirect syntax, and a
+            // real redirect elsewhere in the segment (`2>&1`) must not strip
+            // the payload of that context (issue #317). A live `>` inside the
+            // payload (`bash -c "cat x > $T"`) classifies as code there and
+            // keeps the deny; a real redirect OUTSIDE the payload is covered
+            // both here (its own offset is unquoted) and by the per-segment
+            // redirect-view pass, which masks the payload and evaluates only
+            // the segment's true redirect syntax.
             if is_core_filesystem_redirect_rule(pack_id, pattern.name)
                 && (crate::context::offset_is_quoted_data(command_for_packs, span.start)
-                    || first_unquoted_output_redirect(command_for_packs, shell_dialect).is_none())
+                    || first_unquoted_output_redirect(command_for_packs, shell_dialect).is_none()
+                    || inline_payload_offset_is_quoted_redirect_data(command_for_packs, span.start))
+            {
+                continue;
+            }
+
+            // PowerShell's `$null` automatic variable is the null device —
+            // `2>$null` is the idiomatic `2>/dev/null` and never opens a
+            // file, and `$null` is a read-only constant that cannot be
+            // reassigned to a path. When the dialect is proven PowerShell and
+            // every redirect target in the command is `$null`, the
+            // dynamic-path rule stands down (issue #321). Any other variable
+            // (`$nullFile`, `$none`) and any non-PowerShell dialect keep the
+            // fail-closed denial.
+            if pattern.name == Some("redirect-truncate-dynamic-path")
+                && pack_id == "core.filesystem"
+                && powershell_null_device_redirects_only(command_for_packs, shell_dialect)
             {
                 continue;
             }
@@ -21289,6 +21385,30 @@ fn unquoted_output_redirect_targets(command: &str, dialect: ShellDialect) -> Opt
     (!targets.is_empty()).then_some(targets)
 }
 
+/// True when the dialect is proven PowerShell and every unquoted output
+/// redirect target in `command` is the `$null` automatic variable (issue
+/// #321).
+///
+/// In PowerShell `2>$null` / `*>$null` is the idiomatic null-device redirect
+/// (`2>/dev/null`): no file is opened, nothing can be truncated, and `$null`
+/// is a read-only constant the language refuses to reassign, so the target
+/// cannot be redirected to a real path. The check is deliberately narrow:
+/// only the exact `$null` spelling (case-insensitive, `${null}` included)
+/// qualifies — `$nullFile`, `$none`, and every other variable stay
+/// fail-closed, as does every non-PowerShell dialect, where `$null` is an
+/// ordinary (assignable) variable.
+fn powershell_null_device_redirects_only(command: &str, dialect: ShellDialect) -> bool {
+    if dialect != ShellDialect::PowerShell {
+        return false;
+    }
+    let Some(targets) = unquoted_output_redirect_targets(command, dialect) else {
+        return false;
+    };
+    targets.iter().all(|target| {
+        target.eq_ignore_ascii_case("$null") || target.eq_ignore_ascii_case("${null}")
+    })
+}
+
 /// Whether a matched `core.filesystem` redirect rule is suppressed by a
 /// configured `[rules."core.filesystem:<name>"] exempt_target_globs` (#284).
 ///
@@ -21438,13 +21558,14 @@ fn evaluate_core_filesystem_pack(
             } else {
                 command_for_packs
             };
-        let proven_variable_redirect = statically_safe_variable_redirect(
-            redirect_source,
-            segment_ranges,
-            segment_start,
-            dialect_segment,
-            shell_dialect,
-        );
+        let proven_variable_redirect =
+            statically_safe_variable_redirect(
+                redirect_source,
+                segment_ranges,
+                segment_start,
+                dialect_segment,
+                shell_dialect,
+            ) || powershell_null_device_redirects_only(dialect_segment, shell_dialect);
         let redirect_filter: fn(Option<&str>) -> bool = if proven_variable_redirect {
             filesystem_redirect_pattern_excluding_dynamic
         } else {
@@ -21850,6 +21971,51 @@ fn shell_inline_payload_offset_is_quoted_data(command: &str, offset: usize) -> O
         ));
     }
     None
+}
+
+/// Redirect-rule variant of [`shell_inline_payload_offset_is_quoted_data`]
+/// (issue #317): when a `core.filesystem` redirect rule's match offset falls
+/// inside an inline interpreter payload, decide from the payload's own
+/// quoting whether the matched `>` is string-literal bytes or live syntax.
+///
+/// Unlike the command-oriented helper this one is NOT limited to Bash
+/// payloads: the redirect rules judge OUTER-shell redirect syntax, and inside
+/// a `python3 -c '…'` / `node -e '…'` payload a quoted `>` is data in every
+/// language whose string literals use POSIX-style quotes. The #136
+/// conservative treatment does not apply here — that class is about quoted
+/// COMMAND strings flowing to execution sinks, which the command-oriented
+/// rules and the recursive launcher analysis keep covering. An UNQUOTED `>`
+/// in any payload still returns false (fail closed): for shell payloads it is
+/// a real redirect, and for other languages the conservative deny is the
+/// safe direction. Multi-segment payloads keep the conservative
+/// classification for the same reason as the Bash helper (`eval` routing).
+fn inline_payload_offset_is_quoted_redirect_data(command: &str, offset: usize) -> bool {
+    if crate::heredoc::check_triggers(command) == crate::heredoc::TriggerResult::NoTrigger {
+        return false;
+    }
+    let crate::heredoc::ExtractionResult::Extracted(contents) =
+        crate::heredoc::extract_content(command, &crate::heredoc::ExtractionLimits::default())
+    else {
+        return false;
+    };
+    for content in &contents {
+        let Some(range) = content.content_range.as_ref() else {
+            continue;
+        };
+        if !(range.start <= offset && offset < range.end) {
+            continue;
+        }
+        // The payload bytes sit verbatim in the outer command string (both
+        // for inline `-c` args and for executing-interpreter heredoc bodies).
+        let Some(payload) = command.get(range.clone()) else {
+            return false;
+        };
+        if crate::packs::split_command_segments(payload).len() != 1 {
+            return false;
+        }
+        return crate::context::offset_is_quoted_data(payload, offset - range.start);
+    }
+    false
 }
 
 fn range_intersects_conservatively_scanned_interpreter_input(
@@ -22316,6 +22482,27 @@ fn evaluate_pack_destructive_patterns(
                 if crate::context::offset_is_quoted_data(pattern_command, raw_start) {
                     continue;
                 }
+                // A match inside an inline interpreter payload keeps the
+                // quote context the payload itself defines: `sh -c "echo
+                // 'a => %s'" 2>&1` matches on the `>` inside `'a => %s'`,
+                // which the payload's own single quotes prove to be literal
+                // bytes, not redirect syntax (issue #317). A live `>` in the
+                // payload (`bash -c "cat x > $T"`) classifies as code there
+                // and keeps the deny.
+                if inline_payload_offset_is_quoted_redirect_data(redirect_syntax_command, raw_start)
+                {
+                    continue;
+                }
+            }
+            // PowerShell's read-only `$null` automatic variable is the null
+            // device: `2>$null` opens no file and cannot truncate anything
+            // (issue #321). Only the exact `$null` spelling under a proven
+            // PowerShell dialect qualifies; see
+            // `powershell_null_device_redirects_only`.
+            if pattern.name == Some("redirect-truncate-dynamic-path")
+                && powershell_null_device_redirects_only(redirect_syntax_command, shell_dialect)
+            {
+                continue;
             }
             // Rule-scoped target exemption (#284): the redirect target is
             // resolvable here, so a configured glob stands this rule down
@@ -22599,7 +22786,10 @@ where
         None,
         None, // project_path: legacy function, path-aware allowlisting unavailable
     );
-    if result.allowlist_override.is_none() {
+    // Same guard as the dialect-view path: a recorded heredoc/launcher
+    // allowlist grant may attribute an ALLOW, never overwrite a pack denial
+    // or indeterminate verdict (bd-l9jf whole-command leg).
+    if result.is_allowed() && result.allowlist_override.is_none() {
         if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
             return EvaluationResult::allowed_by_allowlist(matched, layer, reason);
         }
@@ -29653,6 +29843,106 @@ mod tests {
     }
 
     #[test]
+    fn quoted_redirect_bytes_inside_inline_shell_payload_stay_inert() {
+        // #317 (post-6f1aa5a residue of #288): a `>` that is literal bytes
+        // inside a quoted string one level down in an inline-shell payload is
+        // not a redirect operator, and a real redirect elsewhere in the
+        // segment (`2>&1`, `2>/dev/null`, a literal /tmp target) must not
+        // strip the payload of its own quote context.
+        for command in [
+            "sh -c \"echo 'a => %s'\" 2>&1",
+            "sh -c \"echo 'a => %s'\" 2>/dev/null",
+            "sh -c \"echo 'a => %s'\" > /tmp/out.txt",
+            "bash -c \"echo 'a => %s'\" 2>&1",
+            "python3 -c \"print('a => %s')\" 2>&1",
+            "node -e \"console.log('a => %s')\" 2>&1",
+            "docker exec c sh -c \"echo 'a => %s'\" 2>&1",
+            "sh -c \"printf '%-20s -> %s\\n' a b\" 2>/dev/null",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "quoted payload bytes must stay inert next to a real redirect: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // Controls: a LIVE redirect inside the payload, or a dynamic /
+        // sensitive redirect outside it, keeps the fail-closed denial.
+        for command in [
+            "bash -c \"cat x > $T\"",
+            "bash -c 'cat x > $T'",
+            "sh -c \"echo hi > ~/.ssh/authorized_keys\"",
+            "sh -c 'echo hi > ~/.ssh/authorized_keys'",
+            "echo hi > \"$TARGET\"",
+            "echo hi > ~/data.txt",
+            "cat x > $HOME/y",
+            // Real dynamic redirect OUTSIDE the payload must stay caught even
+            // though the payload also contains quoted `>` bytes.
+            "sh -c \"echo 'a => b'\" > $TARGET",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "live redirect must stay denied: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_null_device_redirect_is_not_a_dynamic_path() {
+        // #321: PowerShell's `$null` automatic variable is the null device —
+        // `2>$null` is the idiomatic `2>/dev/null`, opens no file, and
+        // `$null` is a read-only constant that cannot name a real path.
+        for command in [
+            "echo hi 2>$null",
+            "echo hi 2>$NULL",
+            "echo hi 2>${null}",
+            "python scan.py --json 2>$null",
+            "Get-ChildItem -Recurse *>$null",
+            "echo hi >$null 2>$null",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::PowerShell,
+            );
+            assert!(
+                result.is_allowed(),
+                "PowerShell $null redirect must be allowed: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // Any other variable, a mixed dynamic target, or a non-PowerShell
+        // dialect keeps the fail-closed denial: in POSIX shells `null` is an
+        // ordinary assignable variable.
+        for (command, dialect) in [
+            ("echo hi 2>$nullFile", ShellDialect::PowerShell),
+            ("echo hi 2>$none", ShellDialect::PowerShell),
+            ("echo hi >$log 2>$null", ShellDialect::PowerShell),
+            ("echo hi 2>$null", ShellDialect::Posix),
+            ("echo hi 2>$null", ShellDialect::Unknown),
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, &["core.filesystem"], dialect);
+            assert!(
+                result.is_denied(),
+                "non-null-device dynamic redirect must stay denied: {command:?} ({dialect:?}): {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
     fn mktemp_scratch_roots_prove_variable_redirect_targets() {
         // #275: a variable bound to `$(mktemp)` / `$(mktemp -d)` in the same
         // command is a freshly minted, caller-owned temp path — redirects into
@@ -29906,6 +30196,149 @@ mod tests {
                 .and_then(|i| i.pattern_name.as_deref()),
             Some("pipeline-consumer"),
             "record-as-code denial carries the stable pipeline-consumer id"
+        );
+    }
+
+    #[test]
+    fn launcher_unverified_denials_carry_stable_allowlistable_rule_ids() {
+        // #316/bd-l9jf: the fail-closed launcher-verifier family previously
+        // denied as MatchSource::LegacyPattern with `rule_id: null`, so the
+        // operator had nothing to review, allowlist, or tune. Both families
+        // now carry stable heredoc.* rule ids and honor allowlist grants.
+
+        // Windows-shell launcher assembly that cannot be statically verified.
+        let result = evaluate_with_pack_ids_in_dialect(
+            "powershell -EncodedCommand %%%",
+            &["core.filesystem"],
+            ShellDialect::Unknown,
+        );
+        assert!(result.is_denied());
+        let info = result.pattern_info.expect("denial carries pattern info");
+        assert_eq!(info.pack_id.as_deref(), Some("heredoc.shell"));
+        assert_eq!(info.pattern_name.as_deref(), Some("launcher-unverified"));
+
+        let allowlists = project_allowlists_for_rule(
+            "heredoc.shell:launcher-unverified",
+            "reviewed launcher shape",
+        );
+        let result = evaluate_with_pack_ids_and_allowlists_at_path(
+            "powershell -EncodedCommand %%%",
+            &["core.filesystem"],
+            &allowlists,
+            None,
+        );
+        assert!(
+            result.is_allowed(),
+            "allowlisting the stable launcher rule id must permit the command: {:?}",
+            result.pattern_info
+        );
+
+        // POSIX inline interpreter launcher with a dynamic executable. The
+        // producer name deliberately avoids `shell`/`cmd`/`pwsh` substrings:
+        // those route to the Windows-launcher scan first (which carries the
+        // heredoc.shell id asserted above).
+        let result = evaluate_with_pack_ids_in_dialect(
+            "$tool -c 'echo safe'",
+            &["core.filesystem"],
+            ShellDialect::Posix,
+        );
+        assert!(result.is_denied());
+        let info = result.pattern_info.expect("denial carries pattern info");
+        assert_eq!(info.pack_id.as_deref(), Some("heredoc.posix"));
+        assert_eq!(
+            info.pattern_name.as_deref(),
+            Some("inline-launcher-unverified")
+        );
+
+        let allowlists = project_allowlists_for_rule(
+            "heredoc.posix:inline-launcher-unverified",
+            "reviewed inline launcher",
+        );
+        let result = evaluate_with_pack_ids_and_allowlists_at_path(
+            "$tool -c 'echo safe'",
+            &["core.filesystem"],
+            &allowlists,
+            None,
+        );
+        assert!(
+            result.is_allowed(),
+            "allowlisting the stable inline-launcher rule id must permit a safe payload: {:?}",
+            result.pattern_info
+        );
+
+        // The allowlist grant only skips the launcher fail-closed check; the
+        // rest of the command is still evaluated and denied on its own merits
+        // (bd-l9jf whole-command leg: the grant must never become a
+        // whole-command allow).
+        let allowlists = project_allowlists_for_rule(
+            "heredoc.shell:launcher-unverified",
+            "reviewed launcher shape",
+        );
+        let result = evaluate_with_pack_ids_and_allowlists_at_path(
+            "powershell -EncodedCommand %%% ; rm -rf /",
+            &["core.filesystem"],
+            &allowlists,
+            None,
+        );
+        assert!(
+            result.is_denied(),
+            "allowlisting the launcher rule must not unlock destruction elsewhere in the command: {:?}",
+            result.pattern_info
+        );
+        // The denial must come from ordinary pack evaluation of the chained
+        // segment — proving the grant WAS honored (launcher check skipped)
+        // and did not become a whole-command allow.
+        assert_eq!(
+            result
+                .pattern_info
+                .as_ref()
+                .and_then(|i| i.pack_id.as_deref()),
+            Some("core.filesystem"),
+            "chained rm -rf must be denied by the filesystem pack, not the granted launcher rule"
+        );
+
+        // Same property for the POSIX inline-launcher grant.
+        let allowlists = project_allowlists_for_rule(
+            "heredoc.posix:inline-launcher-unverified",
+            "reviewed inline launcher",
+        );
+        let result = evaluate_with_pack_ids_and_allowlists_at_path(
+            "$tool -c 'echo safe' ; rm -rf /",
+            &["core.filesystem"],
+            &allowlists,
+            None,
+        );
+        assert!(
+            result.is_denied(),
+            "allowlisting the inline-launcher rule must not unlock destruction elsewhere in the command: {:?}",
+            result.pattern_info
+        );
+        assert_eq!(
+            result
+                .pattern_info
+                .as_ref()
+                .and_then(|i| i.pack_id.as_deref()),
+            Some("core.filesystem"),
+            "chained rm -rf must be denied by the filesystem pack, not the granted launcher rule"
+        );
+
+        // A launcher shape that is NOT allowlisted still fails closed even
+        // when a different launcher rule is: the grant is scoped to its own
+        // rule id, exactly like the #261 embedded-sink allowlist entries.
+        let allowlists = project_allowlists_for_rule(
+            "heredoc.posix:inline-launcher-unverified",
+            "reviewed inline launcher",
+        );
+        let result = evaluate_with_pack_ids_and_allowlists_at_path(
+            "powershell -EncodedCommand %%%",
+            &["core.filesystem"],
+            &allowlists,
+            None,
+        );
+        assert!(
+            result.is_denied(),
+            "an inline-launcher allowlist grant must not unlock the distinct windows-launcher rule: {:?}",
+            result.pattern_info
         );
     }
 
@@ -32580,7 +33013,19 @@ mod tests {
                 "unverifiable launcher payload must fail closed: {command:?}"
             );
             let info = result.pattern_info.expect("fail-closed denial metadata");
-            assert_eq!(info.source, MatchSource::LegacyPattern, "{command:?}");
+            // #316/bd-l9jf: the fail-closed launcher family carries a stable,
+            // allowlistable rule id instead of an unattributed legacy denial.
+            assert_eq!(info.source, MatchSource::HeredocAst, "{command:?}");
+            assert_eq!(
+                info.pack_id.as_deref(),
+                Some("heredoc.shell"),
+                "{command:?}"
+            );
+            assert_eq!(
+                info.pattern_name.as_deref(),
+                Some("launcher-unverified"),
+                "{command:?}"
+            );
             assert!(info.matched_span.is_none(), "{command:?}");
         }
 

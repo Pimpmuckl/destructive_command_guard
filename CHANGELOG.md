@@ -11,7 +11,265 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
-## [Unreleased]
+## [v0.12.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.12.0) -- 2026-08-20 [Release]
+
+### Added
+
+- **`ssh <host> '<command>'` remote payloads are scanned (#326).** ssh
+  concatenates every argv word after the destination and hands the result to
+  the remote login shell — an inline-shell wrapper exactly like `sh -c`, minus
+  the flag. dcg treated the quoted payload as opaque argv data, so
+  `ssh host 'dropdb mydb'` rode through while the unquoted spelling was
+  denied — a false negative in precisely the remote-execution direction. The
+  heredoc pipeline now extracts the payload (walking the modeled OpenSSH
+  option grammar to locate the destination: bundled flags, attached values
+  like `-p2222`, separate values like `-o X=y`, and `--`) and recursively
+  evaluates it, so quoted and unquoted spellings reach the same decision and
+  every enabled pack applies to the remote command. Read-only remote
+  diagnostics (`uptime`, `df -h`, `journalctl …`) stay allowed, the payload's
+  own quoting still classifies remote data as data
+  (`ssh h 'echo "dropdb mydb"'` passes), `echo`/`grep`/commit-message
+  mentions of ssh stay inert, and an unmodeled ssh option makes extraction
+  bail to the previous behavior rather than guess at the destination (a real
+  ssh refuses unknown options anyway). The opt-in `remote.ssh` pack is
+  unchanged and still adds its curated remote-execution rules on top.
+
+### Fixed
+
+- **The dead `overrides.allowlist` / `overrides.allowlist_rules` config keys
+  are removed and loudly reported (#327).** Both keys parsed, appeared in
+  `dcg config schema` with worked examples, and were never consulted: the
+  config layer merge only carried `overrides.allow`/`block`, so the
+  documented path-scoped allowlisting silently had no effect (and the dead
+  compile path behind it ignored `paths` anyway — wiring it up as parsed
+  would have granted path-scoped configs *global* allowances). The keys are
+  gone from the schema (`config.schema.json` regenerated); a config still
+  carrying them parses, grants nothing, and is now named explicitly by
+  `dcg config` (a `Warnings:` section), `dcg config --format json` (a
+  `warnings` array plus `overrides.removed_keys_present`), and `dcg doctor`'s
+  configuration check, each pointing at the surfaces that work:
+  `overrides.allow`, per-rule `exempt_target_globs`, and `dcg allowlist add`.
+  Closing the report's observability gap, `dcg config --format json` now also
+  echoes the enforcement-relevant `overrides`, `rules`, and `policy` sections
+  (deterministically ordered), so CI can assert what is actually loaded
+  instead of inferring it from `dcg test` decisions.
+
+- **`redirect-truncate-root-home` no longer recommends an alternative it then
+  denies (#316 follow-up).** The rule's "Make a backup" suggestion —
+  `cp <file> <file>.bak && echo data > <file>` — still ends in a truncating
+  redirect onto the same home/system path, so an agent that instantiated it
+  from the triggering command was denied again by the same rule. The
+  suggestion (block-message prose and the structured `PatternSuggestion`) now
+  routes the write through a temp file: `cp <file> <file>.bak &&
+  echo data > /tmp/<subdir>/out && cp -f /tmp/<subdir>/out <file>`, which the
+  hook allows end-to-end even for home targets. Two sibling rows with the
+  same latent trap were fixed in the same pass: the `truncate` rules'
+  "keep the first N bytes" suggestion (`head -c N <file> > <file>.head` —
+  a home-path redirect) now writes the head through `/tmp` and `cp -f`s it
+  into place, and `mv-sensitive-source-root-home`'s in-place-rename
+  suggestion (`mv <file> <file>.deleted-YYYYMMDD` — itself an mv touching a
+  sensitive path) is now marked gated, so it renders with the explicit
+  "dcg gates this too — it needs explicit approval" marker
+  (`mv-dynamic-path` got its own suggestion set where the literal rename
+  stays ungated, since a resolved literal rename is exactly the escape from
+  that denial). The #316 suggestion self-consistency sweep now instantiates
+  `{path}` with a home path (in addition to the relative path) for every rule
+  whose name carries `root-home`/`sensitive` — the configuration the original
+  sweep never exercised, which is why this row survived it — and requires
+  gated suggestions to be denied in at least one applicable profile.
+
+## [v0.11.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.11.1) -- 2026-08-19 [Release]
+
+### Added
+
+- **First-party OpenCode support (#318).** `dcg install --opencode` writes a
+  native `tool.execute.before` plugin to
+  `~/.config/opencode/plugins/dcg-guard.js` (`--project` for
+  `<repo>/.opencode/plugins/`). The plugin routes every OpenCode `bash` tool
+  call through dcg's Claude-compatible hook protocol — spawning the absolute
+  dcg path embedded at install time with `OPENCODE=1` so the agent is
+  identified — and aborts the tool call by throwing on a `deny` (an `ask`
+  verdict also fails closed; OpenCode has no operator-review state).
+  Infrastructure failures (dcg missing) fail open with a stderr notice. The
+  file carries a `dcg-opencode-plugin` ownership marker: the installer refuses
+  to overwrite a user-owned file of that name even with `--force`, and
+  `uninstall.sh` deletes only marker-carrying files. `install.sh` configures
+  OpenCode automatically when detected, `dcg doctor` gains an
+  `opencode_plugin` check (an error + `--fix`able when OpenCode is in use but
+  unguarded — there is no Claude-compat fallback), and `Agent::OpenCode` is
+  detected from the plugin's `OPENCODE=1`. New
+  `docs/opencode-integration.md`. Motivated by a real shared-environment
+  outage where a green doctor coexisted with an entirely unguarded OpenCode
+  install.
+- **`dcg update` can no longer silently replace a local build that is ahead of
+  its release (#320).** Build provenance (`git describe --tags --dirty`, plus
+  an explicit `DCG_RELEASE_BUILD=1` marker exported by dist.yml and the DSR
+  runbook) is embedded at compile time and shown as a `Commit:` line in
+  `dcg --version`. `dcg update` now refuses — before any network or installer
+  work — when the installed binary is a local build ahead of its release tag,
+  or when the install is pinned via the new `general.update_pin` config
+  (`DCG_UPDATE_PIN` env). The explicit escape hatch is
+  `dcg update --replace-local-build`. Pinned installs also suppress the
+  background "update available" nudge, and a new warning-only doctor check
+  (`build_provenance`) flags the unpinned-local-ahead state that is one
+  routine update away from silent coverage loss.
+- **Suggestions dcg itself gates are now labeled, machine-checked, and
+  consistent (#316).** `PatternSuggestion` gained a `gated` flag: a gated
+  suggestion is a *less* destructive form of the blocked operation that still
+  requires approval, and every renderer now says so explicitly ("dcg gates
+  this too — it needs explicit approval" in block output, `[gated: ...]` in
+  `dcg packs`/classify text, a `gated` field in JSON) so an agent reading the
+  block message stops retrying suggestions dcg will deny. The 14 remaining
+  self-denied suggestions from the #316 sweep are either fixed or marked
+  gated: the MySQL `TRUNCATE`⇄`DELETE` mutual-referral loop is broken (backup
+  suggestion first, gated cross-references labeled), the kamal proxy rules
+  gained `kamal proxy restart` as a runnable first alternative,
+  `core.git:branch-dynamic-token` now leads with the workflow fix that
+  actually works and clarifies that quoting protects a *creation* while a
+  literal `-D` stays gated, and the docker/kubectl/postgres/bigquery/
+  guardrails/github rows carry accurate gated markers. Two registry-wide
+  tests enforce the invariant in both directions (every non-gated suggestion
+  is allowed by its own pack; every gated marker is real), replacing the
+  first-suggestion-only check. External YAML packs can declare
+  `gated: true` per suggestion.
+- **The fail-closed launcher-verifier family now carries stable, allowlistable
+  rule ids (#316, #304, #313).** "Embedded shell launcher cannot be statically
+  verified" and "Inline interpreter launcher cannot be statically verified"
+  denials previously reported `"rule_id": null` with `source:
+  "legacy_pattern"` — nothing to `dcg allowlist add`, nothing for
+  `[policy.rules]`. They are now `heredoc.shell:launcher-unverified` and
+  `heredoc.posix:inline-launcher-unverified`: reviewable, allowlistable
+  (an allowlist grant skips only the fail-closed launcher check — the rest of
+  the command is still evaluated on its own merits), and policy-addressable
+  like the #261 family.
+
+### Fixed
+
+- **Heredoc/launcher allowlist grants no longer override pack denials.** A
+  grant for a fail-closed heredoc-family rule (e.g.
+  `heredoc.shell:launcher-unverified`) was converted into a whole-command
+  allow at the end of evaluation even when the pack pass had denied the
+  command — an unverifiable encoded-launcher segment chained with `rm -rf /`
+  was allowed in full under the grant. Both terminal conversion sites now
+  attribute the grant only to an ALLOW outcome; pack denials and indeterminate
+  verdicts pass through untouched, so a grant skips exactly the fail-closed
+  check it names and nothing else (bd-l9jf whole-command leg).
+- **Windows installer repairs a stale `$PROFILE` hook-check (#282).** The
+  earlier #282 fix corrected the startup-check block's detection text, but the
+  installer skipped any profile already containing the marker line — which was
+  identical across versions — so pre-fix installs kept warning
+  `[dcg] Hook missing from ~/.claude/settings.json` on every new terminal no
+  matter how often dcg was reinstalled or updated. `Add-DcgProfileCheck` now
+  rewrites the managed block in place when its content is stale (line-ending
+  differences don't count as stale), and best-effort repairs the *other*
+  PowerShell host's `profile.ps1` (Windows PowerShell 5.1 vs pwsh 7) without
+  ever creating one.
+- **Unix shell startup checks self-repair too.** `install.sh` and
+  `dcg setup --shell-check` had the same marker-only idempotence trap on the
+  bash/zsh RC snippet: once the marker line existed, no re-run would ever
+  replace the block, pinning users to the first snippet version they received.
+  The Unix snippet has never changed, so nobody was bitten — this closes the
+  trap before the first time it does. Both injectors now rewrite a stale
+  managed region (marker line through the first column-0 `fi`) in place; an
+  unrecognizable boundary falls back to appending a current block.
+- **The keyword pre-filter treats `_` as a boundary, not a word character
+  (#323).** Underscore was in the pre-filter's word class, so underscore-joined
+  names never admitted a pack: `export DCG_DISABLE=1` quick-rejected past the
+  guardrails pack's own self-weakening rule, `terraform destroy
+  -target=cloudflare_record.www` past `dns.cloudflare`, and `WEBHOOK_SECRET` /
+  `SCW_SECRET_KEY` past every credential rule — the regexes were correct but
+  never ran (silent fail-open, invisible to tests written against hyphenated
+  decoys). `_` is now a boundary in the pre-filter only; pack regexes still
+  decide the verdict, so the change can only admit more commands to full
+  evaluation. Alphanumeric continuations (`dcgx`) still quick-reject.
+- **Dead-gated rules re-armed by fixing their packs' keyword lists (#323).**
+  `system.disk` gained `umount` (the `umount-force` rule was unreachable — no
+  keyword in the list occurs in `umount -f`), `database.redis` gained `valkey`
+  and `keydb` (the protocol-compatible client renames; every rule silently
+  stopped firing on those binaries), and `database.mysql` gained `mariadb` and
+  `RESET MASTER` (the renamed client, and the reset-master statement when it
+  reaches the shell without a `mysql` token).
+- **A `Bash`-labeled command that is unmistakably PowerShell now evaluates as
+  the fail-closed union of all dialects (#322).** VS Code Agent Host
+  transforms PowerShell tool calls and puts `tool_name: "Bash"` on the wire,
+  so `Remove-Item -LiteralPath .\pipelines -Recurse -Force` was evaluated
+  under the POSIX dialect — where a cmdlet is an inert unknown binary — and
+  executed. When any statement segment starts with an approved-verb
+  `Verb-Noun` cmdlet token, the hook now widens the dialect to `Unknown`,
+  which fails closed across every dialect. Explicit `powershell`/`pwsh`/`cmd`
+  labels are never second-guessed, and hyphenated POSIX commands (`apt-get`,
+  `docker-compose`, `start-stop-daemon`) do not widen.
+  **Two follow-up gaps closed (fresh-eyes review):** (1) the widening only
+  fired on `Verb-Noun` cmdlet tokens, so the PowerShell/cmd *aliases* agents
+  emit most — `rm -Recurse -Force .\pipelines`, `del /s /q C:\src`,
+  `rd /s C:\dir` — still evaluated as POSIX and failed open. The hook now also
+  widens when a segment leads with a destructive alias (`rm`/`ri`/`del`/`rd`/
+  `rmdir`/`erase`) **and** carries a Windows-shell-only argument — a
+  single-dash PowerShell parameter word (`-Recurse`/`-Force`/`-Path`/…, a
+  ≥3-char prefix that POSIX `rm` never accepts) or a cmd switch (`/s`, `/q`).
+  A plain POSIX `rm -rf ./build` has neither and keeps the Posix dialect.
+  (2) The oversized-input fail-closed path (`try_deny_oversized_input`, taken
+  when a payload exceeds `max_command_bytes`) resolved each scan window with an
+  *unrefined* dialect, so padding a mislabeled PowerShell payload past the
+  limit reopened the same hole. That path now applies the identical
+  `refine_shell_dialect` widening per window.
+- **`redirect-truncate-root-home` knows the macOS home spelling (#325).**
+  The sensitive-path alternation carried `/home` but not `/Users`, so `echo x
+  > /Users/<user>/.zshrc` — the absolute form tools actually hand agents —
+  was allowed while `> ~/.zshrc`, `> $HOME/.zshrc`, and even the *less*
+  certain `> $D/.zshrc` were blocked. `/Users` now sits in the shared
+  alternation of every rule that uses it (`redirect-truncate-root-home`,
+  `mv-sensitive-source-root-home`, `find -delete`, `unlink`, `truncate`,
+  `shred`, `tar --remove-files`, `dd of=`, and the cp/ln/rsync
+  copy-then-delete chains), matching the platform parity the `rm` rules
+  already had (#247).
+- **Write-safe character devices no longer deny as truncating redirects
+  (#324).** `> /dev/null`, `> /dev/zero`, `> /dev/full`, and `> /dev/tty`
+  are carved out of `redirect-truncate-*`: these are always character
+  devices, so opening them with `O_TRUNC` cannot destroy persistent data,
+  and each false block cost a human round-trip. `/dev/st0` (tape) and
+  `/dev/tty0`/`/dev/ttysNNN` (other terminals) stay blocked.
+  **Correction (fresh-eyes review):** the carve-out originally also covered
+  `/dev/stdout`, `/dev/stderr`, and `/dev/fd/[0-2]`, on the false premise that
+  they too are character devices. They are symlinks to whatever fd 0/1/2
+  currently point at, which may be a regular file (after `exec > logfile` or
+  an inherited redirect) — where `O_TRUNC` truncates that real file. Those
+  three are no longer carved out; the guard blocks them under its
+  zero-false-negatives posture.
+
+- **Quoted `>` bytes inside an inline interpreter payload no longer read as
+  redirect syntax when the segment carries a real redirect (#317).** `sh -c
+  "echo 'a => %s'" 2>&1` (and the `2>/dev/null` / literal `/tmp` target /
+  `python3 -c` / `node -e` variants) allowed: the `redirect-truncate-*` match
+  offset is now re-derived against the payload's own quoting, extending the
+  6f1aa5a treatment from `$`/backtick to the redirect operator. A live `>`
+  inside the payload (`bash -c "cat x > $T"`), a dynamic or sensitive target
+  outside it, and multi-segment payloads all keep the fail-closed deny.
+- **PowerShell `2>$null` is the null device, not a dynamic path (#321).**
+  Under a proven PowerShell dialect, a command whose every redirect target is
+  the read-only `$null` automatic variable (case-insensitive, `${null}`
+  included) no longer denies as `redirect-truncate-dynamic-path`. `$nullFile`,
+  `$none`, mixed targets, and POSIX/Unknown dialects — where `null` is an
+  ordinary assignable variable — stay denied.
+- **Grok Build's documented shell tool name is accepted (#319).** Grok's hooks
+  guide names the shell tool `run_terminal_command`; dcg only accepted the
+  abbreviated `run_terminal_cmd`, so the documented envelope was answered with
+  a "skip" — a silent fail-open on the exact path Grok uses. Both spellings now
+  classify as the Grok protocol and evaluate the command.
+- **`redirect-truncate-*` denials now carry redirect-specific suggestions
+  (#316/#317).** The suggestion registry previously served the recursive-rm
+  set (`ls -la` preview / `rm -ri` / move-to-trash) for redirect rules — a non
+  sequitur on a redirect denial. The rules now suggest inspecting the resolved
+  target, appending instead of truncating, redirecting to a literal temp path,
+  and backing up first. The `rm-rf-root-home` explanation also no longer
+  recommends `rm -rf /path/to/specific/directory` — a command dcg itself
+  denies — and points at the literal-temp and interactive (`rm -ri`) forms it
+  actually allows (#316).
+
+### Dependencies
+
+- Applied dependabot #315 directly: `async-trait` 0.1.92, `ast-grep-core` /
+  `ast-grep-language` 0.45.1, `rusqlite` 0.40.2 (+ `libsqlite3-sys` 0.38.2).
 
 ## [v0.11.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.11.0) -- 2026-08-14 [Release]
 

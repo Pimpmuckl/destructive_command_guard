@@ -62,6 +62,9 @@ const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TIMESTAMP: Option<&str> = option_env!("VERGEN_BUILD_TIMESTAMP");
 const RUSTC_SEMVER: Option<&str> = option_env!("VERGEN_RUSTC_SEMVER");
 const CARGO_TARGET: Option<&str> = option_env!("VERGEN_CARGO_TARGET_TRIPLE");
+// Git provenance (#320): `git describe --tags --dirty` at build time. Absent
+// (or the vergen placeholder) outside a git checkout.
+const GIT_DESCRIBE: Option<&str> = option_env!("VERGEN_GIT_DESCRIBE");
 
 // NOTE: HookInput, ToolInput, HookOutput, HookSpecificOutput types are now defined
 // in the hook module. Use hook::HookInput, hook::read_hook_input(), etc.
@@ -552,7 +555,13 @@ fn try_deny_oversized_input(
         if destructive_command_guard::packs::pack_aware_quick_reject(command, &enabled_keywords) {
             continue;
         }
-        let outcome = resolve_hook_command(&eval_context, command, shell_dialect, None);
+        // Down-trust a `Bash`-labeled dialect when this window is unmistakably
+        // PowerShell/cmd, exactly as the normal parsed path does (#322). Without
+        // this, padding a mislabeled PowerShell payload past `max_command_bytes`
+        // routed it here with an unrefined Posix dialect, where a cmdlet is an
+        // inert unknown binary — reopening the #322 hole on the oversized path.
+        let refined_dialect = hook::refine_shell_dialect(command, shell_dialect);
+        let outcome = resolve_hook_command(&eval_context, command, refined_dialect, None);
         match outcome {
             ResolvedCommandOutcome::DenyFamily(resolved)
                 if matches!(resolved.mode, DecisionMode::Deny | DecisionMode::Ask) =>
@@ -1273,6 +1282,19 @@ fn print_version() {
             target.white(),
             "│".bright_black()
         );
+    }
+    // Provenance (#320): distinguishes a release-tag build from a local build
+    // ahead of the tag (`v0.11.0-7-gabc1234` / `-dirty`).
+    if let Some(describe) = GIT_DESCRIBE {
+        if !describe.is_empty() && describe != "VERGEN_IDEMPOTENT_OUTPUT" {
+            eprintln!(
+                "  {}  {} {}                {}",
+                "│".bright_black(),
+                "Commit:".bright_black(),
+                describe.white(),
+                "│".bright_black()
+            );
+        }
     }
 
     eprintln!(
