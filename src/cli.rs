@@ -735,10 +735,18 @@ pub struct BatchHookOutput {
     pub index: usize,
     /// Decision: "allow", "deny", or "indeterminate"
     pub decision: &'static str,
-    /// Rule ID if denied (e.g., "core.git:reset-hard")
+    /// Policy mode resolved for the matched rule: "deny", "ask", "warn", or
+    /// "log". Present only when a rule matched. `warn` and `log` matches are
+    /// reported with `decision: "allow"` because the active `[policy]`
+    /// allows them — the same resolution bare `dcg` and `dcg test` apply
+    /// (#330). `ask` is reported as `deny`: this protocol has no review
+    /// channel, so it blocks exactly like a non-review-capable hook.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<&'static str>,
+    /// Rule ID if a rule matched (e.g., "core.git:reset-hard")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rule_id: Option<String>,
-    /// Pack ID if denied
+    /// Pack ID if a rule matched
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pack_id: Option<String>,
     /// Error message if parsing failed
@@ -2642,6 +2650,7 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
                     (
                         order,
                         evaluate_batch_line(
+                            config,
                             &line,
                             &enabled_keywords,
                             &ordered_packs,
@@ -2662,6 +2671,7 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
                 (
                     order,
                     evaluate_batch_line(
+                        config,
                         &line,
                         &enabled_keywords,
                         &ordered_packs,
@@ -2704,6 +2714,7 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
                         let result = BatchHookOutput {
                             index: emit_index,
                             decision: "error",
+                            mode: None,
                             rule_id: None,
                             pack_id: None,
                             error: Some(format!("IO error: {e}")),
@@ -2722,6 +2733,7 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
             }
 
             let mut result = evaluate_batch_line(
+                config,
                 &line,
                 &enabled_keywords,
                 &ordered_packs,
@@ -2770,6 +2782,7 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
 /// emit index so that skipped blank lines do not consume an index (issue #154).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn evaluate_batch_line(
+    config: &Config,
     line: &str,
     enabled_keywords: &[&str],
     ordered_packs: &[String],
@@ -2789,6 +2802,7 @@ fn evaluate_batch_line(
         return BatchHookOutput {
             index: 0,
             decision: "skip",
+            mode: None,
             rule_id: None,
             pack_id: None,
             error: Some("Empty line".to_string()),
@@ -2804,6 +2818,7 @@ fn evaluate_batch_line(
             return BatchHookOutput {
                 index: 0,
                 decision: "error",
+                mode: None,
                 rule_id: None,
                 pack_id: None,
                 error: Some(format!("JSON parse error: {e}")),
@@ -2815,16 +2830,21 @@ fn evaluate_batch_line(
         return BatchHookOutput {
             index: 0,
             decision: "skip",
+            mode: None,
             rule_id: None,
             pack_id: None,
             error: Some("Not a supported shell tool invocation or missing command".to_string()),
         };
     };
     // Batched envelopes (VS Code Agent Host `toolCalls`) carry additional
-    // shell commands that must each be evaluated independently; the first
-    // non-allow decision speaks for the whole line (issue #252).
+    // shell commands that must each be evaluated independently (issue #252).
+    // Every entry is resolved — evaluation AND policy mode — before one is
+    // chosen to speak for the line, by rank: deny > indeterminate > ask >
+    // warn > log > allow. Stopping at the first evaluator-level non-allow was
+    // a fail-open once `[policy]` could turn that entry into a warn/log
+    // `allow` (#330): the entries after it were never evaluated.
     let project_path = std::env::current_dir().ok();
-    let mut eval_result = None;
+    let mut decisive: Option<BatchEntryOutcome> = None;
     for (command, dialect) in
         std::iter::once((extracted_command.command, extracted_command.dialect))
             .chain(extracted_command.additional_commands)
@@ -2842,24 +2862,83 @@ fn evaluate_batch_line(
             None,                    // No deadline for batch mode
             dialect,
         );
-        let decisive = !matches!(result.decision, EvaluationDecision::Allow);
-        eval_result = Some(result);
-        if decisive {
+        let outcome = resolve_batch_entry(config, &command, result);
+        if decisive
+            .as_ref()
+            .is_none_or(|current| outcome.rank() > current.rank())
+        {
+            decisive = Some(outcome);
+        }
+        if decisive
+            .as_ref()
+            .is_some_and(|current| current.rank() == BatchEntryOutcome::MAX_RANK)
+        {
             break;
         }
     }
-    let eval_result = eval_result.expect("the primary command is always evaluated");
+    let decisive = decisive.expect("the primary command is always evaluated");
+    BatchHookOutput {
+        index: 0,
+        decision: decisive.decision,
+        mode: decisive.mode,
+        rule_id: decisive.rule_id,
+        pack_id: decisive.pack_id,
+        error: decisive.error,
+    }
+}
 
+/// One resolved entry of a `dcg hook` line: the evaluator's verdict with the
+/// active `[policy]` applied, plus the precedence used to pick the entry that
+/// speaks for a batched line.
+struct BatchEntryOutcome {
+    decision: &'static str,
+    mode: Option<&'static str>,
+    rule_id: Option<String>,
+    pack_id: Option<String>,
+    error: Option<String>,
+    rank: u8,
+}
+
+impl BatchEntryOutcome {
+    /// Rank of a hard deny — nothing outranks it, so scanning can stop.
+    const MAX_RANK: u8 = 5;
+
+    const fn rank(&self) -> u8 {
+        self.rank
+    }
+}
+
+/// Apply the active `[policy]` to one evaluated batch entry.
+///
+/// The evaluator reports the rule's default decision; the active `[policy]`
+/// (and confidence scoring) decide what that match means. Bare `dcg` and
+/// `dcg test` already resolve this; `dcg hook` skipped it and enforced `deny`
+/// for rules the user had downgraded to warn/log, disagreeing with `dcg test`
+/// on the same config (#330). Explicit `[overrides].block` and legacy
+/// fail-closed findings stay deny inside the resolver.
+fn resolve_batch_entry(
+    config: &Config,
+    command: &str,
+    eval_result: crate::evaluator::EvaluationResult,
+) -> BatchEntryOutcome {
     match eval_result.decision {
-        EvaluationDecision::Allow => BatchHookOutput {
-            index: 0,
+        EvaluationDecision::Allow => BatchEntryOutcome {
             decision: "allow",
+            mode: None,
             rule_id: None,
             pack_id: None,
             error: None,
+            rank: 0,
+        },
+        EvaluationDecision::Indeterminate => BatchEntryOutcome {
+            decision: "indeterminate",
+            mode: None,
+            rule_id: None,
+            pack_id: None,
+            error: Some(INDETERMINATE_REASON.to_string()),
+            rank: 4,
         },
         EvaluationDecision::Deny => {
-            // Extract pattern info for deny decisions
             let (rule_id, pack_id) =
                 eval_result
                     .pattern_info
@@ -2873,21 +2952,36 @@ fn evaluate_batch_line(
                         (rule_id, info.pack_id.clone())
                     });
 
-            BatchHookOutput {
-                index: 0,
-                decision: "deny",
+            let mode = crate::evaluator::resolve_effective_mode(config, command, &eval_result)
+                .unwrap_or(DecisionMode::Deny);
+            let (decision, mode_label, rank) = match mode {
+                DecisionMode::Deny => ("deny", "deny", BatchEntryOutcome::MAX_RANK),
+                // No review channel on this protocol: block, like every
+                // non-review-capable hook and `dcg test`.
+                DecisionMode::Ask => ("deny", "ask", 3),
+                DecisionMode::Warn => ("allow", "warn", 2),
+                DecisionMode::Log => ("allow", "log", 1),
+            };
+            if mode == DecisionMode::Warn {
+                let reason = eval_result
+                    .pattern_info
+                    .as_ref()
+                    .map_or("", |info| info.reason.as_str());
+                eprintln!(
+                    "[dcg] Warning: {} matched but policy mode is warn; allowing. {reason}",
+                    rule_id.as_deref().unwrap_or("a destructive pattern")
+                );
+            }
+
+            BatchEntryOutcome {
+                decision,
+                mode: Some(mode_label),
                 rule_id,
                 pack_id,
                 error: None,
+                rank,
             }
         }
-        EvaluationDecision::Indeterminate => BatchHookOutput {
-            index: 0,
-            decision: "indeterminate",
-            rule_id: None,
-            pack_id: None,
-            error: Some(INDETERMINATE_REASON.to_string()),
-        },
     }
 }
 
@@ -16878,6 +16972,7 @@ mod tests {
     }
 
     struct BatchEvalContext {
+        config: Config,
         enabled_keywords: Vec<&'static str>,
         ordered_packs: Vec<String>,
         keyword_index: Option<crate::packs::EnabledKeywordIndex>,
@@ -16897,6 +16992,7 @@ mod tests {
         let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
 
         BatchEvalContext {
+            config,
             enabled_keywords,
             ordered_packs,
             keyword_index,
@@ -16913,6 +17009,7 @@ mod tests {
             .enumerate()
             .map(|(index, line)| {
                 let mut result = evaluate_batch_line(
+                    &ctx.config,
                     line,
                     &ctx.enabled_keywords,
                     &ctx.ordered_packs,

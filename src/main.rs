@@ -533,6 +533,9 @@ fn try_deny_oversized_input(
         allowlists: &allowlists,
         heredoc_settings,
         cwd_path: cwd_path.as_deref(),
+        // Only the truncated prefix of an oversized payload is available
+        // here; its envelope fields were never parsed.
+        hook_cwd: None,
         working_dir: &working_dir,
         deadline,
         hook_protocol,
@@ -825,11 +828,129 @@ struct HookEvalContext<'a> {
     allowlists: &'a LayeredAllowlist,
     heredoc_settings: &'a HeredocSettings,
     cwd_path: Option<&'a Path>,
+    /// Working directory reported by the harness in the hook payload (`cwd`),
+    /// when present. This is where the command will run, which can differ
+    /// from the hook process's own cwd; rebase-recovery resolution prefers
+    /// it (#331). Allow-once and history keep using `cwd_path`, the path the
+    /// matching CLI commands resolve from.
+    hook_cwd: Option<&'a Path>,
     working_dir: &'a str,
     deadline: &'a Deadline,
     hook_protocol: hook::HookProtocol,
     history_agent_type: &'a str,
     max_command_bytes: usize,
+}
+
+/// Outcome of checking a denied command against the rebase-recovery window.
+enum RecoveryAttempt {
+    /// Not a recovery rule, no signal, or the probe location could not be
+    /// attributed. The original deny stands.
+    NotApplicable,
+    /// The signal is active and nothing else on the line denies: allow. The
+    /// permit, if that was the signal, has been consumed.
+    Granted {
+        reason: destructive_command_guard::rebase_recovery::RecoveryReason,
+        pattern: Option<String>,
+    },
+    /// The signal is active, but re-evaluating the rest of the line found
+    /// another verdict that stands on its own. Nothing was consumed.
+    Residual(Box<destructive_command_guard::evaluator::EvaluationResult>),
+    /// The deadline ran out during re-evaluation.
+    Indeterminate,
+}
+
+/// Decide whether the rebase-recovery window applies to a denied command.
+///
+/// The signal is probed in the repository the command will actually run in
+/// (#331): the harness-reported `cwd` when present (else the hook process
+/// cwd), moved by any leading `cd <literal> &&` / `pushd` and a
+/// `git -C <literal>` on the matched segment. Anything dcg cannot attribute
+/// statically keeps the deny.
+///
+/// A live signal unlocks only the recovery rules, never the line. The command
+/// is re-evaluated with exactly those rules granted; a second destructive
+/// operation on the same line (`git restore -- f; git reset --hard`, or a
+/// `git restore` in another repository after a further `cd`) keeps its own
+/// verdict and the permit stays unconsumed because the command will not run.
+fn attempt_rebase_recovery(
+    ctx: &HookEvalContext<'_>,
+    command: &str,
+    shell_dialect: ShellDialect,
+    result: &destructive_command_guard::evaluator::EvaluationResult,
+) -> RecoveryAttempt {
+    use destructive_command_guard::rebase_recovery;
+
+    let Some(info) = result.pattern_info.as_ref() else {
+        return RecoveryAttempt::NotApplicable;
+    };
+    let pack = info.pack_id.as_deref();
+    let pattern = info.pattern_name.as_deref();
+    if !rebase_recovery::is_recovery_rule(pack, pattern) {
+        return RecoveryAttempt::NotApplicable;
+    }
+
+    let recovery_base = ctx
+        .hook_cwd
+        .filter(|path| path.is_absolute() && path.is_dir())
+        .or(ctx.cwd_path);
+    let Some(recovery_cwd) = recovery_base.and_then(|base| {
+        rebase_recovery::resolve_recovery_cwd(
+            base,
+            command,
+            info.matched_span.as_ref().map(|span| span.start),
+            shell_dialect,
+        )
+    }) else {
+        return RecoveryAttempt::NotApplicable;
+    };
+    let Some(reason) = rebase_recovery::should_allow_recovery(&recovery_cwd, pack, pattern) else {
+        return RecoveryAttempt::NotApplicable;
+    };
+
+    if ctx.deadline.is_exceeded() {
+        return RecoveryAttempt::Indeterminate;
+    }
+    let relaxed = rebase_recovery::relaxed_allowlist(ctx.allowlists);
+    let residual = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+        command,
+        ctx.enabled_keywords,
+        ctx.ordered_packs,
+        ctx.keyword_index,
+        ctx.compiled_overrides,
+        &relaxed,
+        ctx.heredoc_settings,
+        None,
+        ctx.cwd_path,
+        Some(ctx.deadline),
+        shell_dialect,
+    );
+    if residual.decision == EvaluationDecision::Indeterminate || residual.skipped_due_to_budget {
+        return RecoveryAttempt::Indeterminate;
+    }
+    if residual.decision == EvaluationDecision::Deny {
+        // A residual finding whose policy mode lets the line run (warn/log)
+        // still spends the permit: the recovery command executes, and a
+        // single-shot permit must not survive its own use.
+        let residual_mode = destructive_command_guard::evaluator::resolve_effective_mode(
+            ctx.config, command, &residual,
+        )
+        .unwrap_or(DecisionMode::Deny);
+        if !matches!(residual_mode, DecisionMode::Deny | DecisionMode::Ask)
+            && matches!(reason, rebase_recovery::RecoveryReason::ActivePermit(_))
+        {
+            rebase_recovery::consume_permit(&recovery_cwd);
+        }
+        return RecoveryAttempt::Residual(Box::new(residual));
+    }
+
+    // Consume the permit if that's why we allowed (single-shot).
+    if matches!(reason, rebase_recovery::RecoveryReason::ActivePermit(_)) {
+        rebase_recovery::consume_permit(&recovery_cwd);
+    }
+    RecoveryAttempt::Granted {
+        reason,
+        pattern: pattern.map(str::to_string),
+    }
 }
 
 /// Resolve one hook command end-to-end WITHOUT publishing a protocol
@@ -868,7 +989,7 @@ fn resolve_hook_command(
 
     // Use the shared evaluator for hook mode parity with `dcg test`.
     let eval_start = Instant::now();
-    let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+    let mut result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
         command,
         ctx.enabled_keywords,
         ctx.ordered_packs,
@@ -923,7 +1044,7 @@ fn resolve_hook_command(
         return ResolvedCommandOutcome::Allow(allow_row);
     }
 
-    let Some(ref info) = result.pattern_info else {
+    if result.pattern_info.is_none() {
         // Fail open: structurally unexpected, but hook safety wins.
         let allow_row = history_writer.map(|_| {
             Box::new(build_history_entry(
@@ -938,14 +1059,11 @@ fn resolve_hook_command(
             ))
         });
         return ResolvedCommandOutcome::Allow(allow_row);
-    };
+    }
 
-    let pack = info.pack_id.as_deref();
-    let mode =
+    let mut mode =
         destructive_command_guard::evaluator::resolve_effective_mode(ctx.config, command, &result)
             .unwrap_or(DecisionMode::Deny);
-
-    let pattern = info.pattern_name.as_deref();
 
     // Rebase-recovery unblock (issue #104), applied per command.
     //
@@ -957,29 +1075,22 @@ fn resolve_hook_command(
     // into an allow with a stderr note and (for the permit case) consume
     // the cookie so subsequent unrelated commands stay blocked.
     //
-    // Safety: only fires when BOTH (a) the matched pattern is on the
-    // small recovery allowlist, AND (b) a recovery signal is active.
-    // Outside this narrow window the original deny path is unchanged. The
-    // conversion leaves stdout untouched, so later batch entries are still
-    // evaluated.
+    // Safety: only fires when (a) the matched pattern is on the small
+    // recovery allowlist, (b) a recovery signal is active in the repository
+    // the command reaches, AND (c) nothing else on the command line denies
+    // on its own merits. Outside this narrow window the original deny path
+    // is unchanged. The conversion leaves stdout untouched, so later batch
+    // entries are still evaluated.
     if matches!(mode, DecisionMode::Deny) {
-        if let Some(cwd_ref) = ctx.cwd_path {
-            if let Some(reason) = destructive_command_guard::rebase_recovery::should_allow_recovery(
-                cwd_ref, pack, pattern,
-            ) {
-                // Consume the permit if that's why we allowed (single-shot).
-                if matches!(
-                    reason,
-                    destructive_command_guard::rebase_recovery::RecoveryReason::ActivePermit(_)
-                ) {
-                    destructive_command_guard::rebase_recovery::consume_permit(cwd_ref);
-                }
+        match attempt_rebase_recovery(ctx, command, shell_dialect, &result) {
+            RecoveryAttempt::NotApplicable => {}
+            RecoveryAttempt::Granted { reason, pattern } => {
                 // Inform on stderr (visible to the agent and to humans).
                 // Stays silent when stderr isn't a TTY and robot mode is on,
                 // but the message itself is always safe to emit.
                 eprintln!(
                     "[dcg] Allowing `{}` → rebase-recovery mode ({})",
-                    pattern.unwrap_or("<unknown>"),
+                    pattern.as_deref().unwrap_or("<unknown>"),
                     reason.label()
                 );
                 if let Some(writer) = history_writer {
@@ -989,16 +1100,46 @@ fn resolve_hook_command(
                         ctx.working_dir,
                         HistoryOutcome::Allow,
                         eval_duration,
-                        pack,
-                        pattern,
+                        Some("core.git"),
+                        pattern.as_deref(),
                         Some("rebase-recovery"),
                     );
                     writer.log(entry);
                 }
                 return ResolvedCommandOutcome::Allow(None);
             }
+            RecoveryAttempt::Indeterminate => {
+                return ResolvedCommandOutcome::DeadlineExhausted {
+                    command: command.to_string(),
+                    stage: "rebase_recovery_reevaluation",
+                };
+            }
+            RecoveryAttempt::Residual(residual) => {
+                // The recovery rule itself was unlockable, but another
+                // finding on the same line stands on its own. Report THAT
+                // finding: telling the user to mint a permit for a rule that
+                // is not what blocks them sends them in circles.
+                result = *residual;
+                mode = destructive_command_guard::evaluator::resolve_effective_mode(
+                    ctx.config, command, &result,
+                )
+                .unwrap_or(DecisionMode::Deny);
+            }
         }
     }
+
+    let Some(ref info) = result.pattern_info else {
+        // Only reachable through a residual result, which by construction
+        // carries pattern info for its deny. Keep the conservative answer.
+        return ResolvedCommandOutcome::DenyFamily(Box::new(ResolvedDenyFamily {
+            command: command.to_string(),
+            result,
+            mode: DecisionMode::Deny,
+            eval_duration,
+        }));
+    };
+    let pack = info.pack_id.as_deref();
+    let pattern = info.pattern_name.as_deref();
 
     if mode == DecisionMode::Log {
         // Silent allow with its own audit row; never a response candidate, so
@@ -1561,6 +1702,8 @@ fn main() {
         }
     }
 
+    let hook_cwd = hook_input.cwd.as_deref().map(Path::new);
+
     let eval_context = HookEvalContext {
         config: &config,
         enabled_keywords: &enabled_keywords,
@@ -1570,6 +1713,7 @@ fn main() {
         allowlists: &allowlists,
         heredoc_settings: &heredoc_settings,
         cwd_path: cwd_path.as_deref(),
+        hook_cwd,
         working_dir: &working_dir,
         deadline: &deadline,
         hook_protocol,
