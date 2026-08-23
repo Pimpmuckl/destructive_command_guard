@@ -7,8 +7,10 @@
     {
       "name": "destructive-command-guard",
       "source": {
-        "source": "local",
-        "path": "./plugins/destructive-command-guard"
+        "source": "url",
+        "url": "https://github.com/Pimpmuckl/destructive_command_guard.git",
+        "path": "plugins/destructive-command-guard",
+        "ref": "main"
       },
       "policy": {
         "installation": "AVAILABLE",
