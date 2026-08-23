@@ -2119,7 +2119,7 @@ pub fn write_denial_to(
     // below and `WarningAudience::CodexModel`), and the reason string must
     // not reintroduce what the protocol's design withholds.
     let reason_allow_once_code = match protocol {
-        HookProtocol::Codex => None,
+        HookProtocol::Codex | HookProtocol::CodexAsk => None,
         _ => allow_once_code,
     };
     let message = format_denial_message(
