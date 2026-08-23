@@ -154,6 +154,33 @@ fn heredoc_piped_into_a_shell_is_evaluated_as_that_shells_source() {
 }
 
 #[test]
+fn an_unrecognized_shell_long_option_does_not_hide_the_piped_payload() {
+    // A no-value long option (`--norc`, `--posix`, `--login`, `--noprofile`)
+    // does not change the program source: the shell still runs its script from
+    // stdin. It must not be read as a script-file operand (which would ALLOW
+    // the payload). Found in the session's fresh-eyes review.
+    let lab = Lab::new("longopt");
+    for command in [
+        "echo 'rm -rf ~' | bash --norc",
+        "echo 'rm -rf ~' | bash --posix",
+        "echo 'git reset --hard' | bash --login",
+        "echo 'rm -rf ~' | sh --noprofile",
+        "bash --norc <(echo 'rm -rf ~')",
+        "bash --posix <(echo 'git reset --hard')",
+    ] {
+        let (stdout, stderr) = lab.hook(command);
+        assert!(
+            stdout.contains("deny"),
+            "expected DENY for:\n{command}\n--- stdout:\n{stdout}\n--- stderr:\n{stderr}"
+        );
+    }
+    // A benign payload through a long-option shell stays allowed, and a `-c`
+    // long form still means the shell does not read stdin.
+    lab.assert_allowed("echo hi | bash --norc");
+    lab.assert_allowed("cat data | bash --rcfile x -c 'echo ok'");
+}
+
+#[test]
 fn a_redirect_stealing_stdout_from_the_producer_is_genuinely_safe() {
     // `cat <<EOF >log … EOF | bash` sends the heredoc body to `log`, so the
     // pipe delivers nothing to bash. This is a true allow, not a miss — the
@@ -187,6 +214,37 @@ fn process_substitution_into_a_shell_is_not_defeated_by_a_redirect() {
             "expected DENY for:\n{command}\n--- stdout:\n{stdout}\n--- stderr:\n{stderr}"
         );
     }
+}
+
+#[test]
+fn an_rcfile_process_substitution_into_an_interactive_shell_is_evaluated() {
+    // Sibling of the long-option fix, found by adversarially sweeping it: an
+    // *interactive* shell sources its `--rcfile`/`--init-file` at startup, and
+    // that file may be a process substitution — `bash --init-file <(…) -i` runs
+    // the producer's output (verified on macOS and Linux). The value-taking
+    // option must not swallow the marker as an inert option argument and
+    // conclude the shell runs nothing (which ALLOWED the payload); the producer
+    // is the shell's source. Both token orders and the glued `=` spelling.
+    let lab = Lab::new("rcfile");
+    for command in [
+        "bash --init-file <(echo 'rm -rf ./src') -i",
+        "bash --rcfile <(echo 'git reset --hard') -i",
+        "bash -i --rcfile <(printf 'rm -rf ./src')",
+        "bash --init-file=<(echo 'rm -rf ./src') -i",
+        "bash --rcfile=<(echo 'git reset --hard') -i",
+    ] {
+        let (stdout, stderr) = lab.hook(command);
+        assert!(
+            stdout.contains("deny"),
+            "expected DENY for:\n{command}\n--- stdout:\n{stdout}\n--- stderr:\n{stderr}"
+        );
+    }
+    // Controls: a real-file rcfile value (not the marker) leaves the marker as
+    // the benign script the shell runs, and `-o`/`-O` take a shopt *name* bash
+    // rejects rather than executes — both stay allowed.
+    lab.assert_allowed("bash --rcfile init.sh <(echo 'echo hi')");
+    lab.assert_allowed("bash --init-file cfg.sh <(echo 'echo done')");
+    lab.assert_allowed("bash -o errexit <(echo 'echo ok')");
 }
 
 #[test]
