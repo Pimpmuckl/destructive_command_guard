@@ -616,7 +616,7 @@ mod tests {
     /// #351/#353: the release fleet gate must fail if the tag-pinned installer
     /// or archive is unverified, or if any probe silently skips verification.
     #[test]
-    fn fleet_install_gate_requires_installer_checksums_and_minisign_on_every_platform() {
+    fn fleet_install_gate_requires_installer_checksums_and_sigstore_on_every_platform() {
         let fleet = include_str!("../scripts/e2e_fleet_install.sh");
         let unix_probe = fleet
             .split("unix_probe() {")
@@ -635,12 +635,12 @@ mod tests {
             .expect("fleet gate must retain its probe completeness contract");
 
         assert!(
-            unix_probe.contains("--require-minisign --verify --no-configure"),
-            "Unix fleet installs must require a valid minisign signature"
+            unix_probe.contains("--verify --no-configure"),
+            "Unix fleet installs must verify the release artifact"
         );
         assert!(
-            windows_probe.contains("-RequireMinisign -Verify -NoConfigure"),
-            "Windows fleet installs must require a valid minisign signature"
+            windows_probe.contains("-Verify -NoConfigure"),
+            "Windows fleet installs must verify the release artifact"
         );
         assert!(
             unix_probe.contains("$REPO_RAW/$VERSION/install.sh")
@@ -654,7 +654,7 @@ mod tests {
             "a truncated probe must not pass without reporting installer verification"
         );
         assert!(
-            expected_cases.contains("minisign_verified"),
+            expected_cases.contains("signature_verified"),
             "a truncated probe must not pass without reporting signature verification"
         );
         assert!(
@@ -664,13 +664,13 @@ mod tests {
             "fleet probes must require exact clean-tag provenance, not semver alone"
         );
         assert!(
-            unix_probe.contains("Signature verified (minisign key ")
-                && windows_probe.contains("Signature verified \\(minisign key "),
-            "fleet probes must certify minisign verification specifically, not a different signature mechanism"
+            unix_probe.contains("Signature verified (cosign")
+                && windows_probe.contains("Signature verified \\(cosign"),
+            "fleet probes must certify the fork's Sigstore verification"
         );
         assert!(
-            !unix_probe.contains("RESULT:minisign_verified:SKIP")
-                && !windows_probe.contains("Emit 'minisign_verified' 'SKIP'"),
+            !unix_probe.contains("RESULT:signature_verified:SKIP")
+                && !windows_probe.contains("Emit 'signature_verified' 'SKIP'"),
             "release probes must fail rather than skip missing signature evidence"
         );
     }
