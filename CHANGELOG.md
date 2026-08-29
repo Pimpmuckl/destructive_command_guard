@@ -11,6 +11,291 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [v0.13.9](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.13.9) -- 2026-08-27 [Release]
+
+### Fixed
+
+- **Close Windows executable-spelling gaps in scoped pack rules.** Executable
+  scoping now treats `.cmd`, `.bat`, and `.com` like `.exe` in the native Cmd
+  dialect, matching the documented contract and preserving protection through
+  `CALL`, `IF`, `START`, and `FOR`. The Infisical and disclosure rules also
+  match case-insensitive Windows executable names and suffixes explicitly.
+- **Complete opt-in secret-disclosure coverage without blocking help.** The
+  disclosure pack now catches redirected bare Infisical listings, AWS Secrets
+  Manager batch reads, and all decrypted SSM parameter-read variants. Safe
+  `-h`, `--help`, and AWS `help` invocations remain available, including when
+  nested secret reads still require denial. The pack now retains service-tier
+  attribution ahead of the broader Windows egress preset.
+
+---
+
+## [v0.13.8](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.13.8) -- 2026-08-27 [Release]
+
+### Added
+
+- **Add explicit Infisical and transcript-disclosure protection.** The new
+  `secrets.infisical` pack blocks destructive secret, folder, dynamic-lease,
+  and local-reset operations. The separate exact opt-in `secret_disclosure` pack
+  blocks value-emitting reads across Infisical, 1Password, Doppler, Vault, AWS
+  Secrets Manager, and decrypted SSM while leaving metadata inspection and
+  direct process injection available. Provider packs retain their existing
+  mutation-only policy unless disclosure protection is explicitly enabled;
+  enabling the `secrets` category alone does not activate it.
+  ([#355])
+
+### Fixed
+
+- **Treat shell line continuations as syntax, not dynamic `mv` paths.** Literal
+  multi-file `mv` commands split with backslash-LF or backslash-CRLF now match
+  their single-line equivalent. Variables, substitutions, doubled
+  backslashes, and in-path escapes remain fail-closed. ([#356])
+
+[#355]: https://github.com/Dicklesworthstone/destructive_command_guard/issues/355
+[#356]: https://github.com/Dicklesworthstone/destructive_command_guard/issues/356
+
+---
+
+## [v0.13.7](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.13.7) -- 2026-08-27 [Release]
+
+### Release integrity
+
+- **Ship portable Linux archives without macOS metadata members.** DSR now
+  disables extended attributes as well as macOS copyfile metadata while
+  packaging tar archives. This prevents `._dcg` AppleDouble members from
+  appearing when GNU tar reads a Linux archive, so the strict installer sees
+  exactly the one root-level `dcg` binary it requires. v0.13.7 supersedes the
+  Linux artifacts from v0.13.6; the product changes are otherwise identical.
+
+---
+
+## [v0.13.6](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.13.6) -- 2026-08-27 [Release]
+
+The macOS and Windows artifacts passed the public install gate, but the Linux
+archives included a macOS `._dcg` metadata member and were correctly rejected
+by the strict installer. Use v0.13.7 or newer on Linux.
+
+### Fixed
+
+- **Resolve literal executable assignments before per-pack evaluation.**
+  Straight-line POSIX forms such as `d=docker; $d system prune -af` now bind
+  the later segment to Docker and report `containers.docker:system-prune`
+  instead of borrowing flags into an unrelated Git rule. Dynamic assignments
+  remain fail-closed, and evaluated segments cannot hide a destructive command
+  later in the chain. ([#288], [#289])
+- **Allow new literal files inside home-directory worktrees.** A truncating
+  redirect to a currently absent literal target in an existing VCS worktree is
+  treated as creation. Existing files, symlinks, dynamic paths, missing
+  parents, system paths, and `.git` internals remain blocked; `dcg create-new`
+  remains the race-free exclusive-create path. ([#337])
+- **Guard GitHub repository visibility changes.** `gh repo edit --visibility`
+  now requires review under the GitHub platform pack. ([#354])
+
+[#288]: https://github.com/Dicklesworthstone/destructive_command_guard/issues/288
+[#289]: https://github.com/Dicklesworthstone/destructive_command_guard/issues/289
+[#337]: https://github.com/Dicklesworthstone/destructive_command_guard/issues/337
+[#354]: https://github.com/Dicklesworthstone/destructive_command_guard/issues/354
+
+---
+
+## [v0.13.5](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.13.5) -- 2026-08-27 [Release]
+
+### Security
+
+- **Fail closed when an update installer checksum is unavailable.** The Unix
+  and Windows update paths now refuse to execute a downloaded installer unless
+  its tag-matched SHA256 sidecar is present and valid. This removes the legacy
+  fallback that could describe an update as verified after continuing past a
+  missing installer checksum. ([#352])
+
+[#352]: https://github.com/Dicklesworthstone/destructive_command_guard/issues/352
+
+---
+
+## [v0.13.4](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.13.4) -- 2026-08-27 [Release]
+
+### Release integrity
+
+- **Verify tag-pinned installer bytes before execution.** The real fleet gate
+  now downloads the same tagged `install.sh` / `install.ps1` bytes used by
+  `dcg update`, requires their adjacent SHA256 sidecars, and verifies the digest
+  before invoking either script.
+- **Ship signed installer scripts in the strict DSR contract.** Both installers,
+  their checksum sidecars, and their current-key minisign signatures join the
+  six signed binary archives in the exact public asset set. This closes the
+  installer-authentication gap found while replaying the v0.12.5 updater path.
+  ([#353])
+
+[#353]: https://github.com/Dicklesworthstone/destructive_command_guard/issues/353
+
+---
+
+## [v0.13.3](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.13.3) -- 2026-08-27 [Release]
+
+### Release integrity
+
+- **Bind strict DSR binaries to their exact tagged source.** DSR builds from an
+  authenticated tracked-byte snapshot that intentionally excludes `.git`, so
+  v0.13.2 could not expose the full commit SHA required by dcg's absolute
+  latency certificate. DSR now passes its independently verified tag and SHA
+  into every native build; dcg validates both before embedding them. This
+  superseding patch preserves v0.13.2's current-key signatures while restoring
+  the source-to-binary proof required by the release gate.
+
+---
+
+## [v0.13.2](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.13.2) -- 2026-08-27 [Release]
+
+### Release integrity
+
+- **Route DSR signing through dcg's current release authority.** The v0.13.1
+  archives were signed on the build coordinator with dcg's retired
+  `36B847D11BA5A0D0` key, so current installers correctly rejected them. This
+  superseding patch is signed on the dedicated signing host with the embedded
+  `69B3955C8D2E62A8` trust root; the product and safety behavior from v0.13.1 is
+  otherwise unchanged.
+
+---
+
+## [v0.13.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.13.1) -- 2026-08-27 [Release]
+
+This patch release was intended to turn the post-v0.13.0 safety and release
+hardening into a clean, signed distribution. Its published archives were
+mistakenly signed with dcg's retired key and are therefore rejected by current
+installers; v0.13.2 supersedes it. The underlying changes substantially improve
+diagnostics, external-pack validation, OMP lifecycle safety, and the quality of
+suggested alternatives after a block.
+
+### Security
+
+- **Unverified commands no longer fail open for unattended agents.** Commands
+  that cannot be evaluated completely, including deadline exhaustion and
+  incomplete nested evaluation, retain an indeterminate decision and are
+  denied when the host cannot ask for review.
+- **Filesystem coverage now catches unbounded non-recursive glob deletion.**
+  Risky `rm` expansions no longer evade the recursive-delete rules merely by
+  omitting `-r`; bounded scratch-directory operations retain their narrow safe
+  path.
+- **External packs validate executable scope canonically.** Pack authors get a
+  concrete validation error when a rule's declared executable scope and its
+  regex semantics disagree, preventing broad or misleading attribution.
+- **OMP's native bridge has a tighter trust boundary.** The generated extension
+  binds to the installed `dcg` binary, rejects lossy executable paths, preserves
+  signal provenance, bounds child observation and stream resources, and keeps
+  host-owned hook fields during self-healing.
+
+### Added
+
+- **Pack validation is wired into the CLI.** Custom-pack authors can validate
+  schema and semantic problems before enabling a pack, with focused diagnostics
+  for executable scopes and rule definitions. ([#289])
+- **Release-grade performance certificates.** The absolute evaluator budget
+  gate now binds results to the full source commit, verifies every timed wire
+  decision, applies an explicit 95/95 tail-tolerance rule, and emits a
+  self-contained failure certificate outside the measured checkout.
+- **More complete integration management.** CLI and installer flows can inspect
+  and unconfigure supported agent integrations explicitly, with stronger
+  ownership checks and truthful dry-run/summary behavior across Unix and
+  Windows.
+
+### Fixed
+
+- **Normal upgrades can consume aggregate checksums.** The POSIX installer now
+  falls back from an adjacent `<archive>.sha256` file to `SHA256SUMS.txt` or
+  `SHA256SUMS`, matching the PowerShell installer and repairing the tag-pinned
+  updater path reported in [#342].
+- **Official binaries have exact release provenance.** The release path now
+  rejects dirty or ahead-of-tag binaries before signing, preventing the
+  `LocalAheadOfRelease` false classification reported in [#344].
+- **Every archive is signed by the DSR release authority.** The six platform
+  archives publish adjacent `.minisig` files under the documented long-lived
+  key, repairing the fail-closed installer path reported in [#351].
+- **Pipeline diagnostics preserve the command users actually wrote.** Shell
+  transformations no longer erase syntax needed for matching and explanations;
+  unverifiable Python-to-PowerShell pipelines identify the producer that could
+  not be modeled instead of presenting an opaque refusal.
+- **Safer alternatives are operation-specific.** Suggestions now reflect the
+  destructive operation's flags and target shape, and their classifier rules
+  are checked for self-consistency.
+- **Windows and hook protocol tests are host-independent.** Fixtures isolate
+  ambient Git/configuration state, choose current-platform binary names, and
+  reject stale Windows binaries instead of silently exercising old bytes.
+
+[#289]: https://github.com/Dicklesworthstone/destructive_command_guard/issues/289
+[#342]: https://github.com/Dicklesworthstone/destructive_command_guard/issues/342
+[#344]: https://github.com/Dicklesworthstone/destructive_command_guard/issues/344
+[#351]: https://github.com/Dicklesworthstone/destructive_command_guard/issues/351
+
+---
+
+## [v0.13.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.13.0) -- 2026-08-24 [Release]
+
+Minor bump: this release adds first-class support for a new agent host (Oh My Pi)
+across detection, install, uninstall and doctor, and closes a config-override
+bypass that could allow an unexamined command.
+
+### Security
+
+- **An `[overrides] allow` entry no longer speaks for the rest of a compound
+  command.** Allow patterns are substring-matched, and the allow check runs
+  *before* pack evaluation, so a single entry matching one segment returned
+  `allowed` for text that was never examined — an entry naming a scratch path
+  also allowed whatever followed the `&&`. A safe segment silencing a
+  destructive one is the same bypass class `split_command_segments` already
+  closes for pack patterns, so allow overrides now clear each segment on its
+  own terms: a single-segment command keeps the previous whole-string
+  semantics, and a compound command is allowed only when every segment is
+  itself allowed. Anything uncovered falls through to normal evaluation.
+  Command substitutions are segments too, so a safe outer command cannot
+  carry a destructive inner one past the check.
+
+  As a side effect, anchored entries now compose across a chain for the first
+  time: `^a$` and `^b$` previously allowed neither half of `a && b`, because
+  neither matched the whole string. ([#340])
+
+### Added
+
+- **First-class Oh My Pi (`omp`) agent support** in detection, CLI, and
+  `dcg doctor`, with easy-mode installers and uninstallers taught about it and
+  a symmetric uninstall path. The generated OMP extension bridge carries schema
+  validation and health checks, monotonic child-transition handling, refined
+  timeout and process-signal handling, and dynamic shell-dialect selection for
+  eligible local PTYs. Agent coverage in the installer was expanded alongside
+  it. ([#335])
+
+### Fixed
+
+- **`dcg doctor` no longer undercounts enabled packs.** It counted the raw
+  enabled-pack set, which carries the bare `core` category marker, while
+  `dcg packs --enabled` lists the two registry leaves that marker expands into
+  (`core.filesystem`, `core.git`). The two numbers disagreed by exactly one in
+  every configuration. Doctor now counts registry leaf packs, so both agree.
+  No protection was missing; only the reported count was wrong. ([#335])
+- **A block message no longer grows with the command it is reporting on.** The
+  message becomes the hook's `permissionDecisionReason`, which lands in an
+  agent's context and is replayed on every later turn, and it embedded the
+  command verbatim: a 10 KB heredoc write produced a ~10.8 KB reason and a
+  50 KB one produced ~50.8 KB, while the stderr box stayed a constant ~2 KB.
+  The echoed command is now capped and the reason reports how many bytes were
+  elided, which is the useful signal. Ordinary commands are untouched and stay
+  copy-pasteable. ([#339])
+- **OMP hardening:** invalid profile environments are rejected, commands are
+  evaluated in the effective cwd, agent policy is applied in robot mode, the
+  installer conflict summary is preserved, project extensions are anchored to
+  cwd, and `PI_CONFIG_DIR` is honored when detecting OMP. PowerShell installer
+  and uninstaller handle Windows OMP config paths correctly.
+- **Install path:** the OpenCode plugin and OMP extension are written
+  atomically, a non-UTF-8 `dcg` path is refused rather than embedded in
+  generated JavaScript, and the native-integration install flags are mutually
+  exclusive.
+- **E2E harness:** the matrix no longer swallows failures inside `&&` / `||`
+  chains.
+
+[#335]: https://github.com/Dicklesworthstone/destructive_command_guard/issues/335
+[#339]: https://github.com/Dicklesworthstone/destructive_command_guard/issues/339
+[#340]: https://github.com/Dicklesworthstone/destructive_command_guard/issues/340
+
+---
+
 ## [v0.12.5](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.12.5) -- 2026-08-23 [Release]
 
 ### Security

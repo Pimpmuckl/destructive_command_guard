@@ -37,7 +37,7 @@ const RM_RF_ROOT_HOME_SUGGESTIONS: &[PatternSuggestion] = &[
 const RM_RF_GENERAL_SUGGESTIONS: &[PatternSuggestion] = &[
     PatternSuggestion::new(
         "rm -ri {path}",
-        "Interactive mode: confirms each file before deletion",
+        "Interactive mode: confirms each file before deletion (needs a terminal: with stdin closed, as under an agent hook, it deletes nothing and exits 0)",
     ),
     PatternSuggestion::with_platform(
         "trash-put {path}",
@@ -48,6 +48,11 @@ const RM_RF_GENERAL_SUGGESTIONS: &[PatternSuggestion] = &[
         "gio trash {path}",
         "Move to trash via GNOME (requires gio)",
         Platform::Linux,
+    ),
+    PatternSuggestion::with_platform(
+        "mv {path} ~/.Trash/",
+        "Move to the Finder trash instead of deleting (macOS has no ~/.local/share/Trash)",
+        Platform::MacOS,
     ),
     PatternSuggestion::new(
         "mv {path} /tmp/delete-me-{timestamp}",
@@ -71,7 +76,7 @@ const RM_RF_GENERAL_SUGGESTIONS: &[PatternSuggestion] = &[
 const RM_R_F_SEPARATE_SUGGESTIONS: &[PatternSuggestion] = &[
     PatternSuggestion::new(
         "rm -ri {path}",
-        "Interactive mode: confirms each file before deletion",
+        "Interactive mode: confirms each file before deletion (needs a terminal: with stdin closed, as under an agent hook, it deletes nothing and exits 0)",
     ),
     PatternSuggestion::new(
         "rm -r -f /tmp/{subdir}",
@@ -87,10 +92,10 @@ const RM_R_F_SEPARATE_SUGGESTIONS: &[PatternSuggestion] = &[
 const RM_RECURSIVE_FORCE_SUGGESTIONS: &[PatternSuggestion] = &[
     PatternSuggestion::new(
         "rm --interactive --recursive {path}",
-        "Interactive mode: confirms each file before deletion",
+        "Interactive mode: confirms each file before deletion (needs a terminal: with stdin closed, as under an agent hook, it deletes nothing and exits 0)",
     ),
     PatternSuggestion::new(
-        "find {path} --maxdepth 2 -ls | head -30",
+        "find {path} -maxdepth 2 -ls | head -30",
         "Preview directory structure before deletion",
     ),
     PatternSuggestion::new(
@@ -304,6 +309,10 @@ const SENSITIVE_PROPAGATION_DELETE_SUGGESTIONS: &[PatternSuggestion] = &[
 const REDIRECT_TRUNCATE_SUGGESTIONS: &[PatternSuggestion] = &[
     PatternSuggestion::new("ls -la {path}", "Verify the path before any redirect"),
     PatternSuggestion::new(
+        "producer | dcg create-new {path}",
+        "After resolving a literal destination, create it only if no file, directory, or symlink already exists",
+    ),
+    PatternSuggestion::new(
         "cp {path} {path}.bak && echo data > /tmp/{subdir}/out && cp -f /tmp/{subdir}/out {path}",
         "Back up the target, write the new content to a temp file, then copy it into place",
     ),
@@ -340,12 +349,242 @@ const RM_RECURSIVE_FORCE_REASON: &str =
     "rm --recursive --force is destructive and requires human approval.";
 const RM_RECURSIVE_ROOT_HOME_NAME: &str = "rm-recursive-root-home";
 const RM_RECURSIVE_ROOT_HOME_REASON: &str = "recursive rm targeting a root, home, or absolute system path is EXTREMELY DANGEROUS, even without --force.";
+const RM_BARE_GLOB_NAME: &str = "rm-bare-glob";
+const RM_BARE_GLOB_REASON: &str = "rm with a bare * operand deletes every file the shell finds in the working directory - an unbounded, shell-chosen file set that cannot be reviewed from the command text. This command will NOT be executed.";
+const RM_BARE_GLOB_ROOT_NAME: &str = "rm-bare-glob-root";
+const RM_BARE_GLOB_ROOT_REASON: &str = "rm /* deletes the top-level entries of the filesystem root; on systems where /bin, /lib, and /sbin are symlinks this can brick the machine even without -r. EXTREMELY DANGEROUS.";
 const RM_RECURSIVE_GENERAL_NAME: &str = "rm-recursive-general";
 const RM_RECURSIVE_GENERAL_REASON: &str = "recursive rm can silently remove an entire writable directory tree and requires human approval, even without --force.";
 const RM_RECURSIVE_UNVERIFIED_NAME: &str = "rm-recursive-unverified";
 const RM_RECURSIVE_UNVERIFIED_REASON: &str = "a dynamically resolved executable may be rm and is followed by recursive deletion syntax that cannot be verified safe before shell expansion.";
 const POWERSHELL_REMOVE_ITEM_RECURSIVE_NAME: &str = "powershell-remove-item-recursive";
 const POWERSHELL_REMOVE_ITEM_RECURSIVE_REASON: &str = "PowerShell Remove-Item (or an alias) with -Recurse permanently deletes an entire item tree without using the Recycle Bin.";
+
+// ============================================================================
+// Guidance for classifier-only rules (#348)
+// ============================================================================
+//
+// The semantic rm classifier decides reason and severity itself and never
+// walks `destructive_patterns`, so a denial it produces has to look its
+// explanation and safer-alternative suggestions up by rule name
+// (`Pack::rule_guidance`). Most classifier rule names double as regex rules
+// and carry their text on the pattern. The four below exist only inside the
+// classifier, so their guidance lives here. These rows are text only: they
+// cannot change what the guard blocks, only what a blocked caller is told.
+
+/// Suggestions for a recursive `rm` that carries no force flag.
+const RM_RECURSIVE_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "rm -ri {path}",
+        "Interactive mode: confirms each file before deletion (needs a terminal: with stdin closed, as under an agent hook, it deletes nothing and exits 0)",
+    ),
+    PatternSuggestion::with_platform(
+        "trash-put {path}",
+        "Move to trash instead of permanent deletion (requires trash-cli)",
+        Platform::Linux,
+    ),
+    PatternSuggestion::with_platform(
+        "mv {path} ~/.Trash/",
+        "Move to the Finder trash instead of deleting (macOS has no ~/.local/share/Trash)",
+        Platform::MacOS,
+    ),
+    PatternSuggestion::new(
+        "mv {path} /tmp/delete-me-{timestamp}",
+        "Move the tree aside instead of deleting it; remove the holding copy after review",
+    ),
+    PatternSuggestion::new(
+        "rm -r /tmp/{subdir}",
+        "Safe temp directory deletion (allowed without confirmation)",
+    ),
+    PatternSuggestion::new(
+        "ls -la {path}",
+        "List directory contents to verify the path",
+    ),
+];
+
+/// Suggestions for a recursive delete whose command word is resolved at run
+/// time (`find … -exec {} -r …`, PowerShell splatting).
+const RM_RECURSIVE_UNVERIFIED_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::gated(
+        "rm -r {path}",
+        "Name the executable literally so the recursive delete gets the ordinary rm decision",
+    ),
+    PatternSuggestion::new(
+        "echo {command}",
+        "Print the assembled command first, then run the literal text it produced",
+    ),
+    PatternSuggestion::new(
+        "ls -la {path}",
+        "List directory contents to verify the path",
+    ),
+];
+
+/// Suggestions for PowerShell `Remove-Item -Recurse`.
+const POWERSHELL_REMOVE_ITEM_RECURSIVE_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "Get-ChildItem -Recurse {path}",
+        "List the item tree before removing it",
+    ),
+    PatternSuggestion::new(
+        "Remove-Item -Recurse -WhatIf {path}",
+        "Report what the removal would do without removing anything",
+    ),
+    PatternSuggestion::new(
+        "Move-Item {path} (Join-Path ([IO.Path]::GetTempPath()) delete-me-{timestamp})",
+        "Move the tree aside instead of deleting it; the temp path resolves on Windows and POSIX pwsh alike",
+    ),
+];
+
+/// Suggestions for a non-recursive rm with a bare `*` operand.
+const RM_BARE_GLOB_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "ls -la",
+        "List what the glob would expand to before deleting anything",
+    ),
+    PatternSuggestion::new(
+        "rm ./file-one ./file-two",
+        "Delete explicitly named files so the removal set is reviewable",
+    ),
+    PatternSuggestion::new(
+        "rm *.log",
+        "Constrain the glob to a reviewable shape instead of everything",
+    ),
+    PatternSuggestion::new(
+        "rm -i *",
+        "Interactive glob delete: confirms each file (needs a terminal: with stdin closed, as under an agent hook, it deletes nothing and exits 0)",
+    ),
+    PatternSuggestion::new(
+        "mv ./file /tmp/delete-me-{timestamp}",
+        "Move files aside instead of deleting them; remove the holding copy after review",
+    ),
+];
+
+const RM_BARE_GLOB_EXPLANATION: &str = "A bare * (or ./*) handed to rm is expanded by the shell at execution time, so \
+     the command text never shows what gets deleted: every file in the working \
+     directory that matches, whatever the directory happens to contain when the \
+     command runs. Leaving off -f does not bound it - -f only decides whether errors \
+     are reported, and the write-protection query it suppresses reaches nobody under \
+     an agent hook.\n\n\
+     Preview the expansion, then delete a reviewable set (dcg allows these forms):\n  \
+     ls -la                           # see what * would match\n  \
+     rm ./file-one ./file-two         # explicitly named files\n  \
+     rm *.log                         # a constrained, reviewable glob\n  \
+     rm -i *                          # interactive; needs a terminal - with stdin closed it deletes nothing and exits 0\n  \
+     mv ./file /tmp/delete-me-<literal-timestamp>   # move aside instead of deleting";
+
+const RM_BARE_GLOB_ROOT_EXPLANATION: &str = "rm /* expands to every top-level entry of the filesystem root. Without -r the \
+     directories survive, but on systems where /bin, /lib, and /sbin are symlinks \
+     into /usr, deleting those symlinks bricks the machine - no shell, no rescue \
+     tooling, and -f is irrelevant to any of it.\n\n\
+     There is almost no legitimate reason to run this. If one file under / was \
+     meant, name it explicitly after previewing (dcg allows these forms):\n  \
+     ls -la /                        # see what /* would match\n  \
+     rm /specific-file               # one named file, still reviewed\n  \
+     mv /specific-file /tmp/delete-me-<literal-timestamp>";
+
+const RM_RECURSIVE_GENERAL_EXPLANATION: &str = "rm -r deletes a directory and everything under it. Leaving off -f does not \
+     bound the command: -f only decides whether errors are reported and whether a \
+     write-protected file is queried, and that query reaches a terminal, not an agent \
+     hook. Everything the process can unlink, it unlinks, and there is no undo.\n\n\
+     dcg auto-allows recursive deletion only for literal temp paths:\n  \
+     rm -r /tmp/<subdir>/scratch\n\n\
+     For any other directory, preview first, then either delete interactively or move \
+     the tree aside (dcg allows both forms):\n  \
+     ls -la /path/to/directory\n  \
+     rm -ri /path/to/directory   # needs a terminal; with stdin closed it deletes nothing and exits 0\n  \
+     mv /path/to/directory /tmp/delete-me-<literal-timestamp>\n\n\
+     The trash directory is ~/.Trash on macOS and ~/.local/share/Trash on Linux.";
+
+const RM_RECURSIVE_ROOT_HOME_EXPLANATION: &str = "A recursive rm rooted at /, ~, or $HOME removes the account or the machine, and \
+     leaving off -f changes nothing about that: -f decides whether errors are reported, \
+     not what is deleted.\n\n\
+     There is NO recovery without backups. Even with backups, full restoration takes \
+     hours to days.\n\n\
+     If one directory under the home was meant, name it in full and delete that \
+     instead:\n  \
+     rm -r ~/projects/scratch-build   # a specific path, still reviewed\n  \
+     rm -r ~                          # never this\n\n\
+     dcg auto-allows recursive deletion only for literal temp paths:\n  \
+     rm -r /tmp/<subdir>/scratch\n\n\
+     For a specific directory, preview first, then either delete interactively or move \
+     the tree aside (dcg allows both forms):\n  \
+     ls -la /path/to/directory\n  \
+     rm -ri /path/to/directory   # needs a terminal; with stdin closed it deletes nothing and exits 0\n  \
+     mv /path/to/directory /tmp/delete-me-<literal-timestamp>";
+
+const RM_RECURSIVE_UNVERIFIED_EXPLANATION: &str = "The command word is resolved at run time, so dcg cannot read which binary will \
+     run, and the arguments beside it are recursive deletion syntax. A find -exec \
+     placeholder is filled from the search result, and PowerShell splatting takes both \
+     the flags and the path from a hashtable, so in either form the deletion target is \
+     assembled after this check would have run. dcg fails closed here rather than guess.\n\n\
+     Make the command word literal and the command gets the ordinary recursive-rm \
+     decision instead:\n  \
+     rm -r ./tree\n\n\
+     If the command really must be assembled, print the assembled text first and run \
+     that literal text. Reading the tree costs nothing and is always accepted:\n  \
+     ls -la /path/to/directory";
+
+const POWERSHELL_REMOVE_ITEM_RECURSIVE_EXPLANATION: &str = "Remove-Item -Recurse deletes the whole item tree immediately. PowerShell has no \
+     Recycle Bin step: the cmdlet unlinks, and nothing lands anywhere recoverable.\n\n\
+     Preview and safer forms:\n  \
+     Get-ChildItem -Recurse <path>          # list the tree first\n  \
+     Remove-Item -Recurse -WhatIf <path>    # report the removal without doing it (dcg allows -WhatIf)\n  \
+     Move-Item <path> (Join-Path ([IO.Path]::GetTempPath()) delete-me-<literal-timestamp>)\n\n\
+     To recycle rather than delete, call \
+     Microsoft.VisualBasic.FileIO.FileSystem::DeleteDirectory with SendToRecycleBin.";
+
+/// Explanation and safer-alternative suggestions for a rule that only the
+/// semantic rm/PowerShell classifier can attribute a denial to.
+///
+/// Returns `None` for every rule that has a `destructive_patterns` entry, so
+/// the pattern's own text stays authoritative for those.
+pub(crate) fn classifier_rule_guidance(
+    name: &str,
+) -> Option<(&'static str, &'static [PatternSuggestion])> {
+    match name {
+        n if n == RM_RECURSIVE_GENERAL_NAME => {
+            Some((RM_RECURSIVE_GENERAL_EXPLANATION, RM_RECURSIVE_SUGGESTIONS))
+        }
+        n if n == RM_RECURSIVE_ROOT_HOME_NAME => Some((
+            RM_RECURSIVE_ROOT_HOME_EXPLANATION,
+            RM_RF_ROOT_HOME_SUGGESTIONS,
+        )),
+        n if n == RM_RECURSIVE_UNVERIFIED_NAME => Some((
+            RM_RECURSIVE_UNVERIFIED_EXPLANATION,
+            RM_RECURSIVE_UNVERIFIED_SUGGESTIONS,
+        )),
+        n if n == POWERSHELL_REMOVE_ITEM_RECURSIVE_NAME => Some((
+            POWERSHELL_REMOVE_ITEM_RECURSIVE_EXPLANATION,
+            POWERSHELL_REMOVE_ITEM_RECURSIVE_SUGGESTIONS,
+        )),
+        n if n == RM_BARE_GLOB_NAME => Some((RM_BARE_GLOB_EXPLANATION, RM_BARE_GLOB_SUGGESTIONS)),
+        n if n == RM_BARE_GLOB_ROOT_NAME => {
+            Some((RM_BARE_GLOB_ROOT_EXPLANATION, RM_BARE_GLOB_SUGGESTIONS))
+        }
+        _ => None,
+    }
+}
+
+/// Every rule name the semantic rm/PowerShell classifier can emit.
+///
+/// Kept beside the constants so a test can prove that each one delivers
+/// authored guidance through `Pack::rule_guidance`: a new classifier rule
+/// without a `destructive_patterns` entry or a `classifier_rule_guidance`
+/// row would otherwise reach the blocked caller mute (#348).
+pub(crate) const CLASSIFIER_RULE_NAMES: &[&str] = &[
+    RM_RF_ROOT_HOME_NAME,
+    RM_R_F_SEPARATE_ROOT_HOME_NAME,
+    RM_RECURSIVE_FORCE_ROOT_HOME_NAME,
+    RM_RF_GENERAL_NAME,
+    RM_R_F_SEPARATE_NAME,
+    RM_RECURSIVE_FORCE_NAME,
+    RM_RECURSIVE_ROOT_HOME_NAME,
+    RM_RECURSIVE_GENERAL_NAME,
+    RM_RECURSIVE_UNVERIFIED_NAME,
+    POWERSHELL_REMOVE_ITEM_RECURSIVE_NAME,
+    RM_BARE_GLOB_NAME,
+    RM_BARE_GLOB_ROOT_NAME,
+];
 
 pub(crate) fn is_pre_rm_propagation_rule(name: Option<&str>) -> bool {
     matches!(
@@ -2423,9 +2662,25 @@ fn parse_rm_segment_with_option_scanning(
         }
     }
 
-    let flag_state = flags.resolve();
-    let Some(flag_state) = flag_state else {
-        return RmParseDecision::NoMatch;
+    // GNU rm resolves -f/--force and all interactive modes in argv order.
+    // -i and -I override an earlier force; a later force overrides either.
+    let redirected_stdin = tokens
+        .iter()
+        .skip(start_idx)
+        .take_while(|token| token.kind != NormalizeTokenKind::Separator)
+        .filter_map(|token| token.text(command))
+        .any(starts_with_shell_stdin_redirection);
+    let interactive_prompts = flags.interactive_mode.prompts();
+
+    let Some(flag_state) = flags.resolve() else {
+        // Non-recursive rm has no dangerous flag shape of its own, but a bare
+        // `*` operand still hands the shell an unbounded deletion set (#334).
+        return parse_bare_glob_rm(
+            &paths,
+            interactive_prompts,
+            automated_stdin,
+            redirected_stdin,
+        );
     };
 
     // `rm -r` without an operand only reports a usage error. More
@@ -2435,14 +2690,6 @@ fn parse_rm_segment_with_option_scanning(
         return RmParseDecision::NoMatch;
     }
 
-    // GNU rm resolves -f/--force and all interactive modes in argv order.
-    // -i and -I override an earlier force; a later force overrides either.
-    let redirected_stdin = tokens
-        .iter()
-        .skip(start_idx)
-        .take_while(|token| token.kind != NormalizeTokenKind::Separator)
-        .filter_map(|token| token.text(command))
-        .any(starts_with_shell_stdin_redirection);
     if flag_state.interactive_mode.prompts() && !automated_stdin && !redirected_stdin {
         return RmParseDecision::Allow;
     }
@@ -2524,6 +2771,68 @@ fn parse_rm_segment_with_option_scanning(
         severity,
         span,
     })
+}
+
+/// Deny a non-recursive `rm` whose operand is a bare working-directory or
+/// root glob (#334): `rm -f *`, `rm ./*`, `rm /*`.
+///
+/// Without `-r` the recursive rules never see these, yet the shell expands
+/// the glob to every matching entry, so the deleted set is unbounded and
+/// invisible in the command text. `-f` is deliberately not required: it only
+/// changes error reporting, and the write-protection query it suppresses
+/// reaches nobody under an agent hook. Suffix and prefix globs (`*.log`,
+/// `build/*`) stay untouched — they name a reviewable shape — as do quoted
+/// operands (`rm '*'` is one literal file) and genuinely interactive
+/// invocations, which prompt per file exactly like the recursive forms.
+fn parse_bare_glob_rm(
+    paths: &[PathToken<'_>],
+    interactive_prompts: bool,
+    automated_stdin: bool,
+    redirected_stdin: bool,
+) -> RmParseDecision {
+    if paths.is_empty() {
+        return RmParseDecision::NoMatch;
+    }
+    if interactive_prompts && !automated_stdin && !redirected_stdin {
+        // The per-file prompt bounds the deletion; with stdin closed, as
+        // under a hook, rm deletes nothing and exits 0.
+        return RmParseDecision::NoMatch;
+    }
+
+    let unquoted_operand = |wanted: fn(&str) -> bool| {
+        paths
+            .iter()
+            .find(|path| path.quote == QuoteKind::None && wanted(path.unquoted))
+    };
+
+    // Root first: the more severe attribution wins when both shapes appear.
+    if let Some(path) = unquoted_operand(|text| text == "/*") {
+        if rm_targets_exempted_for_rule(RM_BARE_GLOB_ROOT_NAME, paths) {
+            // Only this rule stands down (#284); other rules still see the
+            // command, so report no-match rather than a shielding allow.
+            return RmParseDecision::NoMatch;
+        }
+        return RmParseDecision::Deny(RmParseMatch {
+            pattern_name: RM_BARE_GLOB_ROOT_NAME,
+            reason: RM_BARE_GLOB_ROOT_REASON,
+            severity: Severity::Critical,
+            span: Some(path.range.clone()),
+        });
+    }
+
+    if let Some(path) = unquoted_operand(|text| matches!(text, "*" | "./*")) {
+        if rm_targets_exempted_for_rule(RM_BARE_GLOB_NAME, paths) {
+            return RmParseDecision::NoMatch;
+        }
+        return RmParseDecision::Deny(RmParseMatch {
+            pattern_name: RM_BARE_GLOB_NAME,
+            reason: RM_BARE_GLOB_REASON,
+            severity: Severity::High,
+            span: Some(path.range.clone()),
+        });
+    }
+
+    RmParseDecision::NoMatch
 }
 
 fn apple_rm_option_token_is_valid(text: &str) -> bool {
@@ -3378,10 +3687,11 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              takes hours to days.\n\n\
              dcg auto-allows recursive deletion only for literal temp paths:\n  \
              rm -rf /tmp/<subdir>/scratch\n\n\
-             For any other directory, preview first and then delete interactively \
-             (dcg allows the interactive form):\n  \
+             For any other directory, preview first, then either delete interactively \
+             or move the tree aside (dcg allows both forms):\n  \
              find /path/to/directory -type f | head -20\n  \
-             rm -ri /path/to/directory",
+             rm -ri /path/to/directory   # needs a terminal; with stdin closed it deletes nothing and exits 0\n  \
+             mv /path/to/directory /tmp/delete-me-<literal-timestamp>",
             RM_RF_ROOT_HOME_SUGGESTIONS
         ),
         // Same root/home catastrophe but with SEPARATE flags (`rm -r -f /`,
@@ -3396,7 +3706,12 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             Critical,
             "Separate `-r -f` flags on `/` or `~` have identical effect to `rm -rf /`: \
              recursive, forced, silent deletion of the entire filesystem or home directory.\n\n\
-             There is NO recovery without backups. Run only if truly intended.",
+             There is NO recovery without backups. Run only if truly intended.\n\n\
+             For a specific directory, preview first, then either delete interactively \
+             or move the tree aside (dcg allows both forms):\n  \
+             ls -la /path/to/directory\n  \
+             rm -ri /path/to/directory   # needs a terminal; with stdin closed it deletes nothing and exits 0\n  \
+             mv /path/to/directory /tmp/delete-me-<literal-timestamp>",
             RM_RF_ROOT_HOME_SUGGESTIONS
         ),
         // Same root/home catastrophe but with LONG flags
@@ -3407,7 +3722,12 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             "rm --recursive --force targeting root or home is EXTREMELY DANGEROUS.",
             Critical,
             "The long-flag form has identical effect to `rm -rf /`: recursive, forced, \
-             silent deletion. Run only if truly intended.",
+             silent deletion. Run only if truly intended.\n\n\
+             For a specific directory, preview first, then either delete interactively \
+             or move the tree aside (dcg allows both forms):\n  \
+             ls -la /path/to/directory\n  \
+             rm -ri /path/to/directory   # needs a terminal; with stdin closed it deletes nothing and exits 0\n  \
+             mv /path/to/directory /tmp/delete-me-<literal-timestamp>",
             RM_RF_ROOT_HOME_SUGGESTIONS
         ),
         // General rm -rf (caught after safe patterns) - High because temp paths are allowed
@@ -3425,8 +3745,9 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Wildcards can expand to match more than expected\n\
              - No undo mechanism exists\n\n\
              Safe alternatives:\n\
-             - rm -ri: Interactive mode, confirms each file\n\
-             - trash-cli: Moves files to trash instead of deleting\n\
+             - rm -ri: Interactive mode, confirms each file. Needs a terminal: with stdin closed, as under an agent hook, it prompts, deletes nothing, and exits 0\n\
+             - mv <path> /tmp/delete-me-<literal-timestamp>: Move the tree aside instead of deleting it (dcg allows this form)\n\
+             - trash-cli (Linux) or mv <path> ~/.Trash/ (macOS): Moves files to trash instead of deleting\n\
              - rm -rf in literal /tmp or /var/tmp subdirectories: Allowed\n\
              - Variable-rooted paths such as $TMPDIR: Reviewed because the environment may point anywhere\n\n\
              Preview what would be deleted:\n  \
@@ -3455,7 +3776,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              Safer alternatives:\n\
              - Preview the expansion first: `ls ~/Downloads/*.md`\n\
              - Delete explicitly named files: `rm ~/Downloads/one-file.md`\n\
-             - Move to trash instead: `mv ~/Downloads/*.md ~/.local/share/Trash/`",
+             - Move to trash instead: `mv ~/Downloads/*.md ~/.Trash/` on macOS, \
+             `mv ~/Downloads/*.md ~/.local/share/Trash/` on Linux",
             RM_RF_GENERAL_SUGGESTIONS
         ),
         // rm -r -f (separate flags)
@@ -3501,7 +3823,11 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Use absolute paths to avoid ambiguity\n\
              - Consider using trash-cli for recoverable deletion\n\n\
              Preview command:\n  \
-             find /path --maxdepth 2 -ls | head -30",
+             find /path -maxdepth 2 -ls | head -30\n\n\
+             Forms dcg accepts instead:\n  \
+             rm --recursive --force /tmp/<subdir>   # literal temp paths are allowed\n  \
+             rm -ri /path/to/directory              # needs a terminal; with stdin closed it deletes nothing and exits 0\n  \
+             mv /path/to/directory /tmp/delete-me-<literal-timestamp>",
             RM_RECURSIVE_FORCE_SUGGESTIONS
         ),
         // ----- `find ... -delete` (Critical: root/home target) -----
@@ -3915,10 +4241,14 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Any shell-expanded mv path can resolve to `/`, `/etc`, or another
         // sensitive tree. `mv` intentionally has no broad general tier, so it
         // needs an explicit fail-closed rule for variables, command
-        // substitutions, and backslash-obfuscated path traversal.
+        // substitutions, and backslash-obfuscated path traversal. A
+        // backslash immediately followed by LF (or CRLF) is a shell line
+        // continuation, not part of any path token, so it is excluded from
+        // the backslash evidence (#356). A doubled backslash before a newline
+        // still matches at the first backslash, as it is a real escaped byte.
         destructive_pattern!(
             "mv-dynamic-path",
-            r"\bmv\b[^|;&]*[\\$`]",
+            r"\bmv\b[^|;&]*(?:[$`]|\\(?:[^\r\n]|$|\r(?:[^\n]|$)))",
             "mv with a shell-expanded or escaped path cannot be verified before execution.",
             High,
             "Shell variables and command substitutions are controlled by the calling environment and may resolve to `/`, `/etc`, a home directory, or another persistent tree. Backslash escapes can also hide traversal from lexical path checks, so dcg cannot safely classify this move.\n\n\
@@ -3993,7 +4323,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "redirect-truncate-root-home",
             r#"(?<![<>])(?:&>|>&|\*>|(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?>\|?)\s*(?:['"\\]|\$['"])?(?!/dev/(?:null|zero|full|tty)\b)(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
-            "shell truncating redirect (including arbitrary numeric, named, and PowerShell all-stream forms) to a sensitive system or home path destroys the previous file contents. EXTREMELY DANGEROUS.",
+            "shell truncating redirect (including arbitrary numeric, named, and PowerShell all-stream forms) to an existing sensitive system or home path destroys the previous file contents. A currently absent literal target inside an existing home-directory VCS worktree is allowed; dynamic paths, symlinks, missing parents, system paths, and .git internals stay blocked.",
             Critical,
             "`> /etc/passwd` (or `: > /etc/passwd`, `echo > /etc/passwd`, etc.) opens \
              the target file with O_WRONLY|O_CREAT|O_TRUNC — the contents are destroyed \
@@ -4003,6 +4333,11 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              There is NO recovery without backups.\n\n\
              Safer alternatives:\n\
              - Use append (`>>`) to preserve existing content: `echo line >> <file>`.\n\
+             - A literal, currently absent destination inside an existing home-directory VCS \
+               worktree is allowed. Existing files, symlinks, dynamic paths, missing parents, \
+               system paths, and `.git` internals remain blocked.\n\
+             - For race-free exclusive creation, resolve a literal path and use:\n  \
+               `producer | dcg create-new <path>` (existing files, directories, and symlinks are refused).\n\
              - Make a backup, then write via a temp file:\n  \
                `cp <file> <file>.bak && echo data > /tmp/<subdir>/out && cp -f /tmp/<subdir>/out <file>`\n  \
                (a truncating redirect straight back onto a home/system path is denied \
@@ -5162,6 +5497,27 @@ mod tests {
     }
 
     #[test]
+    fn mv_literal_operands_with_line_continuations_are_allowed_issue_356() {
+        let pack = create_pack();
+        for cmd in [
+            "mv fileA.md fileB.md \\\n               fileC.md \\\n               destdir/",
+            "mv fileA.md fileB.md \\\r\n               fileC.md \\\r\n               destdir/",
+        ] {
+            assert_no_match(&pack, cmd);
+        }
+
+        // Only the shell's backslash-newline join is inert. Runtime
+        // expansion and in-path escaping remain unverifiable and blocked.
+        for cmd in [
+            "mv fileA.md \\\n               $DEST/",
+            r"mv fileA\ name.md destdir/",
+            "mv fileA\\\rdest.md destdir/",
+        ] {
+            assert_blocks_with_pattern(&pack, cmd, "mv-dynamic-path");
+        }
+    }
+
+    #[test]
     fn sensitive_propagation_then_delete_blocks_critical() {
         let pack = create_pack();
         for (cmd, pattern) in [
@@ -5377,6 +5733,28 @@ mod tests {
         ] {
             assert_blocks_with_severity(&pack, cmd, Severity::Critical);
             assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
+        }
+    }
+
+    #[test]
+    fn redirect_truncate_rules_suggest_exclusive_create_new_sink() {
+        let pack = create_pack();
+        for rule_name in [
+            "redirect-truncate-root-home",
+            "redirect-truncate-dynamic-path",
+        ] {
+            let rule = pack
+                .destructive_patterns
+                .iter()
+                .find(|pattern| pattern.name == Some(rule_name))
+                .unwrap_or_else(|| panic!("missing {rule_name} rule"));
+            assert!(
+                rule.suggestions.iter().any(|suggestion| {
+                    suggestion.command == "producer | dcg create-new {path}"
+                        && suggestion.description.contains("only if no file")
+                }),
+                "{rule_name} must expose the non-overwriting positive capability"
+            );
         }
     }
 
@@ -6957,5 +7335,173 @@ mod tests {
         ] {
             assert_blocks_with_pattern(&pack, command, "redirect-truncate-root-home");
         }
+    }
+}
+
+/// The rm classifier never walks `destructive_patterns`, so its denials must
+/// find their guidance by rule name (#348). These tests prove every rule it
+/// can emit resolves to authored text, and that the rule list they iterate
+/// cannot silently fall behind the constants it mirrors.
+#[cfg(test)]
+mod classifier_guidance_tests {
+    use super::*;
+
+    const PLACEHOLDER: &str = "No additional explanation is available yet";
+
+    /// Forms dcg accepts, either unconditionally or for literal temp paths.
+    /// An explanation that names none of them tells the caller only that it
+    /// lost.
+    const ACCEPTED_FORMS: &[&str] = &["rm -ri", "/tmp/delete-me-", "ls -la", "-WhatIf"];
+
+    #[test]
+    fn every_classifier_rule_resolves_to_authored_guidance() {
+        let pack = create_pack();
+        for &name in CLASSIFIER_RULE_NAMES {
+            let (explanation, suggestions) = pack.rule_guidance(name);
+            let explanation =
+                explanation.unwrap_or_else(|| panic!("classifier rule {name} has no explanation"));
+            assert!(
+                !explanation.contains(PLACEHOLDER),
+                "classifier rule {name} resolves to the placeholder"
+            );
+            assert!(
+                ACCEPTED_FORMS.iter().any(|form| explanation.contains(form)),
+                "classifier rule {name} names no command dcg accepts: {explanation}"
+            );
+            assert!(
+                !suggestions.is_empty(),
+                "classifier rule {name} offers no safer alternative"
+            );
+            for suggestion in suggestions {
+                assert!(
+                    !suggestion.command.contains("--maxdepth"),
+                    "{name}: find takes -maxdepth, not --maxdepth"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn classifier_rule_explanations_are_distinct() {
+        // One shared blurb attached to every rule would satisfy the test
+        // above while telling a PowerShell caller about `rm -ri`.
+        let pack = create_pack();
+        let mut seen: Vec<(&str, &str)> = Vec::new();
+        for &name in CLASSIFIER_RULE_NAMES {
+            let explanation = pack.rule_guidance(name).0.expect("explanation");
+            if let Some((other, _)) = seen.iter().find(|(_, text)| *text == explanation) {
+                panic!("{name} reuses the explanation authored for {other}");
+            }
+            seen.push((name, explanation));
+        }
+    }
+
+    #[test]
+    fn classifier_only_guidance_covers_exactly_the_pattern_less_rules() {
+        // A rule with a regex pattern carries its text on the pattern; the
+        // classifier-only table must cover the rest and nothing else, or a
+        // row is dead (shadowed by the pattern) or a rule is mute.
+        let pack = create_pack();
+        for &name in CLASSIFIER_RULE_NAMES {
+            let has_pattern = pack
+                .destructive_patterns
+                .iter()
+                .any(|pattern| pattern.name == Some(name));
+            let has_table_row = classifier_rule_guidance(name).is_some();
+            assert!(
+                has_pattern != has_table_row,
+                "{name}: pattern={has_pattern} table={has_table_row}; exactly one must hold"
+            );
+        }
+        assert!(classifier_rule_guidance("no-such-rule").is_none());
+    }
+
+    #[test]
+    fn classifier_rule_name_list_mirrors_the_constants() {
+        // The list is hand-maintained; tie it to the `*_NAME` constants in
+        // this module so a new classifier rule cannot ship without a row in
+        // the list (and therefore without the guidance checks above).
+        let declared: Vec<&str> = include_str!("filesystem.rs")
+            .lines()
+            .filter(|line| line.starts_with("const ") && line.contains("_NAME: &str"))
+            .collect();
+        assert_eq!(
+            declared.len(),
+            CLASSIFIER_RULE_NAMES.len(),
+            "this module declares {} rule-name constants but CLASSIFIER_RULE_NAMES lists {}: \
+             add the new rule to the list and author its guidance.\n{declared:#?}",
+            declared.len(),
+            CLASSIFIER_RULE_NAMES.len()
+        );
+    }
+
+    #[test]
+    fn rm_suggestions_no_longer_advertise_linux_trash_on_macos() {
+        // #348: `~/.local/share/Trash` does not exist on macOS; every rm rule
+        // that offers a trash move must offer the Finder trash for macOS.
+        let pack = create_pack();
+        let trash_rules = [RM_RF_GENERAL_NAME, RM_RECURSIVE_GENERAL_NAME];
+        for name in trash_rules {
+            let (_, suggestions) = pack.rule_guidance(name);
+            assert!(
+                suggestions.iter().any(|suggestion| {
+                    suggestion.platform == Platform::MacOS
+                        && suggestion.command.contains("~/.Trash")
+                }),
+                "{name} offers no macOS trash suggestion"
+            );
+        }
+    }
+
+    /// #334: a bare `*` handed to non-recursive rm wipes an unbounded,
+    /// shell-chosen file set and must be reviewed; reviewable shapes (suffix
+    /// globs, named files, quoted literals, interactive) stay allowed.
+    #[test]
+    fn bare_glob_rm_is_denied_and_reviewable_shapes_stay_allowed() {
+        let pack = create_pack();
+        for (command, rule) in [
+            ("rm -f *", RM_BARE_GLOB_NAME),
+            ("rm *", RM_BARE_GLOB_NAME),
+            ("rm -f ./*", RM_BARE_GLOB_NAME),
+            ("rm -fv *", RM_BARE_GLOB_NAME),
+            ("cd /srv/app && rm -f *", RM_BARE_GLOB_NAME),
+            ("rm /*", RM_BARE_GLOB_ROOT_NAME),
+            ("rm -f /*", RM_BARE_GLOB_ROOT_NAME),
+        ] {
+            let matched = pack
+                .check(command)
+                .unwrap_or_else(|| panic!("{command} must be denied"));
+            assert_eq!(matched.name, Some(rule), "{command}");
+            assert!(
+                matched.explanation.is_some(),
+                "{command}: bare-glob denial must carry guidance"
+            );
+        }
+
+        for command in [
+            "rm *.log",
+            "rm -f *.env",
+            "rm build/*",
+            "rm -f build/*",
+            "rm '*'",
+            "rm \"*\"",
+            "rm -i *",
+            "rm ./file-one ./file-two",
+            "rm -f notes.txt",
+            "echo *",
+            "ls *",
+        ] {
+            assert!(
+                pack.check(command).is_none(),
+                "{command} must stay allowed, matched {:?}",
+                pack.check(command).and_then(|matched| matched.name)
+            );
+        }
+
+        // Recursive spellings keep their established, more specific rules.
+        assert_eq!(
+            pack.check("rm -rf *").and_then(|matched| matched.name),
+            Some(RM_RF_GENERAL_NAME)
+        );
     }
 }

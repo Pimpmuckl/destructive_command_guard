@@ -1147,8 +1147,13 @@ jobs:
     needs: check
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The absolute gate binds the binary's full Git object id to this
+          # checkout and retains `git describe` as supplemental diagnostics.
+          # Full history keeps that description reproducible.
+          fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
 
       - name: Cache cargo registry and target
         uses: actions/cache@v6
@@ -1170,8 +1175,10 @@ jobs:
           set +e
 
           BASELINE_JSON="perf/baselines/2026-01-11-after-lazy.json"
-          CURRENT_JSON="perf-current.json"
-          REPORT_MD="perf-regression-report.md"
+          PERF_ARTIFACT_DIR="$RUNNER_TEMP/dcg-perf-relative"
+          mkdir -p "$PERF_ARTIFACT_DIR"
+          CURRENT_JSON="$PERF_ARTIFACT_DIR/perf-current.json"
+          REPORT_MD="$PERF_ARTIFACT_DIR/perf-regression-report.md"
 
           python3 scripts/perf_baseline.py \
             --bin target/release/dcg \
@@ -1188,6 +1195,7 @@ jobs:
 
           python3 - "$BASELINE_JSON" "$CURRENT_JSON" "$REPORT_MD" <<'PY'
           import json
+          import math
           import sys
 
           baseline_path = sys.argv[1]
@@ -1198,16 +1206,69 @@ jobs:
           slack_ms = 5.0
           rss_slack_kb = 8192
 
-          with open(baseline_path, "r", encoding="utf-8") as handle:
-              baseline = json.load(handle)
-          with open(current_path, "r", encoding="utf-8") as handle:
-              current = json.load(handle)
+          def reject_non_finite_json_constant(value):
+              raise ValueError(f"non-standard JSON numeric constant: {value}")
 
-          baseline_cases = {c["id"]: c for c in baseline.get("cases", [])}
-          current_cases = {c["id"]: c for c in current.get("cases", [])}
+          with open(baseline_path, "r", encoding="utf-8") as handle:
+              baseline = json.load(
+                  handle, parse_constant=reject_non_finite_json_constant
+              )
+          with open(current_path, "r", encoding="utf-8") as handle:
+              current = json.load(
+                  handle, parse_constant=reject_non_finite_json_constant
+              )
 
           violations = []
           rows = []
+
+          def finite_nonnegative_number(value, label):
+              if isinstance(value, bool) or not isinstance(value, (int, float)):
+                  violations.append(f"{label} must be a JSON number")
+                  return None
+              numeric = float(value)
+              if not math.isfinite(numeric) or numeric < 0:
+                  violations.append(f"{label} must be finite and nonnegative")
+                  return None
+              return numeric
+
+          def optional_nonnegative_rss(value, label):
+              if value is None:
+                  return None
+              if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                  violations.append(f"{label} must be a nonnegative integer or null")
+                  return None
+              return value
+
+          baseline_case_list = baseline.get("cases", [])
+          current_case_list = current.get("cases", [])
+
+          def duplicate_ids(cases):
+              ids = [case["id"] for case in cases]
+              return sorted(case_id for case_id in set(ids) if ids.count(case_id) > 1)
+
+          for label, cases in (("baseline", baseline_case_list), ("current", current_case_list)):
+              duplicates = duplicate_ids(cases)
+              if duplicates:
+                  violations.append(f"duplicate case ids in {label}: {', '.join(duplicates)}")
+
+          baseline_cases = {c["id"]: c for c in baseline_case_list}
+          current_cases = {c["id"]: c for c in current_case_list}
+
+          required_baseline_case_ids = {
+              "quick_reject",
+              "safe_keyword",
+              "destructive_keyword",
+              "heredoc_inline",
+              "bypass",
+          }
+          missing_baseline_ids = sorted(
+              required_baseline_case_ids - set(baseline_cases)
+          )
+          if missing_baseline_ids:
+              violations.append(
+                  "committed baseline is missing required case ids: "
+                  + ", ".join(missing_baseline_ids)
+              )
 
           for case_id in sorted(baseline_cases.keys()):
               if case_id not in current_cases:
@@ -1217,31 +1278,51 @@ jobs:
               b = baseline_cases[case_id].get("metrics", {})
               c = current_cases[case_id].get("metrics", {})
 
-              b_p50 = float(b.get("p50_ms", 0.0))
-              c_p50 = float(c.get("p50_ms", 0.0))
+              b_p50 = finite_nonnegative_number(
+                  b.get("p50_ms"), f"baseline {case_id} p50_ms"
+              )
+              c_p50 = finite_nonnegative_number(
+                  c.get("p50_ms"), f"current {case_id} p50_ms"
+              )
+              if b_p50 is None or c_p50 is None:
+                  continue
 
               limit_p50 = b_p50 * mult + slack_ms
               status = "OK" if c_p50 <= limit_p50 else "REGRESSED"
               rows.append((case_id, b_p50, c_p50, limit_p50, status))
 
-              if c_p50 > limit_p50:
+              if status != "OK":
                   violations.append(
                       f"{case_id} p50_ms {c_p50:.2f} > {limit_p50:.2f} (baseline {b_p50:.2f}, mult {mult}x + {slack_ms}ms)"
                   )
 
-              b_rss = b.get("max_rss_kb")
-              c_rss = c.get("max_rss_kb")
-              if isinstance(b_rss, int) and isinstance(c_rss, int):
+              b_rss = optional_nonnegative_rss(
+                  b.get("max_rss_kb"), f"baseline {case_id} max_rss_kb"
+              )
+              c_rss = optional_nonnegative_rss(
+                  c.get("max_rss_kb"), f"current {case_id} max_rss_kb"
+              )
+              if b_rss is not None and c_rss is not None:
                   rss_limit = max(int(b_rss * 2.0), b_rss + rss_slack_kb)
                   if c_rss > rss_limit:
                       violations.append(
                           f"{case_id} max_rss_kb {c_rss} > {rss_limit} (baseline {b_rss})"
                       )
 
-          # Also fail if new unexpected cases are added (keeps the harness stable)
+          # Historical baselines are intentionally sparse. Current-only cases
+          # remain visible here and are enforced by the absolute evaluator-cost
+          # gate below; inventing retroactive limits would fabricate evidence.
           extra_cases = sorted(set(current_cases.keys()) - set(baseline_cases.keys()))
-          if extra_cases:
-              violations.append(f"unexpected new cases in current run: {', '.join(extra_cases)}")
+          for case_id in extra_cases:
+              c = current_cases[case_id].get("metrics", {})
+              c_p50 = finite_nonnegative_number(
+                  c.get("p50_ms"), f"current {case_id} p50_ms"
+              )
+              optional_nonnegative_rss(
+                  c.get("max_rss_kb"), f"current {case_id} max_rss_kb"
+              )
+              if c_p50 is not None:
+                  rows.append((case_id, None, c_p50, None, "UNBASELINED"))
 
           # Write report (Markdown for GHA summary + artifacts)
           lines = []
@@ -1250,11 +1331,15 @@ jobs:
           lines.append(f"- Baseline: `{baseline_path}`")
           lines.append(f"- Threshold: `current_p50_ms <= baseline_p50_ms * {mult} + {slack_ms}ms`")
           lines.append(f"- RSS slack: `max(baseline*2, baseline+{rss_slack_kb}KB)` (when available)")
+          lines.append("- Current-only cases: `UNBASELINED`; enforced by the absolute gate below")
           lines.append("")
           lines.append("| Case | Baseline p50 (ms) | Current p50 (ms) | Limit (ms) | Status |")
           lines.append("|------|-------------------|-----------------|-----------|--------|")
           for case_id, b_p50, c_p50, limit_p50, status in rows:
-              lines.append(f"| `{case_id}` | {b_p50:.2f} | {c_p50:.2f} | {limit_p50:.2f} | {status} |")
+              if status == "UNBASELINED":
+                  lines.append(f"| `{case_id}` | — | {c_p50:.2f} | — | {status} |")
+              else:
+                  lines.append(f"| `{case_id}` | {b_p50:.2f} | {c_p50:.2f} | {limit_p50:.2f} | {status} |")
           lines.append("")
 
           if violations:
@@ -1291,8 +1376,8 @@ jobs:
         with:
           name: perf-regression-artifacts
           path: |
-            perf-current.json
-            perf-regression-report.md
+            ${{ runner.temp }}/dcg-perf-relative/perf-current.json
+            ${{ runner.temp }}/dcg-perf-relative/perf-regression-report.md
           retention-days: 14
           if-no-files-found: ignore
 
@@ -1308,23 +1393,39 @@ jobs:
       # fixed hook deadline is never consulted. That is exactly how a ~215ms
       # per-invocation cost shipped against a 200ms budget and turned ordinary
       # commands into fail-closed review prompts for every user. This gate
-      # asserts cold p95 against the SHIPPED default budget with a hermetic
-      # HOME and no DCG_* overrides, so it fails on absolute cost regardless of
-      # what the baseline says.
-      - name: Absolute hook-latency gate vs shipped default budget
+      # pairs each full hook invocation with DCG_BYPASS and asserts the p95 of
+      # the matched difference against the SHIPPED default budget. Process
+      # spawn sits outside that in-process deadline, so raw end-to-end p95 is
+      # retained as evidence but is not substituted for evaluator cost. The
+      # run uses a hermetic HOME and no ambient DCG_* overrides. One hundred
+      # samples also support the harness's 95/95 one-sided binomial tolerance
+      # rule (at most one over-limit sample per case).
+      - name: Absolute evaluator-cost gate vs shipped default budget
         run: |
+          LATENCY_ARTIFACT_DIR="$RUNNER_TEMP/dcg-perf-latency"
+          mkdir -p "$LATENCY_ARTIFACT_DIR"
+          python3 -B scripts/perf_baseline.py --self-test
           BUDGET_MS=$(grep -oP 'pub const HOOK_EVALUATION_BUDGET_MS: u64 = \K[0-9_]+' src/perf.rs | tr -d '_')
-          if [ -z "$BUDGET_MS" ]; then
-            echo "::error::could not read HOOK_EVALUATION_BUDGET_MS from src/perf.rs"
+          if ! [[ "$BUDGET_MS" =~ ^[0-9]+$ ]] || [ "$BUDGET_MS" -le 0 ]; then
+            echo "::error::HOOK_EVALUATION_BUDGET_MS must be one positive integer"
             exit 1
           fi
           echo "Shipped default hook budget: ${BUDGET_MS}ms"
           python3 scripts/perf_baseline.py \
             --bin target/release/dcg \
-            --skip-trace --warmup 5 --runs 40 \
+            --skip-trace --warmup 5 --runs 100 \
             --assert-budget-ms "$BUDGET_MS" \
             --assert-margin-pct 50 \
-            --output perf-latency-gate.json
+            --output "$LATENCY_ARTIFACT_DIR/perf-latency-gate.json"
+
+      - name: Upload absolute latency gate certificate
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: perf-latency-gate-certificate
+          path: ${{ runner.temp }}/dcg-perf-latency/perf-latency-gate.json
+          retention-days: 14
+          if-no-files-found: error
 
       - name: Harness protocol matrix (real binary, every agent wire format)
         run: |

@@ -319,11 +319,12 @@ pub struct DestructivePattern {
     /// `None` means the rule is unscoped: it matches any text the engine hands
     /// it, exactly as before this field existed. `Some(list)` restricts the
     /// rule to text governed by one of the listed executables — the evaluator
-    /// resolves the argv0 of the command segment the match starts in (wrappers
-    /// such as `sudo`/`env` and leading assignments stripped, path basename,
-    /// `.exe`/`.cmd`/`.bat`/`.com` removed, ASCII case-insensitive) and skips
-    /// the rule unless it is in this list. A dynamic argv0 (one containing a
-    /// shell expansion) never matches.
+    /// requires the complete regex match to stay inside a command segment,
+    /// resolves that segment's argv0 (wrappers such as `sudo`/`env` and leading
+    /// assignments stripped, path basename, `.exe`/`.cmd`/`.bat`/`.com`
+    /// removed, ASCII case-insensitive), and skips the rule unless it is in
+    /// this list. A dynamic argv0 (one containing a shell expansion) never
+    /// matches.
     ///
     /// Names must be written lowercase without a path or extension.
     pub executables: Option<&'static [&'static str]>,
@@ -340,6 +341,28 @@ impl std::fmt::Debug for DestructivePattern {
             .field("suggestions", &self.suggestions)
             .field("executables", &self.executables)
             .finish()
+    }
+}
+
+impl DestructivePattern {
+    /// Match through the same executable-scope contract as the primary
+    /// evaluator. Unscoped rules retain their historical raw-regex behavior.
+    fn matches_command(&self, command: &str) -> bool {
+        match self.executables {
+            None => self.regex.is_match(command),
+            Some(executables) => crate::evaluator::executable_scoped_pattern_matches(
+                &self.regex,
+                command,
+                executables,
+            ),
+        }
+    }
+
+    /// Scope a parser/semantic match that has no regex byte span.
+    fn semantic_match_is_in_scope(&self, command: &str) -> bool {
+        self.executables.is_none_or(|executables| {
+            crate::evaluator::command_invokes_declared_executable(command, executables)
+        })
     }
 }
 
@@ -721,10 +744,10 @@ impl Pack {
                     return None;
                 }
                 crate::packs::careful_company_running_windows::transfer::DirectScpDecision::Destructive => {
-                    return self.destructive_match_by_name("scp-to-remote");
+                    return self.destructive_match_by_name("scp-to-remote", cmd);
                 }
                 crate::packs::careful_company_running_windows::transfer::DirectScpDecision::Unverified => {
-                    return self.destructive_match_by_name("scp-destination-unverified");
+                    return self.destructive_match_by_name("scp-destination-unverified", cmd);
                 }
                 crate::packs::careful_company_running_windows::transfer::DirectScpDecision::NotDirect => {}
             }
@@ -736,7 +759,7 @@ impl Pack {
                     return None;
                 }
                 crate::packs::remote::scp::ScpSemanticDecision::Destructive(name) => {
-                    return self.destructive_match_by_name(name);
+                    return self.destructive_match_by_name(name, cmd);
                 }
                 crate::packs::remote::scp::ScpSemanticDecision::NoMatch => {
                     let segments = crate::packs::split_command_segments(cmd);
@@ -751,11 +774,13 @@ impl Pack {
         if self.id == "core.git" {
             match crate::packs::core::git::branch_command_decision(cmd) {
                 crate::packs::core::git::BranchCommandDecision::Destructive => {
-                    return self.destructive_match_by_name("branch-force-delete");
+                    return self.destructive_match_by_name("branch-force-delete", cmd);
                 }
                 crate::packs::core::git::BranchCommandDecision::DestructiveDynamic => {
-                    return self
-                        .destructive_match_by_name(crate::packs::core::git::BRANCH_DYNAMIC_RULE);
+                    return self.destructive_match_by_name(
+                        crate::packs::core::git::BRANCH_DYNAMIC_RULE,
+                        cmd,
+                    );
                 }
                 crate::packs::core::git::BranchCommandDecision::NonDestructive => return None,
                 crate::packs::core::git::BranchCommandDecision::NotBranch
@@ -772,7 +797,7 @@ impl Pack {
         }
         self.destructive_patterns
             .iter()
-            .find(|p| p.regex.is_match(cmd))
+            .find(|p| p.matches_command(cmd))
             .map(|p| DestructiveMatch {
                 reason: p.reason,
                 name: p.name,
@@ -789,7 +814,7 @@ impl Pack {
         self.destructive_patterns
             .iter()
             .filter(|p| predicate(p.name))
-            .find(|p| p.regex.is_match(cmd))
+            .find(|p| p.matches_command(cmd))
             .map(|p| DestructiveMatch {
                 reason: p.reason,
                 name: p.name,
@@ -798,16 +823,72 @@ impl Pack {
             })
     }
 
-    fn destructive_match_by_name(&self, name: &str) -> Option<DestructiveMatch> {
+    fn destructive_match_by_name(&self, name: &str, cmd: &str) -> Option<DestructiveMatch> {
         self.destructive_patterns
             .iter()
-            .find(|pattern| pattern.name == Some(name))
+            .find(|pattern| pattern.name == Some(name) && pattern.semantic_match_is_in_scope(cmd))
             .map(|pattern| DestructiveMatch {
                 reason: pattern.reason,
                 name: pattern.name,
                 severity: pattern.severity,
                 explanation: pattern.explanation,
             })
+    }
+
+    /// Names of every rule whose authored guidance can be resolved by
+    /// [`Self::rule_guidance`].
+    ///
+    /// Most rules are regex-backed entries in `destructive_patterns`.
+    /// `core.filesystem` also has semantic rm/PowerShell classifier rules that
+    /// never enter that array. Returning both inventories here lets consumers
+    /// validate all suggestions without duplicating the classifier's private
+    /// rule list. A name emitted by both paths is yielded only once.
+    pub fn guidance_rule_names(&self) -> impl Iterator<Item = &'static str> + '_ {
+        let classifier_names: &'static [&'static str] = if self.id == "core.filesystem" {
+            crate::packs::core::filesystem::CLASSIFIER_RULE_NAMES
+        } else {
+            &[]
+        };
+
+        self.destructive_patterns
+            .iter()
+            .filter_map(|pattern| pattern.name)
+            .chain(classifier_names.iter().copied().filter(|name| {
+                !self
+                    .destructive_patterns
+                    .iter()
+                    .any(|pattern| pattern.name == Some(*name))
+            }))
+    }
+
+    /// Explanation and safer-alternative suggestions authored for the rule
+    /// named `name` (#348).
+    ///
+    /// Semantic classifiers (the `core.filesystem` rm parser) build their own
+    /// hit and never walk `destructive_patterns`, so a denial they produce has
+    /// to look its guidance up by rule name. A rule that also exists as a
+    /// regex pattern answers with that pattern's text; a classifier-only rule
+    /// answers with the guidance authored beside the classifier; anything
+    /// else answers with nothing, which renders as the generic placeholder.
+    #[must_use]
+    pub fn rule_guidance(
+        &self,
+        name: &str,
+    ) -> (Option<&'static str>, &'static [PatternSuggestion]) {
+        if let Some(pattern) = self
+            .destructive_patterns
+            .iter()
+            .find(|pattern| pattern.name == Some(name))
+        {
+            return (pattern.explanation, pattern.suggestions);
+        }
+        if self.id == "core.filesystem"
+            && let Some((explanation, suggestions)) =
+                crate::packs::core::filesystem::classifier_rule_guidance(name)
+        {
+            return (Some(explanation), suggestions);
+        }
+        (None, &[])
     }
 
     /// Check a command against this pack.
@@ -853,7 +934,7 @@ impl Pack {
                 crate::packs::remote::scp::ScpSemanticDecision::Safe
                 | crate::packs::remote::scp::ScpSemanticDecision::NonDestructive => return None,
                 crate::packs::remote::scp::ScpSemanticDecision::Destructive(name) => {
-                    return self.destructive_match_by_name(name);
+                    return self.destructive_match_by_name(name, cmd);
                 }
                 crate::packs::remote::scp::ScpSemanticDecision::NoMatch => {}
             }
@@ -870,11 +951,12 @@ impl Pack {
             match crate::packs::core::filesystem::parse_rm_command(cmd) {
                 crate::packs::core::filesystem::RmParseDecision::Allow => return None,
                 crate::packs::core::filesystem::RmParseDecision::Deny(hit) => {
+                    let (explanation, _) = self.rule_guidance(hit.pattern_name);
                     return Some(DestructiveMatch {
                         reason: hit.reason,
                         name: Some(hit.pattern_name),
                         severity: hit.severity,
-                        explanation: None,
+                        explanation,
                     });
                 }
                 crate::packs::core::filesystem::RmParseDecision::NoMatch => {}
@@ -888,10 +970,11 @@ impl Pack {
                 }
                 crate::packs::cdn::cloudflare_workers::WranglerSemanticDecision::Destructive(
                     name,
-                ) => return self.destructive_match_by_name(name),
+                ) => return self.destructive_match_by_name(name, cmd),
                 crate::packs::cdn::cloudflare_workers::WranglerSemanticDecision::Unverified => {
                     return self.destructive_match_by_name(
                         crate::packs::cdn::cloudflare_workers::WRANGLER_UNVERIFIED_RULE,
+                        cmd,
                     );
                 }
                 crate::packs::cdn::cloudflare_workers::WranglerSemanticDecision::NoMatch => {}
@@ -1274,6 +1357,8 @@ const CAREFUL_COMPANY_PRESET_MEMBERS: &[&str] = &[
     "secrets.aws_secrets",
     "secrets.onepassword",
     "secrets.doppler",
+    "secrets.infisical",
+    "secret_disclosure",
     // Cloud control planes.
     "cloud.aws",
     "cloud.gcp",
@@ -1294,7 +1379,7 @@ pub fn preset_members(id: &str) -> Option<&'static [&'static str]> {
 
 /// Static pack entries - metadata is available without instantiating packs.
 /// Packs are built lazily on first access.
-static PACK_ENTRIES: [PackEntry; 100] = [
+static PACK_ENTRIES: [PackEntry; 102] = [
     PackEntry::new("core.git", &["git"], core::git::create_pack),
     PackEntry::new(
         "core.filesystem",
@@ -1442,6 +1527,24 @@ static PACK_ENTRIES: [PackEntry; 100] = [
         "secrets.doppler",
         &["doppler"],
         secrets::doppler::create_pack,
+    ),
+    PackEntry::new(
+        "secrets.infisical",
+        &["infisical"],
+        secrets::infisical::create_pack,
+    ),
+    PackEntry::new(
+        "secret_disclosure",
+        &[
+            "infisical",
+            "doppler",
+            "vault",
+            "aws",
+            "secretsmanager",
+            "ssm",
+            "op",
+        ],
+        secrets::disclosure::create_pack,
     ),
     PackEntry::new("platform.github", &["gh"], platform::github::create_pack),
     PackEntry::new(
@@ -2230,7 +2333,7 @@ impl PackRegistry {
     /// 7. **Tier 7 (database/search/messaging/backup)**: `database.*`, `search.*`, `messaging.*`, `backup.*`
     /// 8. **Tier 8 (`package_managers`)**: package manager protections
     /// 9. **Tier 9 (`strict_git`)**: extra git paranoia
-    /// 10. **Tier 10 (services)**: `cicd.*`, `email.*`, `featureflags.*`, `secrets.*`, `monitoring.*`, `payment.*`
+    /// 10. **Tier 10 (services)**: `cicd.*`, `email.*`, `featureflags.*`, `secrets.*`, `secret_disclosure`, `monitoring.*`, `payment.*`
     /// 11. **Tier 11 (windows)**: `windows.*` - native-Windows filesystem, disk, registry, PowerShell
     /// 12. **Tier 12 (egress preset)**: `careful_company_running_windows.*` - deliberately last of
     ///     the known categories so tool-specific packs claim attribution first
@@ -2274,7 +2377,8 @@ impl PackRegistry {
             "backup" | "database" | "messaging" | "search" => 7,
             "package_managers" => 8,
             "strict_git" => 9,
-            "cicd" | "email" | "featureflags" | "secrets" | "monitoring" | "payment" => 10, // CI/CD + email + feature flags + secrets + monitoring + payment tooling
+            "cicd" | "email" | "featureflags" | "secrets" | "secret_disclosure" | "monitoring"
+            | "payment" => 10, // CI/CD + email + feature flags + secrets + monitoring + payment tooling
             // `windows` needs an explicit arm. Without one it falls to the
             // catch-all, which would put it BEHIND the preset below and hand
             // the preset attribution for commands both match (`sc delete
@@ -3710,11 +3814,7 @@ fn pack_aware_quick_reject_from_normalized_spans(
     // check. Likewise, producer argv can become executable source when piped to
     // an interpreter. Do not widen ordinary inert pipelines (`echo ... | cat`)
     // to a full scan: quoted documentation there remains data (#230).
-    if syntax_outside_executable_spans_matches_keyword(normalized, enabled_keywords) {
-        return false;
-    }
-
-    true // No keywords found in executable spans, safe to skip pack checking
+    !syntax_outside_executable_spans_matches_keyword(normalized, enabled_keywords) // No keywords found in executable spans, safe to skip pack checking
 }
 
 #[cfg(test)]
@@ -3876,6 +3976,129 @@ mod tests {
         ];
         for pattern in &unscoped {
             assert!(pattern.executables.is_none());
+        }
+    }
+
+    fn executable_scoped_test_pack() -> Pack {
+        Pack::new(
+            "test.executable_scope".to_string(),
+            "Executable scope test",
+            "Exercises executable-scoped low-level pack APIs",
+            &["danger"],
+            Vec::new(),
+            vec![crate::destructive_pattern!(
+                "dangerous-operation",
+                r"\bdanger\b",
+                "guardctl danger is destructive",
+                High,
+                executables = ["guardctl"]
+            )],
+        )
+    }
+
+    #[test]
+    fn direct_pack_matching_honors_executable_scope_issue_289() {
+        let pack = executable_scoped_test_pack();
+
+        for command in [
+            "guardctl danger",
+            "sudo /opt/tools/GUARDCTL.EXE danger",
+            "printf danger; guardctl danger",
+            "X=$(printf danger) guardctl danger",
+        ] {
+            assert_eq!(
+                pack.matches_destructive(command)
+                    .and_then(|matched| matched.name),
+                Some("dangerous-operation"),
+                "a match owned by the declared executable must survive: {command:?}"
+            );
+        }
+
+        for command in [
+            "printf danger",
+            "guardctl status; printf danger",
+            "guardctl status \"$(printf danger)\"",
+            "$TOOL danger",
+        ] {
+            assert!(
+                pack.matches_destructive(command).is_none(),
+                "foreign or dynamic argv0 text must not satisfy executable scope: {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_check_command_honors_executable_scope_issue_289() {
+        let enabled = HashSet::from(["system.permissions".to_string()]);
+
+        for command in [
+            "sudo /usr/bin/chmod 777 /tmp/real",
+            "printf 'chmod 777 /tmp/foreign'; chmod 777 /tmp/real",
+            "X=$(printf 'chmod 777 /tmp/foreign') chmod 777 /tmp/real",
+        ] {
+            let result = REGISTRY.check_command(command, &enabled);
+            assert!(result.blocked, "declared executable must deny: {command:?}");
+            assert_eq!(result.pack_id.as_deref(), Some("system.permissions"));
+            assert_eq!(result.pattern_name.as_deref(), Some("chmod-777"));
+        }
+
+        for command in [
+            "printf '%s' 'chmod 777 /tmp/foreign'",
+            "chmod 755 /tmp/safe; printf 'chmod 777 /tmp/foreign'",
+            "chmod 755 \"$(printf 'chmod 777 /tmp/foreign')\"",
+        ] {
+            let result = REGISTRY.check_command(command, &enabled);
+            assert!(
+                !result.blocked,
+                "a chmod-shaped match in a foreign segment must stay allowed: {command:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_store_verdicts_honor_executable_scope_issue_289() {
+        let mut store = ExternalPackStore::new();
+        let pack = executable_scoped_test_pack();
+        let pack_id = pack.id.clone();
+        store.packs.insert(pack_id.clone(), pack);
+        let enabled = HashSet::from([pack_id]);
+
+        for command in [
+            "guardctl danger",
+            "printf danger; sudo /opt/GUARDCTL.CMD danger",
+        ] {
+            let basic = store
+                .check_command(command, &enabled)
+                .expect("basic external-store verdict must preserve a governed match");
+            assert!(basic.blocked, "{command:?}: {basic:?}");
+            assert_eq!(basic.pattern_name.as_deref(), Some("dangerous-operation"));
+
+            let detailed = store
+                .check_command_with_details(command, &enabled)
+                .expect("detailed external-store verdict must preserve a governed match");
+            assert!(detailed.blocked, "{command:?}: {detailed:?}");
+            assert_eq!(
+                detailed.pattern_name.as_deref(),
+                Some("dangerous-operation")
+            );
+        }
+
+        for command in [
+            "printf danger",
+            "guardctl status; printf danger",
+            "guardctl status \"$(printf danger)\"",
+            "$TOOL danger",
+        ] {
+            assert!(
+                store.check_command(command, &enabled).is_none(),
+                "basic external-store verdict must reject a foreign-segment match: {command:?}"
+            );
+            assert!(
+                store
+                    .check_command_with_details(command, &enabled)
+                    .is_none(),
+                "detailed external-store verdict must reject a foreign-segment match: {command:?}"
+            );
         }
     }
 
@@ -4732,6 +4955,7 @@ mod tests {
         assert_eq!(PackRegistry::pack_tier("email.ses"), 10);
         assert_eq!(PackRegistry::pack_tier("featureflags.launchdarkly"), 10);
         assert_eq!(PackRegistry::pack_tier("secrets.vault"), 10);
+        assert_eq!(PackRegistry::pack_tier("secret_disclosure"), 10);
         assert_eq!(PackRegistry::pack_tier("monitoring.splunk"), 10);
         assert_eq!(PackRegistry::pack_tier("payment.stripe"), 10);
 
@@ -5659,7 +5883,7 @@ mod tests {
             // full, so no member can be dropped without this failing.
             assert_eq!(
                 CAREFUL_COMPANY_PRESET_MEMBERS.len(),
-                31,
+                33,
                 "preset membership changed size; update the docs and this count together"
             );
             for category in [
@@ -5714,6 +5938,8 @@ mod tests {
                 "remote.ssh",
                 "backup.restic",
                 "secrets.vault",
+                "secrets.infisical",
+                "secret_disclosure",
                 "cloud.aws",
             ] {
                 assert!(

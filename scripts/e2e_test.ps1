@@ -17,7 +17,7 @@
 #   -Full         Run slow/expensive scenarios (reserved; parity with bash --full)
 #   -Help         Show help and exit
 #
-# Exit codes: 0 all passed | 1 one or more failed | 2 binary-not-found / setup error
+# Exit codes: 0 no failures | 1 one or more failed | 2 setup/internal error
 #
 # Invocation model: the binary IS the hook (no subcommand). We pipe a
 # PreToolUse object with the scenario's shell-specific tool_name (Bash by
@@ -62,6 +62,9 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 $script:TestsTotal = 0
 $script:TestsPassed = 0
 $script:TestsFailed = 0
+$script:TestsSkipped = 0
+$script:TestsWarned = 0
+$script:BinaryExplicit = -not [string]::IsNullOrWhiteSpace($Binary)
 $script:CurrentId = ""
 $script:CurrentSw = $null
 $script:Results = [System.Collections.Generic.List[object]]::new()
@@ -127,7 +130,7 @@ function Log-Fail { param([string]$Desc, [string]$Expected, [string]$Actual)
 }
 
 function Log-Skip { param([string]$Desc, [string]$Reason)
-    $script:TestsPassed++
+    $script:TestsSkipped++
     [void](Record "skip" $Desc "" "")
     if (-not $Json) {
         $suffix = if ($Reason) { " ($Reason)" } else { "" }
@@ -164,6 +167,18 @@ function Resolve-DcgBinary {
 }
 
 function Assert-BinaryVersionFresh { param([string]$Bin)
+    if ($script:BinaryExplicit) { return }
+
+    $repoPath = [System.IO.Path]::GetFullPath($RepoRoot)
+    $binaryPath = [System.IO.Path]::GetFullPath($Bin)
+    $pathComparison = if ($env:OS -eq "Windows_NT" -or $IsWindows) {
+        [System.StringComparison]::OrdinalIgnoreCase
+    } else {
+        [System.StringComparison]::Ordinal
+    }
+    $repoPrefix = $repoPath + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $binaryPath.StartsWith($repoPrefix, $pathComparison)) { return }
+
     $cargoToml = Join-Path $RepoRoot "Cargo.toml"
     if (-not (Test-Path $cargoToml)) { return }
     $expected = (Select-String -Path $cargoToml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
@@ -174,16 +189,24 @@ function Assert-BinaryVersionFresh { param([string]$Bin)
     # exits 0, so capture the streams separately just as Invoke-Dcg does.
     $versionErrFile = [System.IO.Path]::GetTempFileName()
     $previousErrorAction = $ErrorActionPreference
+    $versionExitCode = -1
     try {
         $ErrorActionPreference = "Continue"
         $versionStdout = (& $Bin --version 2>$versionErrFile | Out-String)
+        $versionExitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previousErrorAction
     }
-    $versionStderr = (Get-Content -Raw -LiteralPath $versionErrFile -ErrorAction SilentlyContinue)
-    $verOut = "$versionStdout`n$versionStderr".Trim()
-    if ($verOut -notmatch [regex]::Escape($expected)) {
-        Write-Line "WARNING: binary version ($verOut) != Cargo.toml ($expected); may be STALE. Rebuild for accurate results." "Yellow"
+    $actual = (($versionStdout -split "\r?\n")[0]).Trim()
+    if ($versionExitCode -ne 0 -or $actual -cne $expected) {
+        $displayActual = if ([string]::IsNullOrWhiteSpace($actual)) { "unknown" } else { $actual }
+        [Console]::Error.WriteLine("Error: stale dcg binary selected")
+        [Console]::Error.WriteLine("Binary: $Bin")
+        [Console]::Error.WriteLine("Binary version: $displayActual")
+        [Console]::Error.WriteLine("Version command exit: $versionExitCode")
+        [Console]::Error.WriteLine("Cargo.toml version: $expected")
+        [Console]::Error.WriteLine("Run 'cargo build --release' or pass -Binary PATH to the intended binary.")
+        exit 2
     }
 }
 
@@ -846,11 +869,27 @@ conditions = { CI = "true" }
 # ===========================================================================
 # Summary
 # ===========================================================================
+$testsAccounted = $script:TestsPassed + $script:TestsFailed + $script:TestsSkipped + $script:TestsWarned
+if ($testsAccounted -ne $script:TestsTotal -or $script:Results.Count -ne $script:TestsTotal) {
+    [Console]::Error.WriteLine(
+        "Internal error: test result accounting mismatch (total=$($script:TestsTotal), accounted=$testsAccounted, records=$($script:Results.Count))"
+    )
+    exit 2
+}
+
+$noFailures = $script:TestsFailed -eq 0
+$complete = $noFailures -and $script:TestsSkipped -eq 0 -and $script:TestsWarned -eq 0
+
 if ($Json) {
     [pscustomobject]@{
         total = $script:TestsTotal
         passed = $script:TestsPassed
         failed = $script:TestsFailed
+        skipped = $script:TestsSkipped
+        warned = $script:TestsWarned
+        no_failures = $noFailures
+        success = $complete
+        complete = $complete
         binary = $script:Bin
         results = $script:Results
     } | ConvertTo-Json -Depth 6
@@ -861,6 +900,8 @@ if ($Json) {
     Write-Host "  Passed: $($script:TestsPassed)" -ForegroundColor Green
     if ($script:TestsFailed -gt 0) { Write-Host "  Failed: $($script:TestsFailed)" -ForegroundColor Red }
     else { Write-Host "  Failed: 0" }
+    Write-Host "  Skipped: $($script:TestsSkipped)"
+    Write-Host "  Warned:  $($script:TestsWarned)"
 }
 
 if ($script:TestsFailed -gt 0) { exit 1 } else { exit 0 }

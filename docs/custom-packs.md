@@ -81,7 +81,7 @@ safe_patterns:                       # Patterns that explicitly allow
 A regex like `mytool\s+.*--force` can pair the word `mytool` in one command
 with `--force` from a completely different one. Listing `executables` tells dcg
 which programs the rule is actually about, and the rule then only fires when
-the match starts inside a command segment that runs one of them:
+the complete match stays inside a command segment that runs one of them:
 
 ```yaml
 destructive_patterns:
@@ -101,13 +101,16 @@ How dcg resolves a segment's program:
 - A path is reduced to its basename, so `/usr/local/bin/mytool` resolves to
   `mytool`.
 - A trailing `.exe`, `.cmd`, `.bat`, or `.com` is removed.
-- Comparison is ASCII case-insensitive. Write the names lowercase, without a
-  path or extension.
+- Comparison against the resolved program is ASCII case-insensitive, but pack
+  declarations must use canonical lowercase ASCII basenames: start with a
+  letter or digit; then use only letters, digits, `.`, `_`, `+`, or `-`; and
+  omit paths and executable extensions.
 - If the program name is dynamic (it contains `$`, a backtick, or `%VAR%`),
   dcg cannot know what will run, and the rule does **not** fire.
 
-Omit the key — or give an empty list — to leave the rule unscoped, matching
-anywhere in the command as before.
+Omit the key to leave the rule unscoped, matching anywhere in the command as
+before. An explicitly empty list is rejected so a misspelled scope cannot
+silently become broader or turn into a dead rule.
 
 ### Safe Pattern Fields
 
@@ -119,14 +122,18 @@ anywhere in the command as before.
 
 ## Severity Levels
 
-Severity determines the default action when a command matches:
+Severity determines the default decision mode when a command matches, and how
+much configuration it takes to relax that decision. It is one axis: rule
+authors fold irreversibility, blast radius, and how often the operation is
+legitimately needed into the level they pick — there is no separate
+reversibility field.
 
-| Severity | Default Action | Use Case |
-|----------|---------------|----------|
-| `critical` | Always deny | Irreversible operations (rm -rf /, DROP DATABASE) |
-| `high` | Deny (allowlistable) | Dangerous but sometimes needed (force push, truncate) |
-| `medium` | Warn but allow | Worth noting but not blocking (large deletes) |
-| `low` | Log only | Learning/audit purposes |
+| Severity | Default Action | How it can be relaxed | Use Case |
+|----------|---------------|----------------------|----------|
+| `critical` | Deny | Only by an explicit per-rule `[policy.rules]` override or a per-rule allowlist entry; broad `warn`/`log` policy (global or per-pack) cannot relax it | Catastrophic, typically irreversible operations (rm -rf /, DROP DATABASE) |
+| `high` | Deny | Per-rule overrides and allowlists, and broad policy | Dangerous but sometimes needed (force push, truncate) |
+| `medium` | Warn but allow | n/a (already allows) | Worth noting but not blocking (large deletes) |
+| `low` | Log only | n/a (already allows) | Learning/audit purposes |
 
 ## Keywords Best Practices
 

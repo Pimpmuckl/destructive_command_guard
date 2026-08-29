@@ -1306,7 +1306,6 @@ fn git_token_expansion_may_split(raw: &str, dialect: ShellDialect) -> bool {
                     _ => {}
                 }
             }
-            false
         }
         // Native-command expansion can produce more than one argv element in
         // both PowerShell (arrays) and Cmd (expanded whitespace). Expansion
@@ -1332,9 +1331,9 @@ fn git_token_expansion_may_split(raw: &str, dialect: ShellDialect) -> bool {
                     _ => {}
                 }
             }
-            false
         }
     }
+    false
 }
 
 fn git_dynamic_fragments(decoded: &str, dialect: ShellDialect) -> Vec<String> {

@@ -24,18 +24,9 @@ use std::process::{Command, Stdio};
 // Test Utilities
 // =============================================================================
 
-/// Path to the DCG binary. Prefers `CARGO_BIN_EXE_dcg` (set by Cargo when
-/// building integration tests against a binary target) and falls back to the
-/// `target/<profile>/dcg` layout used by `cargo test`.
+/// Path to the exact DCG binary Cargo built for this integration test.
 fn dcg_binary() -> std::path::PathBuf {
-    if let Some(p) = option_env!("CARGO_BIN_EXE_dcg") {
-        return std::path::PathBuf::from(p);
-    }
-    let mut path = std::env::current_exe().unwrap();
-    path.pop(); // Remove test binary name
-    path.pop(); // Remove deps/
-    path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
-    path
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_dcg"))
 }
 
 /// Per-spawn isolated HOME / XDG_CONFIG_HOME / TMPDIR so dcg cannot read or
@@ -279,6 +270,20 @@ mod agent_detection_tests {
             stderr.contains("dcg") || !stderr.is_empty(),
             "should produce output on stderr"
         );
+    }
+
+    #[test]
+    fn test_explicit_omp_overrides_legacy_pi_environment() {
+        let (stdout, stderr, exit_code) = run_robot_mode_with_env(
+            &["--agent", "omp", "test", "--dialect", "posix", "git status"],
+            &[("PI_CODING_AGENT", "true")],
+        );
+
+        assert_eq!(exit_code, 0, "safe command should be allowed: {stderr}");
+        let output: serde_json::Value =
+            serde_json::from_str(&stdout).expect("robot test output should be valid JSON");
+        assert_eq!(output["agent"]["detected"], "omp");
+        assert_eq!(output["agent"]["detection_method"], "explicit");
     }
 }
 

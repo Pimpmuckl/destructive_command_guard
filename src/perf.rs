@@ -381,30 +381,52 @@ mod tests {
     /// fails rather than silently re-opening the hole.
     #[test]
     fn ci_enforces_absolute_latency_gate_against_shipped_budget() {
+        const {
+            assert!(
+                HOOK_EVALUATION_BUDGET_MS > 0,
+                "the shipped hook budget must remain positive so gate mode cannot \
+                 collapse into a disabled sentinel"
+            );
+        }
         let ci = include_str!("../.github/workflows/ci.yml");
 
+        let gate_step = ci
+            .split("      - name: Absolute evaluator-cost gate vs shipped default budget")
+            .nth(1)
+            .and_then(|rest| rest.split("\n      - name: ").next())
+            .expect("CI must retain the named absolute evaluator-cost gate step");
         assert!(
-            ci.contains("HOOK_EVALUATION_BUDGET_MS"),
-            "CI must derive the latency gate's budget by reading \
-             HOOK_EVALUATION_BUDGET_MS out of src/perf.rs — a hard-coded number \
-             in the workflow silently decouples the gate from the shipped \
-             default (#245)"
+            gate_step.contains(
+                r"BUDGET_MS=$(grep -oP 'pub const HOOK_EVALUATION_BUDGET_MS: u64 = \K[0-9_]+' src/perf.rs | tr -d '_')"
+            ),
+            "the absolute gate step must derive BUDGET_MS directly from \
+             HOOK_EVALUATION_BUDGET_MS in src/perf.rs"
         );
         assert!(
-            ci.contains("--assert-budget-ms"),
-            "CI must invoke scripts/perf_baseline.py with --assert-budget-ms; \
-             the relative baseline comparison alone cannot catch a uniform \
-             slowdown that eats the fixed hook deadline (#245)"
+            gate_step.contains("python3 -B scripts/perf_baseline.py --self-test"),
+            "the absolute gate must exercise source-binding and large-sample tail mutants"
         );
         assert!(
-            ci.contains("scripts/e2e_harness_matrix.sh"),
-            "CI must run the harness protocol matrix: it is the only gate that \
-             asserts each agent's wire contract against the real binary"
+            gate_step.contains("--assert-budget-ms \"$BUDGET_MS\""),
+            "the same absolute gate step must pass its derived BUDGET_MS to \
+             scripts/perf_baseline.py"
+        );
+        assert!(
+            gate_step.contains("\"$BUDGET_MS\" -le 0")
+                && gate_step.contains("HOOK_EVALUATION_BUDGET_MS must be one positive integer"),
+            "zero must be rejected as an invalid shipped budget, not interpreted \
+             by the Python harness as a disabled gate"
+        );
+        assert!(
+            gate_step.contains("LATENCY_ARTIFACT_DIR=\"$RUNNER_TEMP/dcg-perf-latency\"")
+                && gate_step.contains("--output \"$LATENCY_ARTIFACT_DIR/perf-latency-gate.json\""),
+            "the absolute gate must write its self-contained certificate outside \
+             the checkout so its own artifact cannot invalidate the source fence"
         );
 
         // The margin must leave real headroom: a gate set at ~100% of the
         // budget passes right up until the moment users start failing closed.
-        let margin = ci
+        let margin = gate_step
             .split("--assert-margin-pct")
             .nth(1)
             .and_then(|rest| rest.split_whitespace().next())
@@ -414,6 +436,277 @@ mod tests {
             margin <= 60,
             "latency gate margin is {margin}% of the budget; keep it <=60% so \
              the gate trips before real users hit indeterminate verdicts"
+        );
+        assert!(
+            gate_step.contains("--skip-trace --warmup 5 --runs 100"),
+            "the latency gate must retain 100 samples so its 95/95 binomial \
+             tolerance rule can reject more than one over-limit sample"
+        );
+
+        let artifact_step = ci
+            .split("      - name: Upload absolute latency gate certificate")
+            .nth(1)
+            .and_then(|rest| rest.split("\n      - name: ").next())
+            .expect("CI must retain the absolute latency certificate upload step");
+        assert!(
+            artifact_step.contains("if: always()")
+                && artifact_step
+                    .contains("path: ${{ runner.temp }}/dcg-perf-latency/perf-latency-gate.json")
+                && artifact_step.contains("if-no-files-found: error"),
+            "CI must require and retain perf-latency-gate.json on both pass and failure"
+        );
+
+        let relative_step = ci
+            .split("      - name: Run perf baseline + compare to repo baseline")
+            .nth(1)
+            .and_then(|rest| rest.split("\n      - name: ").next())
+            .expect("CI must retain the relative perf regression step");
+        assert!(
+            relative_step.contains("PERF_ARTIFACT_DIR=\"$RUNNER_TEMP/dcg-perf-relative\"")
+                && relative_step.contains("CURRENT_JSON=\"$PERF_ARTIFACT_DIR/perf-current.json\"")
+                && relative_step
+                    .contains("REPORT_MD=\"$PERF_ARTIFACT_DIR/perf-regression-report.md\"")
+                && relative_step.contains("parse_constant=reject_non_finite_json_constant")
+                && relative_step.contains("math.isfinite(numeric)")
+                && relative_step.contains("required_baseline_case_ids"),
+            "relative perf artifacts must stay outside the checkout so they do not \
+             make the following binary/source binding check fail, and malformed \
+             or vacuous baseline metrics must fail closed"
+        );
+
+        let matrix_step = ci
+            .split("      - name: Harness protocol matrix (real binary, every agent wire format)")
+            .nth(1)
+            .and_then(|rest| rest.split("\n      - name: ").next())
+            .expect("CI must retain the harness protocol matrix step");
+        assert!(
+            matrix_step.contains("scripts/e2e_harness_matrix.sh --binary target/release/dcg"),
+            "CI must run the harness protocol matrix against the real release binary"
+        );
+    }
+
+    /// A release tag is descriptive metadata, not a commit identity: the same
+    /// tag text can point at different commits over time. Keep the certificate
+    /// bound to the full object id even when `git describe` is identical.
+    #[test]
+    fn latency_certificate_source_binding_requires_full_git_sha() {
+        let build_script = include_str!("../build.rs");
+        let main_source = include_str!("main.rs");
+        let harness = include_str!("../scripts/perf_baseline.py");
+
+        assert!(
+            build_script.contains(".sha(false)"),
+            "build.rs must embed the full Git object id, not vergen's short SHA"
+        );
+        for required_dsr_binding in [
+            "DSR_RELEASE_GIT_SHA",
+            "DSR_RELEASE_GIT_REF",
+            "DCG_DSR_GIT_SHA",
+            "DCG_DSR_GIT_DESCRIBE",
+        ] {
+            assert!(
+                build_script.contains(required_dsr_binding),
+                "build.rs must bridge strict DSR source identity through {required_dsr_binding}"
+            );
+        }
+        assert!(
+            main_source.contains("Git SHA: {sha}"),
+            "dcg --version must expose the embedded full Git SHA for the certificate"
+        );
+
+        let classifier = harness
+            .split("def classify_source_binding(")
+            .nth(1)
+            .and_then(|rest| rest.split("\ndef capture_git_state(").next())
+            .expect("perf harness must retain its source-binding classifier");
+        assert!(
+            classifier.contains("elif embedded_git_sha != repository_git_sha:")
+                && classifier.contains("status = \"verified_exact_git_sha\"")
+                && classifier.contains("\"verified\": status == \"verified_exact_git_sha\""),
+            "source binding must reject differing full SHAs even when descriptions match"
+        );
+    }
+
+    /// A certificate must identify the compiler that produced the binary, not
+    /// whichever rustup proxy is visible under its isolated measurement HOME.
+    #[test]
+    fn latency_certificate_binds_native_build_toolchain_and_retains_failures() {
+        let build_script = include_str!("../build.rs");
+        let main_source = include_str!("main.rs");
+        let harness = include_str!("../scripts/perf_baseline.py");
+
+        for required_builder_call in [
+            ".semver(true)",
+            ".commit_hash(true)",
+            ".commit_date(true)",
+            ".host_triple(true)",
+        ] {
+            assert!(
+                build_script.contains(required_builder_call),
+                "build.rs lost required rustc identity field {required_builder_call}"
+            );
+        }
+        for stable_label in ["Rustc release", "Rustc commit", "Rustc date", "Rustc host"] {
+            assert!(
+                main_source.contains(stable_label),
+                "dcg --version lost stable compiler label {stable_label}"
+            );
+        }
+
+        let classifier = harness
+            .split("def classify_toolchain_binding(")
+            .nth(1)
+            .and_then(|rest| rest.split("\ndef classify_source_binding(").next())
+            .expect("perf harness must retain its compiler-binding classifier");
+        assert!(
+            classifier.contains("invalid_rustc_identity_fields")
+                && classifier.contains("status = \"verified_exact_rustc_vv\"")
+                && classifier.contains("embedded[field] != observed[field]"),
+            "compiler binding must reject malformed or unequal identities before \
+             certifying exact rustc -vV equality"
+        );
+        assert!(
+            harness.contains("PERF_ARTIFACT_SCHEMA_VERSION = 4")
+                && harness.contains("gate_enabled = args.assert_budget_ms is not None")
+                && harness.contains("def run_guarded_entrypoint(")
+                && harness.contains("abort_emitter("),
+            "certificate schema, explicit gate sentinel, or emergency ERROR \
+             artifact retention regressed"
+        );
+        assert!(
+            harness.contains("REQUIRED_ABSOLUTE_GATE_CASE_IDS")
+                && harness.contains("absolute gate case contract is missing required ids")
+                && harness.contains("PERF_HOOK_AGENT = \"claude-code\"")
+                && harness.contains("[bin_path, \"--agent\", PERF_HOOK_AGENT]"),
+            "the absolute gate must not pass an empty or bypass-only case set, \
+             or infer a variable agent profile from process ancestry"
+        );
+    }
+
+    /// OMP's installed extension consumes a compact private robot envelope.
+    /// Testing the ordinary robot schema does not certify that callback seam.
+    #[test]
+    fn harness_matrix_uses_exact_omp_bridge_protocol() {
+        let harness = include_str!("../scripts/e2e_harness_matrix.sh");
+        let omp_case = harness
+            .split("assert_omp_bridge_case()")
+            .nth(1)
+            .and_then(|rest| rest.split("assert_omp_agent_attribution() {").next())
+            .expect("harness matrix must retain its private OMP bridge assertion");
+        assert!(
+            omp_case.contains("--robot test --stdin")
+                && omp_case
+                    .contains("--agent omp --dialect posix --format json --omp-bridge-output")
+                && omp_case.contains("expected_stdout")
+                && omp_case.contains("stdout_bytes")
+                && omp_case.contains("\"$@\" | run_dcg_cli"),
+            "OMP matrix must assert exact argv, compact bytes, exit status, and streams"
+        );
+        assert!(
+            harness.contains(
+                "assert_omp_bridge_case omp newline-only 0 '{\"decision\":\"allow\"}' printf '\\n'"
+            ) && harness.contains(
+                "assert_omp_bridge_case omp crlf-only 0 '{\"decision\":\"allow\"}' printf '\\r\\n'"
+            ) && harness.contains("assert_omp_bridge_case omp control-bytes-destructive-tail 1")
+                && harness.contains("printf 'echo safe\\000\\t\\033\\ngit reset --hard'"),
+            "OMP matrix must preserve terminal line endings and feed control bytes without lossy shell variables"
+        );
+    }
+
+    /// #351/#353: the release fleet gate must fail if the tag-pinned installer
+    /// or archive is unverified, or if any probe silently skips verification.
+    #[test]
+    fn fleet_install_gate_requires_installer_checksums_and_minisign_on_every_platform() {
+        let fleet = include_str!("../scripts/e2e_fleet_install.sh");
+        let unix_probe = fleet
+            .split("unix_probe() {")
+            .nth(1)
+            .and_then(|rest| rest.split("windows_probe() {").next())
+            .expect("fleet gate must retain its Unix probe");
+        let windows_probe = fleet
+            .split("windows_probe() {")
+            .nth(1)
+            .and_then(|rest| rest.split("EXPECTED_CASES=(").next())
+            .expect("fleet gate must retain its Windows probe");
+        let expected_cases = fleet
+            .split("EXPECTED_CASES=(")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .expect("fleet gate must retain its probe completeness contract");
+
+        assert!(
+            unix_probe.contains("--require-minisign --verify --no-configure"),
+            "Unix fleet installs must require a valid minisign signature"
+        );
+        assert!(
+            windows_probe.contains("-RequireMinisign -Verify -NoConfigure"),
+            "Windows fleet installs must require a valid minisign signature"
+        );
+        assert!(
+            unix_probe.contains("$REPO_RAW/$VERSION/install.sh")
+                && unix_probe.contains("$REPO_RELEASE/$VERSION/install.sh.sha256")
+                && windows_probe.contains("$RepoRaw/$Version/install.ps1")
+                && windows_probe.contains("$RepoRelease/$Version/install.ps1.sha256"),
+            "fleet installs must verify the exact tag-pinned installer before execution"
+        );
+        assert!(
+            expected_cases.contains("installer_checksum_verified"),
+            "a truncated probe must not pass without reporting installer verification"
+        );
+        assert!(
+            expected_cases.contains("minisign_verified"),
+            "a truncated probe must not pass without reporting signature verification"
+        );
+        assert!(
+            expected_cases.contains("provenance_match")
+                && unix_probe.contains("EMBEDDED_DESCRIBE")
+                && windows_probe.contains("$embeddedDescribe -ceq $Version"),
+            "fleet probes must require exact clean-tag provenance, not semver alone"
+        );
+        assert!(
+            unix_probe.contains("Signature verified (minisign key ")
+                && windows_probe.contains("Signature verified \\(minisign key "),
+            "fleet probes must certify minisign verification specifically, not a different signature mechanism"
+        );
+        assert!(
+            !unix_probe.contains("RESULT:minisign_verified:SKIP")
+                && !windows_probe.contains("Emit 'minisign_verified' 'SKIP'"),
+            "release probes must fail rather than skip missing signature evidence"
+        );
+    }
+
+    /// #344: reject bad embedded provenance before an archive reaches the
+    /// release job. The public fleet probe is intentionally a second,
+    /// post-publication boundary; it must not be the first place a dirty,
+    /// ahead, or placeholder describe is discovered.
+    #[test]
+    fn dist_gate_checks_exact_embedded_tag_before_packaging() {
+        let dist = include_str!("../.github/workflows/dist.yml");
+
+        let build_job = dist
+            .split("  build:")
+            .nth(1)
+            .and_then(|rest| rest.split("\n  release:").next())
+            .expect("distribution workflow must retain its build job");
+        assert!(
+            build_job.contains("fetch-depth: 0"),
+            "release builders need full tag history for trustworthy git describe metadata"
+        );
+        assert!(
+            build_job.contains("Verify embedded release tag (Unix)")
+                && build_job.contains("embedded_describe")
+                && build_job.contains("$GITHUB_REF_NAME"),
+            "every runnable Unix artifact must report the exact release tag before packaging"
+        );
+        assert!(
+            build_job.contains("$embeddedDescribe -cne $env:GITHUB_REF_NAME"),
+            "the native Windows artifact must report the exact release tag before packaging"
+        );
+        assert!(
+            build_job.contains("Verify embedded release tag (Windows ARM64 cross-build)")
+                && build_job.contains("Find-ByteSequence")
+                && build_job.contains("$tagWithSuffix"),
+            "the non-runnable Windows ARM64 artifact must contain the tag and reject dirty/ahead suffixes"
         );
     }
 

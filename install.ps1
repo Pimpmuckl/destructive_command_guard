@@ -1782,6 +1782,26 @@ function Resolve-ChecksumToken {
   throw "no valid SHA-256 found for $artifactLeaf (per-file .sha256, SHA256SUMS.txt, SHA256SUMS all failed)"
 }
 
+function Get-OmpConfigRootForDetection {
+  param(
+    [string]$HomeDir = $HOME,
+    [bool]$WindowsSemantics = ([System.IO.Path]::DirectorySeparatorChar -eq '\')
+  )
+  $configName = if ([string]::IsNullOrEmpty($env:PI_CONFIG_DIR)) { '.omp' } else { $env:PI_CONFIG_DIR }
+  $configName = if ($WindowsSemantics) {
+    $configName.TrimStart([char[]]@('\', '/'))
+  } else {
+    $configName.TrimStart([char[]]@('/'))
+  }
+  if ($WindowsSemantics -and $configName -match '^[A-Za-z]:') { return $null }
+  try {
+    $joined = if ($configName.Length -eq 0) { $HomeDir } else { [System.IO.Path]::Combine($HomeDir, $configName) }
+    [System.IO.Path]::GetFullPath($joined)
+  } catch {
+    $null
+  }
+}
+
 function Detect-Agents {
   # Probe for installed coding agents (config dir under $HomeDir, or the agent's
   # CLI on PATH). Returns an [ordered] map of
@@ -1793,7 +1813,10 @@ function Detect-Agents {
   param([string]$HomeDir = $HOME, [string]$RepoRoot = "")
   $null = $RepoRoot
   function _has([string]$cmd) { [bool](Get-Command $cmd -ErrorAction SilentlyContinue) }
-  function _dir([string]$name) { Test-Path (Join-Path $HomeDir $name) -PathType Container }
+  function _dir([string]$name) {
+    Test-Path -LiteralPath (Join-Path $HomeDir $name) -PathType Container -ErrorAction SilentlyContinue
+  }
+  $ompConfigRoot = Get-OmpConfigRootForDetection -HomeDir $HomeDir
   [ordered]@{
     'Claude'  = ((_dir '.claude')  -or (_has 'claude'))
     'Codex'   = ((_dir '.codex')   -or (_has 'codex'))
@@ -1801,15 +1824,20 @@ function Detect-Agents {
     'Cursor'  = ((_dir '.cursor')  -or (_has 'cursor'))
     'Copilot' = ((_dir '.copilot') -or
       (-not [string]::IsNullOrWhiteSpace($env:COPILOT_HOME) -and
-        (Test-Path $env:COPILOT_HOME -PathType Container)) -or
+        (Test-Path -LiteralPath $env:COPILOT_HOME -PathType Container -ErrorAction SilentlyContinue)) -or
       (_has 'copilot') -or (_has 'gh-copilot'))
     'Grok'    = ((_dir '.grok')    -or (-not [string]::IsNullOrEmpty($env:GROK_SESSION_ID)))
     'Agy'     = (_has 'agy')
     'Hermes'  = ((_dir '.hermes') -or (_has 'hermes') -or
-      (Test-Path (Get-HermesConfigDir -HomeDir $HomeDir) -PathType Container))
+      (Test-Path -LiteralPath (Get-HermesConfigDir -HomeDir $HomeDir) -PathType Container -ErrorAction SilentlyContinue))
     # A bare ~/.posit is not enough — other Posit tools share that directory.
-    'Posit'   = ((Test-Path (Join-Path (Join-Path $HomeDir '.posit') 'assistant') -PathType Container) -or
+    'Posit'   = ((Test-Path -LiteralPath (Join-Path (Join-Path $HomeDir '.posit') 'assistant') -PathType Container -ErrorAction SilentlyContinue) -or
       (_dir '.positai') -or (_has 'pa'))
+    'Omp'     = (($null -ne $ompConfigRoot -and
+        [System.IO.Directory]::Exists($ompConfigRoot)) -or
+      (-not [string]::IsNullOrEmpty($env:PI_CODING_AGENT_DIR) -and
+        [System.IO.Directory]::Exists($env:PI_CODING_AGENT_DIR)) -or
+      (Test-Path Env:OMP_PROFILE) -or (_has 'omp'))
   }
 }
 
@@ -1817,7 +1845,7 @@ function Get-DetectedAgentNames {
   # The display-names of agents Detect-Agents flagged as present, in order.
   param($Agents)
   @(
-    foreach ($name in @('Claude', 'Codex', 'Gemini', 'Cursor', 'Copilot', 'Grok', 'Agy', 'Hermes', 'Posit')) {
+    foreach ($name in @('Claude', 'Codex', 'Gemini', 'Cursor', 'Copilot', 'Grok', 'Agy', 'Hermes', 'Posit', 'Omp')) {
       if ($Agents[$name]) { $name }
     }
   )
@@ -1852,6 +1880,7 @@ Configured agents (when detected, or with -Force/-EasyMode):
   Gemini CLI   (~/.gemini/settings.json)      Copilot CLI (~/.copilot/hooks/dcg.json)
   Cursor IDE   (~/.cursor/hooks.json)         Hermes      (HERMES_HOME, else %LOCALAPPDATA%\hermes\config.yaml)
   Posit Assistant (~/.posit/assistant/settings.json)
+  Oh My Pi     (active profile's extensions/dcg-guard.ts via dcg install --omp)
   Grok / agy   via dcg install --grok / --agy under -EasyMode when detected
 '@
   exit 0
@@ -2253,6 +2282,22 @@ if ($detectedAgents['Posit'] -or $forceConfig) {
   } catch {
     Write-Warn "Posit Assistant auto-configuration failed: $_"
   }
+}
+
+# Configure Oh My Pi through dcg's generated native ExtensionAPI module. The
+# Rust installer is the single source of truth for active-profile resolution,
+# marker ownership, and the embedded absolute dcg.exe path.
+if ($detectedAgents['Omp'] -or $forceConfig) {
+  Write-Host ""
+  try {
+    & $dcgExe install --omp --force | Out-Null
+    if ($LASTEXITCODE -eq 0) { Write-Ok "Configured Oh My Pi extension via 'dcg install --omp'" }
+    else { Write-Warn "'dcg install --omp' exited with code $LASTEXITCODE" }
+  } catch {
+    Write-Warn "Oh My Pi extension configuration failed: $_"
+  }
+} else {
+  Write-Info "Oh My Pi not detected; re-run with -EasyMode to configure its extension anyway"
 }
 
 # Grok (xAI) and Antigravity (agy): configured via the dcg binary itself rather

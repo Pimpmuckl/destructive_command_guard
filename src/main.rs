@@ -47,6 +47,7 @@ use destructive_command_guard::pending_exceptions::{
     MaintenanceRecheck, PendingExceptionStore, PersistBudget, log_maintenance,
 };
 use destructive_command_guard::perf::{Deadline, HOOK_EVALUATION_BUDGET};
+use destructive_command_guard::update::{GIT_DESCRIBE, GIT_SHA};
 // Import HookInput for parsing stdin JSON in hook mode
 #[cfg(test)]
 use destructive_command_guard::hook::HookInput;
@@ -61,10 +62,10 @@ use std::time::{Duration, Instant};
 const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TIMESTAMP: Option<&str> = option_env!("VERGEN_BUILD_TIMESTAMP");
 const RUSTC_SEMVER: Option<&str> = option_env!("VERGEN_RUSTC_SEMVER");
+const RUSTC_COMMIT_HASH: Option<&str> = option_env!("VERGEN_RUSTC_COMMIT_HASH");
+const RUSTC_COMMIT_DATE: Option<&str> = option_env!("VERGEN_RUSTC_COMMIT_DATE");
+const RUSTC_HOST_TRIPLE: Option<&str> = option_env!("VERGEN_RUSTC_HOST_TRIPLE");
 const CARGO_TARGET: Option<&str> = option_env!("VERGEN_CARGO_TARGET_TRIPLE");
-// Git provenance (#320): `git describe --tags --dirty` at build time. Absent
-// (or the vergen placeholder) outside a git checkout.
-const GIT_DESCRIBE: Option<&str> = option_env!("VERGEN_GIT_DESCRIBE");
 
 // NOTE: HookInput, ToolInput, HookOutput, HookSpecificOutput types are now defined
 // in the hook module. Use hook::HookInput, hook::read_hook_input(), etc.
@@ -229,12 +230,13 @@ fn handle_indeterminate_evaluation(
     working_dir: &str,
     stage: &str,
     deadline: &Deadline,
+    deny_unverified: bool,
 ) {
     let elapsed = deadline.elapsed();
     let budget = deadline.max_duration();
 
     let reason = format_indeterminate_reason(stage, budget);
-    hook::output_indeterminate_for_protocol(protocol, &reason);
+    hook::output_indeterminate_for_protocol(protocol, &reason, deny_unverified);
 
     if let Some(writer) = history_writer {
         let entry = build_history_entry(
@@ -502,7 +504,7 @@ fn try_deny_oversized_input(
     for id in external_store.pack_ids() {
         enabled_packs.insert(id.clone());
     }
-    remove_disabled_packs_for_agent(&mut enabled_packs, config, &effective_agent);
+    config.remove_disabled_packs_for_agent(&mut enabled_packs, &effective_agent);
 
     let mut enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
     enabled_keywords.extend(external_store.keywords().iter().copied());
@@ -698,43 +700,8 @@ fn top_level_flag_requested(args: &[String], long: &str, short: &str) -> bool {
     false
 }
 
-fn remove_disabled_packs_for_agent(
-    enabled_packs: &mut HashSet<String>,
-    config: &Config,
-    agent: &Agent,
-) {
-    let profile = config.agents.profile_for_agent(agent);
-    for disabled in &profile.disabled_packs {
-        // `Config::enabled_pack_ids_for_agent` preserves the mandatory core
-        // category after profile expansion. This second pass exists so
-        // profile exclusions also apply to auto-enabled external packs; it
-        // must not undo the core invariant while doing so.
-        if disabled == "core" || disabled.starts_with("core.") {
-            continue;
-        }
-        enabled_packs.remove(disabled);
-        enabled_packs.retain(|pack| !pack.starts_with(&format!("{disabled}.")));
-    }
-}
-
-fn apply_agent_allowlist_profile(
-    config: &Config,
-    agent: &Agent,
-    mut allowlists: LayeredAllowlist,
-) -> LayeredAllowlist {
-    if config.allowlist_disabled_for_agent(agent) {
-        return LayeredAllowlist::default();
-    }
-
-    allowlists.prepend_agent_exact_commands(
-        agent.config_key(),
-        config.additional_allowlist_for_agent(agent),
-    );
-    allowlists
-}
-
 fn load_effective_allowlists_for_agent(config: &Config, agent: &Agent) -> LayeredAllowlist {
-    apply_agent_allowlist_profile(config, agent, load_default_allowlists())
+    config.apply_agent_allowlist_profile(agent, load_default_allowlists())
 }
 
 /// A hook command whose evaluation resolved to the deny family
@@ -1186,7 +1153,11 @@ fn publish_decisive_response(
         ResolvedCommandOutcome::Allow(_) => return,
         ResolvedCommandOutcome::OversizedCommand { command_len } => {
             let reason = format_oversized_command_reason(command_len, ctx.max_command_bytes);
-            hook::output_indeterminate_for_protocol(ctx.hook_protocol, &reason);
+            hook::output_indeterminate_for_protocol(
+                ctx.hook_protocol,
+                &reason,
+                ctx.config.unverified_denies(),
+            );
             return;
         }
         ResolvedCommandOutcome::DeadlineExhausted { command, stage } => {
@@ -1198,6 +1169,7 @@ fn publish_decisive_response(
                 ctx.working_dir,
                 stage,
                 ctx.deadline,
+                ctx.config.unverified_denies(),
             );
             return;
         }
@@ -1415,6 +1387,21 @@ fn print_version() {
             "│".bright_black()
         );
     }
+    // Stable compiler identity lines bind reproducibility tooling to the
+    // compiler that built this binary, rather than whichever rustc happens to
+    // be installed when the binary is later measured.
+    for (label, value) in [
+        ("Rustc release", RUSTC_SEMVER),
+        ("Rustc commit", RUSTC_COMMIT_HASH),
+        ("Rustc date", RUSTC_COMMIT_DATE),
+        ("Rustc host", RUSTC_HOST_TRIPLE),
+    ] {
+        if let Some(value) = value {
+            if !value.is_empty() && value != "VERGEN_IDEMPOTENT_OUTPUT" {
+                eprintln!("{label}: {value}");
+            }
+        }
+    }
     if let Some(target) = CARGO_TARGET {
         eprintln!(
             "  {}  {} {}         {}",
@@ -1435,6 +1422,14 @@ fn print_version() {
                 describe.white(),
                 "│".bright_black()
             );
+        }
+    }
+    // Keep the human-friendly description above, but expose the full object id
+    // on its own stable line for provenance-sensitive tooling. This stays on
+    // stderr so stdout remains the single machine-readable semver line.
+    if let Some(sha) = GIT_SHA {
+        if !sha.is_empty() && sha != "VERGEN_IDEMPOTENT_OUTPUT" {
+            eprintln!("Git SHA: {sha}");
         }
     }
 
@@ -1640,7 +1635,7 @@ fn main() {
     // bytes are identical either way.
     if additional_commands.is_empty() && command.len() > max_command_bytes {
         let reason = format_oversized_command_reason(command.len(), max_command_bytes);
-        hook::output_indeterminate_for_protocol(hook_protocol, &reason);
+        hook::output_indeterminate_for_protocol(hook_protocol, &reason, config.unverified_denies());
         return;
     }
 
@@ -1658,7 +1653,7 @@ fn main() {
     for id in external_store.pack_ids() {
         enabled_packs.insert(id.clone());
     }
-    remove_disabled_packs_for_agent(&mut enabled_packs, &config, &effective_agent);
+    config.remove_disabled_packs_for_agent(&mut enabled_packs, &effective_agent);
 
     let mut enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
     // Merge external pack keywords into enabled keywords for quick rejection.
@@ -1792,7 +1787,8 @@ fn print_help() {
     eprintln!("  {}", "USAGE".yellow().bold());
     eprintln!("  {}", "─".repeat(50).bright_black());
     eprintln!("    Runs as a pre-execution shell hook for Claude Code, Codex CLI,");
-    eprintln!("    Gemini CLI, GitHub Copilot CLI, Cursor IDE, and Hermes Agent.");
+    eprintln!("    Gemini CLI, GitHub Copilot CLI, Cursor IDE, Hermes Agent,");
+    eprintln!("    OpenCode, and Oh My Pi (omp).");
     eprintln!("    Compatible agents, including Codex, receive protocol-specific stdout JSON.");
     eprintln!();
 
@@ -1863,6 +1859,10 @@ fn print_help() {
     eprintln!(
         "    {}   Allow a blocked command once via short code",
         "allow-once".green()
+    );
+    eprintln!(
+        "    {}    Create a new file from stdin without overwriting",
+        "create-new".green()
     );
     eprintln!(
         "    {}         Scan files for destructive commands",
@@ -2567,13 +2567,13 @@ mod tests {
 
         fn evaluate_with_agent(config: &Config, agent: &Agent, command: &str) -> EvaluationResult {
             let mut enabled_packs = config.enabled_pack_ids_for_agent(agent);
-            remove_disabled_packs_for_agent(&mut enabled_packs, config, agent);
+            config.remove_disabled_packs_for_agent(&mut enabled_packs, agent);
             let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
             let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
             let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
             let compiled_overrides = config.overrides.compile();
             let allowlists =
-                apply_agent_allowlist_profile(config, agent, LayeredAllowlist::default());
+                config.apply_agent_allowlist_profile(agent, LayeredAllowlist::default());
 
             evaluate_command_with_pack_order_deadline_at_path(
                 command,
@@ -2601,8 +2601,7 @@ mod tests {
                 },
             );
 
-            let allowlists = apply_agent_allowlist_profile(
-                &config,
+            let allowlists = config.apply_agent_allowlist_profile(
                 &Agent::Unknown,
                 project_allowlist_for_rule("core.git:reset-hard"),
             );
@@ -2636,11 +2635,8 @@ mod tests {
                 },
             );
 
-            let allowlists = apply_agent_allowlist_profile(
-                &config,
-                &Agent::ClaudeCode,
-                LayeredAllowlist::default(),
-            );
+            let allowlists = config
+                .apply_agent_allowlist_profile(&Agent::ClaudeCode, LayeredAllowlist::default());
             let compiled_overrides = config.overrides.compile();
             let result = destructive_command_guard::evaluate_command(
                 "git reset --hard",

@@ -381,12 +381,13 @@ impl LayeredAllowlist {
             return None;
         }
 
-        let current_session_id = current_session_id();
+        let mut cached_session_id = SessionIdCache::Unresolved;
 
         for layer in &self.layers {
             for entry in &layer.file.entries {
                 // Skip entries that are invalid or don't match path restrictions
-                if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id.as_deref()) {
+                let current_session_id = session_id_for_entry(entry, &mut cached_session_id);
+                if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id) {
                     continue;
                 }
 
@@ -447,11 +448,12 @@ impl LayeredAllowlist {
         rule: &RuleId,
         cwd: Option<&Path>,
     ) -> Option<(&AllowEntry, AllowlistLayer)> {
-        let current_session_id = current_session_id();
+        let mut cached_session_id = SessionIdCache::Unresolved;
 
         for layer in &self.layers {
             for entry in &layer.file.entries {
-                if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id.as_deref()) {
+                let current_session_id = session_id_for_entry(entry, &mut cached_session_id);
+                if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id) {
                     continue;
                 }
 
@@ -472,11 +474,12 @@ impl LayeredAllowlist {
         command: &str,
         cwd: Option<&Path>,
     ) -> Option<AllowlistHit<'_>> {
-        let current_session_id = current_session_id();
+        let mut cached_session_id = SessionIdCache::Unresolved;
 
         for layer in &self.layers {
             for entry in &layer.file.entries {
-                if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id.as_deref()) {
+                let current_session_id = session_id_for_entry(entry, &mut cached_session_id);
+                if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id) {
                     continue;
                 }
 
@@ -515,11 +518,12 @@ impl LayeredAllowlist {
         command: &str,
         cwd: Option<&Path>,
     ) -> Option<AllowlistHit<'_>> {
-        let current_session_id = current_session_id();
+        let mut cached_session_id = SessionIdCache::Unresolved;
 
         for layer in &self.layers {
             for entry in &layer.file.entries {
-                if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id.as_deref()) {
+                let current_session_id = session_id_for_entry(entry, &mut cached_session_id);
+                if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id) {
                     continue;
                 }
 
@@ -582,11 +586,12 @@ impl LayeredAllowlist {
         command: &str,
         cwd: Option<&Path>,
     ) -> Option<AllowlistHit<'_>> {
-        let current_session_id = current_session_id();
+        let mut cached_session_id = SessionIdCache::Unresolved;
 
         for layer in &self.layers {
             for entry in &layer.file.entries {
-                if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id.as_deref()) {
+                let current_session_id = session_id_for_entry(entry, &mut cached_session_id);
+                if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id) {
                     continue;
                 }
 
@@ -624,10 +629,7 @@ pub fn command_prefix_safely_matches(command: &str, prefix: &str) -> bool {
             return false;
         }
     }
-    if tail_has_shell_chain_metachars(tail) {
-        return false;
-    }
-    true
+    !tail_has_shell_chain_metachars(tail)
 }
 
 /// Built-in command prefixes for *inspection wrappers* — see dcg#132.
@@ -1103,6 +1105,11 @@ fn parse_timestamp(timestamp: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     None
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static CURRENT_SESSION_ID_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Resolve the current shell session identifier.
 ///
 /// Resolution order:
@@ -1110,6 +1117,9 @@ fn parse_timestamp(timestamp: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 /// 2. Linux process fingerprint from parent PID + stdin TTY path
 #[must_use]
 pub fn current_session_id() -> Option<String> {
+    #[cfg(test)]
+    CURRENT_SESSION_ID_CALLS.with(|calls| calls.set(calls.get() + 1));
+
     if let Ok(from_env) = std::env::var("DCG_SESSION_ID") {
         let trimmed = from_env.trim();
         if !trimmed.is_empty() {
@@ -1170,6 +1180,47 @@ fn session_scope_matches(entry: &AllowEntry, current_session_id: Option<&str>) -
     };
 
     bound_session_id == current_session_id
+}
+
+/// Resolve process/TTY identity only when an entry is actually session-scoped.
+///
+/// Ordinary and empty allowlists do not consult the session identifier at all.
+/// When a lookup contains multiple session-scoped entries, cache the result for
+/// that lookup so `/proc` is sampled once while preserving the existing
+/// per-lookup freshness boundary.
+enum SessionIdCache {
+    Unresolved,
+    Unavailable,
+    Resolved(String),
+}
+
+fn session_id_for_entry<'a>(
+    entry: &AllowEntry,
+    cached_session_id: &'a mut SessionIdCache,
+) -> Option<&'a str> {
+    session_id_for_entry_with(entry, cached_session_id, current_session_id)
+}
+
+fn session_id_for_entry_with<'a>(
+    entry: &AllowEntry,
+    cached_session_id: &'a mut SessionIdCache,
+    resolve_session_id: impl FnOnce() -> Option<String>,
+) -> Option<&'a str> {
+    if entry.session != Some(true) {
+        return None;
+    }
+
+    if matches!(cached_session_id, SessionIdCache::Unresolved) {
+        *cached_session_id = match resolve_session_id() {
+            Some(session_id) => SessionIdCache::Resolved(session_id),
+            None => SessionIdCache::Unavailable,
+        };
+    }
+
+    match cached_session_id {
+        SessionIdCache::Resolved(session_id) => Some(session_id.as_str()),
+        SessionIdCache::Unresolved | SessionIdCache::Unavailable => None,
+    }
 }
 
 /// Check if all conditions on an allowlist entry are satisfied.
@@ -2485,6 +2536,166 @@ mod tests {
             paths: None,
             risk_acknowledged: false,
         }
+    }
+
+    fn layered_allowlist_for_session_resolution_tests(
+        session_id: Option<&str>,
+    ) -> LayeredAllowlist {
+        let toml = r#"
+            [[allow]]
+            rule = "core.git:reset-hard"
+            reason = "rule selector"
+
+            [[allow]]
+            rule = "core.git:*"
+            reason = "second rule selector"
+
+            [[allow]]
+            exact_command = "exact candidate"
+            reason = "exact selector"
+
+            [[allow]]
+            command_prefix = "prefix candidate"
+            reason = "prefix selector"
+
+            [[allow]]
+            pattern = "^pattern candidate$"
+            reason = "pattern selector"
+            risk_acknowledged = true
+        "#;
+        let mut file = parse_allowlist_toml(AllowlistLayer::Project, Path::new("dummy"), toml);
+        if let Some(session_id) = session_id {
+            for entry in &mut file.entries {
+                entry.session = Some(true);
+                entry.session_id = Some(session_id.to_string());
+            }
+        }
+        LayeredAllowlist {
+            layers: vec![LoadedAllowlistLayer {
+                layer: AllowlistLayer::Project,
+                path: PathBuf::from("dummy"),
+                file,
+            }],
+        }
+    }
+
+    fn reset_session_id_resolution_count() {
+        CURRENT_SESSION_ID_CALLS.with(|calls| calls.set(0));
+    }
+
+    fn assert_session_id_resolution_count(expected: usize, lookup: impl FnOnce()) {
+        reset_session_id_resolution_count();
+        lookup();
+        CURRENT_SESSION_ID_CALLS.with(|calls| assert_eq!(calls.get(), expected));
+    }
+
+    #[test]
+    fn layered_allowlist_entry_points_skip_session_resolution_for_ordinary_entries() {
+        let allowlist = layered_allowlist_for_session_resolution_tests(None);
+        let exact_rule = RuleId::parse("core.git:reset-hard").expect("valid rule id");
+
+        assert_session_id_resolution_count(0, || {
+            assert!(
+                allowlist
+                    .match_rule_at_path("core.git", "reset-hard", None)
+                    .is_some()
+            );
+        });
+        assert_session_id_resolution_count(0, || {
+            assert!(allowlist.lookup_rule_at_path(&exact_rule, None).is_some());
+        });
+        assert_session_id_resolution_count(0, || {
+            assert!(
+                allowlist
+                    .match_exact_command_at_path("exact candidate", None)
+                    .is_some()
+            );
+        });
+        assert_session_id_resolution_count(0, || {
+            assert!(
+                allowlist
+                    .match_command_prefix_at_path("prefix candidate --safe", None)
+                    .is_some()
+            );
+        });
+        assert_session_id_resolution_count(0, || {
+            assert!(
+                allowlist
+                    .match_pattern_at_path("pattern candidate", None)
+                    .is_some()
+            );
+        });
+    }
+
+    #[test]
+    fn layered_allowlist_entry_points_cache_one_session_resolution_per_lookup() {
+        let current = current_session_id().unwrap_or_default();
+        let mismatched = if current == "dcg-test-session-a" {
+            "dcg-test-session-b"
+        } else {
+            "dcg-test-session-a"
+        };
+        let allowlist = layered_allowlist_for_session_resolution_tests(Some(mismatched));
+        let exact_rule = RuleId::parse("core.git:reset-hard").expect("valid rule id");
+
+        assert_session_id_resolution_count(1, || {
+            assert!(
+                allowlist
+                    .match_rule_at_path("core.git", "reset-hard", None)
+                    .is_none()
+            );
+        });
+        assert_session_id_resolution_count(1, || {
+            assert!(allowlist.lookup_rule_at_path(&exact_rule, None).is_none());
+        });
+        assert_session_id_resolution_count(1, || {
+            assert!(
+                allowlist
+                    .match_exact_command_at_path("exact candidate", None)
+                    .is_none()
+            );
+        });
+        assert_session_id_resolution_count(1, || {
+            assert!(
+                allowlist
+                    .match_command_prefix_at_path("prefix candidate --safe", None)
+                    .is_none()
+            );
+        });
+        assert_session_id_resolution_count(1, || {
+            assert!(
+                allowlist
+                    .match_pattern_at_path("pattern candidate", None)
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn session_id_cache_resolves_unavailable_once_across_session_entries() {
+        let mut first_entry = make_test_entry();
+        first_entry.session = Some(true);
+        let mut second_entry = make_test_entry();
+        second_entry.session = Some(true);
+        let resolver_calls = std::cell::Cell::new(0);
+        let mut cached_session_id = SessionIdCache::Unresolved;
+
+        let resolve_unavailable = || {
+            resolver_calls.set(resolver_calls.get() + 1);
+            None
+        };
+        assert_eq!(
+            session_id_for_entry_with(&first_entry, &mut cached_session_id, resolve_unavailable),
+            None
+        );
+        assert!(matches!(cached_session_id, SessionIdCache::Unavailable));
+
+        assert_eq!(
+            session_id_for_entry_with(&second_entry, &mut cached_session_id, resolve_unavailable),
+            None
+        );
+        assert!(matches!(cached_session_id, SessionIdCache::Unavailable));
+        assert_eq!(resolver_calls.get(), 1);
     }
 
     #[test]

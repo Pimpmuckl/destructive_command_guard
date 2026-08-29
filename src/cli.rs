@@ -18,8 +18,9 @@ use crate::evaluator::{
 use crate::exit_codes::{EXIT_DENIED, EXIT_WARNING};
 use crate::highlight::{HighlightSpan, format_highlighted_command, should_use_color};
 use crate::history::{
-    ExportOptions, HistoryDb, HistoryStats, InteractiveAllowlistAuditEntry,
-    InteractiveAllowlistOptionType, Outcome, SuggestionAction, SuggestionAuditEntry,
+    CommandEntry, ENV_HISTORY_DB_PATH, ExportOptions, HistoryDb, HistoryStats, HistoryWriter,
+    InteractiveAllowlistAuditEntry, InteractiveAllowlistOptionType, Outcome, SuggestionAction,
+    SuggestionAuditEntry,
 };
 use crate::interactive::{
     AllowlistScope, InteractiveConfig, InteractiveResult, check_interactive_available,
@@ -293,8 +294,20 @@ pub enum Command {
         ttl: Option<u64>,
     },
 
+    /// Create a new file from stdin without overwriting any existing path
+    ///
+    /// Opens PATH with exclusive create-new semantics, then streams stdin into
+    /// it. The parent directory must already exist. Existing files, directories,
+    /// and symlinks are refused without modification.
+    #[command(name = "create-new")]
+    CreateNew {
+        /// Destination path, which must not already exist
+        #[arg(value_name = "PATH")]
+        path: std::path::PathBuf,
+    },
+
     /// Install the hook into Claude Code settings (or another agent with
-    /// `--grok`, `--agy`, or `--opencode`)
+    /// `--grok`, `--agy`, `--opencode`, or `--omp`)
     #[command(name = "install")]
     Install {
         /// Force overwrite existing hook configuration
@@ -311,7 +324,7 @@ pub enum Command {
         /// (when combined with `--project`). Grok also picks up dcg from
         /// `~/.claude/settings.json` via its Claude-Code compatibility layer,
         /// but the native path gives the cleanest doctor output.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["agy", "opencode", "omp"])]
         grok: bool,
 
         /// Install the dcg PreToolUse hook for the Antigravity CLI (`agy`) at
@@ -319,7 +332,7 @@ pub enum Command {
         /// `<repo>/.gemini/config/hooks.json` (with `--project`). `agy` reads
         /// Claude-Code-compatible `PreToolUse` hooks from this file and aborts
         /// its `run_command` shell tool when dcg returns a block decision.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["grok", "opencode", "omp"])]
         agy: bool,
 
         /// Install a native OpenCode plugin at
@@ -329,8 +342,17 @@ pub enum Command {
         /// `tool.execute.before` hook: every bash tool call is routed through
         /// dcg's Claude-compatible hook protocol, and a deny aborts the tool
         /// call with dcg's reason. Restart OpenCode after installing (#318).
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["grok", "agy", "omp"])]
         opencode: bool,
+
+        /// Install a native Oh My Pi (`omp`) `tool_call` extension at the
+        /// active user profile's `extensions/dcg-guard.ts` path (normally
+        /// `~/.omp/agent/extensions/dcg-guard.ts`) or
+        /// `<cwd>/.omp/extensions/dcg-guard.ts` (with `--project`). OMP's
+        /// extension discovery is cwd-only and does not walk Git ancestors.
+        /// Every OMP bash tool call is routed through dcg before execution.
+        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode"])]
+        omp: bool,
     },
 
     /// Full setup: install hook + add shell startup check
@@ -487,6 +509,12 @@ pub enum Command {
         /// dialect because the CLI cannot know the source shell.
         #[arg(long, value_enum, default_value = "unknown", env = "DCG_DIALECT")]
         dialect: DialectArg,
+
+        /// Emit only the bounded decision fields consumed by the generated
+        /// OMP bridge. This is an internal protocol surface, not a general
+        /// replacement for `dcg test --format json`.
+        #[arg(long, hide = true)]
+        omp_bridge_output: bool,
     },
 
     /// Generate a sample configuration file
@@ -917,6 +945,113 @@ const CLASSIFY_OUTPUT_SCHEMA_VERSION: u32 = 1;
 /// pattern has been proven, but execution is still blocked conservatively.
 const INDETERMINATE_REASON: &str = "Safety evaluation did not complete within the analysis budget";
 
+/// Maximum reason carried by dcg's private OMP bridge protocol.
+///
+/// The general robot schema intentionally retains complete diagnostics, but
+/// the OMP bridge consumes only the decision, reason, and rule id. Reusing the
+/// shipped default command budget keeps one diagnostic from becoming larger
+/// than the ordinary safety payload it describes. The truncation is UTF-8
+/// boundary-safe and never removes the decision or rule id.
+const OMP_BRIDGE_REASON_MAX_BYTES: usize = crate::config::DEFAULT_MAX_COMMAND_BYTES;
+
+/// Maximum stable rule identifier carried by the private OMP protocol.
+///
+/// External-pack files are capped, but their pack and pattern identifiers do
+/// not have smaller schema limits. Bound the composed identifier to the same
+/// ordinary-command budget so pack metadata cannot defeat the bridge's output
+/// bound. A field-specific suffix makes truncation visible to operators.
+const OMP_BRIDGE_RULE_ID_MAX_BYTES: usize = crate::config::DEFAULT_MAX_COMMAND_BYTES;
+
+/// Maximum expansion of one input byte under JSON string escaping.
+const OMP_BRIDGE_JSON_ESCAPE_EXPANSION: usize = 6;
+
+/// Exact maximum bytes outside `reason` and `rule_id`, including the longest
+/// decision (`indeterminate`) and the newline emitted by `println!`:
+/// `{"decision":"indeterminate","reason":"","rule_id":""}\n`.
+const OMP_BRIDGE_JSON_ENVELOPE_MAX_BYTES: usize = 54;
+
+/// Maximum stdout retained by the generated OMP bridge.
+///
+/// JSON can expand one input byte to six ASCII bytes (`\u00XX`). This exact
+/// expression covers both bounded variable fields, the longest fixed envelope,
+/// and `println!`'s newline without relying on Bun's ambiguous async
+/// `maxBuffer` termination signal.
+pub(crate) const OMP_CHILD_STDOUT_MAX_BYTES: usize = OMP_BRIDGE_JSON_ESCAPE_EXPANSION
+    * (OMP_BRIDGE_REASON_MAX_BYTES + OMP_BRIDGE_RULE_ID_MAX_BYTES)
+    + OMP_BRIDGE_JSON_ENVELOPE_MAX_BYTES;
+
+/// Maximum child diagnostics retained and forwarded by the OMP bridge.
+pub(crate) const OMP_CHILD_STDERR_MAX_BYTES: usize = OMP_BRIDGE_REASON_MAX_BYTES;
+
+/// UTF-16 code units emitted per command-input chunk.
+///
+/// A Unicode scalar occupies at most four UTF-8 bytes, so one quarter of the
+/// ordinary command budget bounds each encoded chunk while preserving the
+/// caller's configured total-command limit inside dcg.
+pub(crate) const OMP_CHILD_STDIN_CHUNK_CODE_UNITS: usize =
+    crate::config::DEFAULT_MAX_COMMAND_BYTES / 4;
+
+const OMP_BRIDGE_REASON_TRUNCATION_SUFFIX: &str = "\n[dcg: reason truncated]";
+const OMP_BRIDGE_RULE_ID_TRUNCATION_SUFFIX: &str = "[dcg: rule id truncated]";
+
+fn bounded_omp_bridge_field<'a>(
+    value: std::borrow::Cow<'a, str>,
+    max_bytes: usize,
+    suffix: &str,
+) -> std::borrow::Cow<'a, str> {
+    if value.len() <= max_bytes {
+        return value;
+    }
+
+    let mut end = max_bytes - suffix.len();
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut bounded = String::with_capacity(max_bytes);
+    bounded.push_str(&value[..end]);
+    bounded.push_str(suffix);
+    std::borrow::Cow::Owned(bounded)
+}
+
+fn bounded_omp_bridge_reason(reason: &str) -> std::borrow::Cow<'_, str> {
+    bounded_omp_bridge_field(
+        std::borrow::Cow::Borrowed(reason),
+        OMP_BRIDGE_REASON_MAX_BYTES,
+        OMP_BRIDGE_REASON_TRUNCATION_SUFFIX,
+    )
+}
+
+fn bounded_omp_bridge_rule_id(rule_id: String) -> std::borrow::Cow<'static, str> {
+    bounded_omp_bridge_field(
+        std::borrow::Cow::Owned(rule_id),
+        OMP_BRIDGE_RULE_ID_MAX_BYTES,
+        OMP_BRIDGE_RULE_ID_TRUNCATION_SUFFIX,
+    )
+}
+
+fn validate_omp_bridge_output_agent(
+    omp_bridge_output: bool,
+    robot_mode: bool,
+    explicit_omp_agent: bool,
+) -> std::io::Result<()> {
+    if omp_bridge_output && (!robot_mode || !explicit_omp_agent) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "--omp-bridge-output requires --robot and an explicit --agent omp selector",
+        ));
+    }
+    Ok(())
+}
+
+fn is_explicit_omp_agent(agent: Option<&str>) -> bool {
+    agent.is_some_and(|name| {
+        name.eq_ignore_ascii_case("omp")
+            || name.eq_ignore_ascii_case("oh-my-pi")
+            || name.eq_ignore_ascii_case("oh_my_pi")
+            || name.eq_ignore_ascii_case("ohmypi")
+    })
+}
+
 const fn policy_blocks_cli_execution(
     decision: EvaluationDecision,
     mode: Option<DecisionMode>,
@@ -1014,6 +1149,52 @@ pub struct TestOutput {
     /// analysis denied it. Additive field — absent means "not checked".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dialect_divergence: Option<DialectDivergence>,
+}
+
+/// Private compact protocol consumed by the marker-owned OMP extension.
+///
+/// In particular, this omits `TestOutput::command`: echoing a configured-large
+/// heredoc made child stdout and the bridge's former `.text()` buffer scale
+/// with input that OMP already holds in memory.
+#[derive(Debug, serde::Serialize)]
+struct OmpBridgeTestOutput<'a> {
+    decision: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<std::borrow::Cow<'a, str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rule_id: Option<std::borrow::Cow<'a, str>>,
+}
+
+fn omp_bridge_test_output(
+    result: &EvaluationResult,
+    resolved_mode: Option<DecisionMode>,
+) -> OmpBridgeTestOutput<'_> {
+    match result.decision {
+        EvaluationDecision::Allow => OmpBridgeTestOutput {
+            decision: "allow",
+            reason: None,
+            rule_id: None,
+        },
+        EvaluationDecision::Deny => {
+            let pattern = result.pattern_info.as_ref();
+            OmpBridgeTestOutput {
+                decision: resolved_mode.unwrap_or(DecisionMode::Deny).label(),
+                reason: pattern.map(|info| bounded_omp_bridge_reason(&info.reason)),
+                rule_id: pattern.and_then(|info| {
+                    info.pack_id.as_ref().and_then(|pack| {
+                        info.pattern_name
+                            .as_ref()
+                            .map(|pattern| bounded_omp_bridge_rule_id(format!("{pack}:{pattern}")))
+                    })
+                }),
+            }
+        }
+        EvaluationDecision::Indeterminate => OmpBridgeTestOutput {
+            decision: "indeterminate",
+            reason: Some(std::borrow::Cow::Borrowed(INDETERMINATE_REASON)),
+            rule_id: None,
+        },
+    }
 }
 
 /// Whether the posix dialect alone — the dialect the live Bash hook uses —
@@ -2171,6 +2352,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         (Config::load(), None)
     };
     let verbosity = Verbosity::from_cli(&cli);
+    let explicit_omp_agent = is_explicit_omp_agent(cli.agent.as_deref());
     maybe_show_update_notice(&cli, &config, verbosity);
 
     match cli.command {
@@ -2209,6 +2391,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             grok,
             agy,
             opencode,
+            omp,
         }) => {
             if grok {
                 install_grok_hook(force, project)?;
@@ -2216,6 +2399,8 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 install_antigravity_hook(force, project)?;
             } else if opencode {
                 install_opencode_plugin(force, project)?;
+            } else if omp {
+                install_omp_extension(force, project, true)?;
             } else {
                 install_hook(force, project)?;
             }
@@ -2282,9 +2467,11 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             enforce_budget,
             force,
             dialect,
+            omp_bridge_output,
         }) => {
             // Robot mode forces JSON output
             let robot_mode = robot_mode_enabled(cli.robot);
+            validate_omp_bridge_output_agent(omp_bridge_output, robot_mode, explicit_omp_agent)?;
             let effective_format = if robot_mode { TestFormat::Json } else { format };
 
             // Load specific config file if provided, otherwise use default
@@ -2298,7 +2485,10 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let command = if stdin {
-                read_test_command_from_stdin(effective_config.general.max_command_bytes())?
+                read_test_command_from_stdin(
+                    effective_config.general.max_command_bytes(),
+                    omp_bridge_output,
+                )?
             } else {
                 command.ok_or_else(|| {
                     std::io::Error::new(
@@ -2344,6 +2534,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     enforce_budget || robot_mode,
                     force,
                     dialect,
+                    omp_bridge_output,
                 );
                 // Exit with code 1 if command would be blocked (for CI/robot mode scripting)
                 if was_blocked {
@@ -2468,6 +2659,15 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::RebaseRecover { ttl }) => {
             handle_rebase_recover(ttl, robot_mode_enabled(cli.robot))?;
         }
+        Some(Command::CreateNew { path }) => {
+            let bytes_written = create_new_from_stdin(&path)?;
+            if !verbosity.quiet && !robot_mode_enabled(cli.robot) {
+                eprintln!(
+                    "Created {} from stdin ({bytes_written} bytes)",
+                    path.display()
+                );
+            }
+        }
         Some(Command::Scan(scan)) => {
             handle_scan_command(&config, scan, verbosity)?;
         }
@@ -2530,6 +2730,45 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// Stream stdin into a newly created regular file without a check-then-open
+/// race. `create_new(true)` maps to the platform's exclusive-create primitive,
+/// so any existing directory entry (including a symlink) makes `open` fail and
+/// is never truncated or followed.
+fn create_new_from_stdin(path: &std::path::Path) -> std::io::Result<u64> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.mode(0o600);
+    }
+
+    let mut destination = options.open(path).map_err(|error| {
+        let context = if error.kind() == std::io::ErrorKind::AlreadyExists {
+            "refusing to replace existing path"
+        } else {
+            "could not create new file"
+        };
+        std::io::Error::new(
+            error.kind(),
+            format!("{context} `{}`: {error}", path.display()),
+        )
+    })?;
+
+    let mut stdin = std::io::stdin().lock();
+    std::io::copy(&mut stdin, &mut destination).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "failed writing stdin to newly created file `{}`; the file may contain partial input: {error}",
+                path.display()
+            ),
+        )
+    })
 }
 
 fn write_completions(shell: CompletionShell) -> Result<(), Box<dyn std::error::Error>> {
@@ -4261,17 +4500,117 @@ fn resolve_mode_for_cli(
     crate::evaluator::resolve_effective_mode(config, command, result)
 }
 
-fn read_test_command_from_stdin(max_command_bytes: usize) -> std::io::Result<String> {
+const ROBOT_INDETERMINATE_HISTORY_PACK: &str = "dcg.internal";
+const ROBOT_INDETERMINATE_HISTORY_PATTERN: &str = "evaluation-deadline";
+
+const fn should_record_robot_history(robot_mode: bool, history_enabled: bool) -> bool {
+    robot_mode && history_enabled
+}
+
+fn robot_history_db_path(config: &crate::config::HistoryConfig) -> Option<std::path::PathBuf> {
+    if let Ok(path) = std::env::var(ENV_HISTORY_DB_PATH) {
+        return Some(std::path::PathBuf::from(path));
+    }
+    config.expanded_database_path()
+}
+
+fn build_robot_history_entry(
+    agent_type: &str,
+    command: &str,
+    working_dir: &str,
+    result: &EvaluationResult,
+    resolved_mode: Option<DecisionMode>,
+    eval_duration: std::time::Duration,
+) -> CommandEntry {
+    let eval_duration_us = u64::try_from(eval_duration.as_micros()).unwrap_or(u64::MAX);
+
+    let (outcome, pack_id, pattern_name, allowlist_layer) = match result.decision {
+        EvaluationDecision::Allow => {
+            if let Some(override_) = result.allowlist_override.as_ref() {
+                (
+                    Outcome::Allow,
+                    override_.matched.pack_id.clone(),
+                    override_.matched.pattern_name.clone(),
+                    Some(override_.layer.label().to_string()),
+                )
+            } else {
+                (
+                    Outcome::Allow,
+                    result
+                        .pattern_info
+                        .as_ref()
+                        .and_then(|info| info.pack_id.clone()),
+                    result
+                        .pattern_info
+                        .as_ref()
+                        .and_then(|info| info.pattern_name.clone()),
+                    None,
+                )
+            }
+        }
+        EvaluationDecision::Deny => {
+            let outcome = match resolved_mode.unwrap_or(DecisionMode::Deny) {
+                DecisionMode::Deny | DecisionMode::Ask => Outcome::Deny,
+                DecisionMode::Warn => Outcome::Warn,
+                DecisionMode::Log => Outcome::Allow,
+            };
+            (
+                outcome,
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pack_id.clone()),
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pattern_name.clone()),
+                None,
+            )
+        }
+        EvaluationDecision::Indeterminate => (
+            Outcome::Deny,
+            Some(ROBOT_INDETERMINATE_HISTORY_PACK.to_string()),
+            Some(ROBOT_INDETERMINATE_HISTORY_PATTERN.to_string()),
+            None,
+        ),
+    };
+
+    CommandEntry {
+        agent_type: agent_type.to_string(),
+        working_dir: working_dir.to_string(),
+        command: command.to_string(),
+        outcome,
+        pack_id,
+        pattern_name,
+        eval_duration_us,
+        allowlist_layer,
+        ..Default::default()
+    }
+}
+
+fn read_test_command_from_stdin(
+    max_command_bytes: usize,
+    preserve_terminal_line_ending: bool,
+) -> std::io::Result<String> {
+    read_test_command(
+        std::io::stdin().lock(),
+        max_command_bytes,
+        preserve_terminal_line_ending,
+    )
+}
+
+fn read_test_command(
+    reader: impl std::io::Read,
+    max_command_bytes: usize,
+    preserve_terminal_line_ending: bool,
+) -> std::io::Result<String> {
     use std::io::Read as _;
 
     let mut bytes = Vec::new();
     let limit = u64::try_from(max_command_bytes)
         .unwrap_or(u64::MAX)
         .saturating_add(1);
-    std::io::stdin()
-        .lock()
-        .take(limit)
-        .read_to_end(&mut bytes)?;
+    reader.take(limit).read_to_end(&mut bytes)?;
     if bytes.len() > max_command_bytes {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -4285,7 +4624,12 @@ fn read_test_command_from_stdin(max_command_bytes: usize) -> std::io::Result<Str
             format!("stdin command is not valid UTF-8: {error}"),
         )
     })?;
-    if command.ends_with('\n') {
+    // Human-facing `dcg test --stdin` traditionally accepts a line-oriented
+    // producer such as `printf '%s\n' "$command"`, so retain its one-line-ending
+    // normalization. The private OMP bridge sends raw shell source with no
+    // framing delimiter: removing LF/CRLF there changes the guarded command
+    // (and turns a newline-only OMP no-op into an input error).
+    if !preserve_terminal_line_ending && command.ends_with('\n') {
         command.pop();
         if command.ends_with('\r') {
             command.pop();
@@ -4415,6 +4759,7 @@ fn test_command(
     enforce_budget: bool,
     force: bool,
     dialect: DialectArg,
+    omp_bridge_output: bool,
 ) -> bool {
     use std::time::{Duration, Instant};
 
@@ -4429,12 +4774,16 @@ fn test_command(
         return false; // Explain mode doesn't track blocked status
     }
 
-    // Build effective config with extra packs if specified
-    let mut effective_config = extra_packs.map_or_else(
+    // Keep the explicit CLI contribution separate as well as reflecting it in
+    // the effective config. Agent profiles apply to configured and external
+    // packs, while an invocation-local `--with-packs` remains the final
+    // authority for the packs the caller explicitly requested.
+    let cli_extra_packs = extra_packs.as_deref().unwrap_or(&[]);
+    let mut effective_config = extra_packs.as_ref().map_or_else(
         || config.clone(),
         |packs| {
             let mut modified = config.clone();
-            modified.packs.enabled.extend(packs);
+            modified.packs.enabled.extend(packs.iter().cloned());
             modified
         },
     );
@@ -4492,18 +4841,22 @@ fn test_command(
         ))
     });
 
-    // Get enabled packs and collect keywords for quick rejection.
-    let mut enabled_packs = effective_config.enabled_pack_ids();
-    let mut enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
+    // Resolve the same agent-specific pack and allowlist policy as hook mode.
+    let mut enabled_packs = effective_config.enabled_pack_ids_for_agent(&detection.agent);
+    let allowlists =
+        effective_config.apply_agent_allowlist_profile(&detection.agent, load_default_allowlists());
 
-    // Load allowlists (project/user/system) for parity with hook mode.
-    // This is a small file read and only affects decisions when a rule matches.
-    let allowlists = load_default_allowlists();
-
-    // Auto-enable external packs and merge their keywords.
+    // Auto-enable external packs, then apply agent exclusions to those later
+    // contributions as hook mode does. Explicit `--with-packs` is re-applied
+    // last so the invocation-local override retains its established priority.
     for id in external_store.pack_ids() {
         enabled_packs.insert(id.clone());
     }
+    effective_config.remove_disabled_packs_for_agent(&mut enabled_packs, &detection.agent);
+    enabled_packs.extend(cli_extra_packs.iter().cloned());
+
+    // Collect keywords only after the final pack policy is known.
+    let mut enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
     enabled_keywords.extend(external_store.keywords().iter().copied());
 
     // Build ordered pack list AFTER external packs are loaded so they're included.
@@ -4556,6 +4909,38 @@ fn test_command(
     let elapsed = start.elapsed();
     let resolved_mode = resolve_mode_for_cli(&effective_config, command, &result);
 
+    // Human `dcg test` remains a diagnostic and does not enter persistent
+    // history. Robot mode is also the native agent-integration boundary used
+    // by OMP, so retain its final post-graduation/post-force decision exactly
+    // as hook mode retains hook evaluations. Construct the writer only after
+    // evaluation so SQLite setup is outside `eval_duration_us`, and bound its
+    // drop wait by the same remaining deadline that governs the robot reply.
+    let _robot_history_writer =
+        if should_record_robot_history(robot_mode, effective_config.history.enabled) {
+            let working_dir = project_path.as_ref().map_or_else(
+                || "<unknown>".to_string(),
+                |path| path.to_string_lossy().into_owned(),
+            );
+            let mut writer = HistoryWriter::new(
+                robot_history_db_path(&effective_config.history),
+                &effective_config.history,
+            );
+            if let Some(deadline) = evaluation_deadline.as_ref() {
+                writer.limit_drop_wait_to(deadline.remaining().unwrap_or_default());
+            }
+            writer.log(build_robot_history_entry(
+                detection.agent.config_key(),
+                command,
+                &working_dir,
+                &result,
+                resolved_mode,
+                elapsed,
+            ));
+            Some(writer)
+        } else {
+            None
+        };
+
     // Quiet mode: the command was fully evaluated above, so suppress all
     // human/structured output but still return the real decision so the exit
     // code is correct (blocked/indeterminate -> exit 1, allowed -> exit 0).
@@ -4582,6 +4967,11 @@ fn test_command(
 
     // Handle structured output (JSON/TOON)
     if format.is_structured() {
+        if omp_bridge_output {
+            let output = omp_bridge_test_output(&result, resolved_mode);
+            println!("{}", serde_json::to_string(&output).unwrap());
+            return policy_blocks_cli_execution(result.decision, resolved_mode);
+        }
         let output = match result.decision {
             EvaluationDecision::Allow => {
                 let allowlist =
@@ -6183,14 +6573,37 @@ fi
     )
 }
 
+/// Build a Git subprocess for CLI operations.
+///
+/// Release binaries honor the operator's normal Git configuration. Unit tests
+/// suppress ambient global, system, and command-scope configuration so that
+/// configuration cannot redirect a temporary repository's hooks or otherwise
+/// perturb its fixtures; repository-local configuration remains in force.
+fn git_command(cwd: &std::path::Path) -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    command.current_dir(cwd);
+
+    #[cfg(test)]
+    {
+        let null_config = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        command
+            .env("GIT_CONFIG_GLOBAL", null_config)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_CONFIG")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_CONFIG_PARAMETERS");
+    }
+
+    command
+}
+
 fn git_resolve_path(
     cwd: &std::path::Path,
     git_path: &str,
 ) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
     ensure_git_repo(cwd)?;
 
-    let output = std::process::Command::new("git")
-        .current_dir(cwd)
+    let output = git_command(cwd)
         .args(["rev-parse", "--git-path", git_path])
         .output()?;
 
@@ -6218,8 +6631,7 @@ fn git_show_toplevel(
 ) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
     ensure_git_repo(cwd)?;
 
-    let output = std::process::Command::new("git")
-        .current_dir(cwd)
+    let output = git_command(cwd)
         .args(["rev-parse", "--show-toplevel"])
         .output()?;
 
@@ -6790,8 +7202,7 @@ fn get_staged_files_at(
 ) -> Result<Vec<std::path::PathBuf>, Box<dyn std::error::Error>> {
     ensure_git_repo(cwd)?;
 
-    let output = std::process::Command::new("git")
-        .current_dir(cwd)
+    let output = git_command(cwd)
         .args([
             "diff",
             "--cached",
@@ -6834,8 +7245,7 @@ fn get_git_diff_files_at(
     // flag or contains shell metacharacters.
     validate_git_rev_range(rev_range)?;
 
-    let output = std::process::Command::new("git")
-        .current_dir(cwd)
+    let output = git_command(cwd)
         .args([
             "diff",
             "-M",
@@ -6890,8 +7300,7 @@ fn validate_git_rev_range(rev_range: &str) -> Result<(), Box<dyn std::error::Err
 }
 
 fn ensure_git_repo(cwd: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-    let output = std::process::Command::new("git")
-        .current_dir(cwd)
+    let output = git_command(cwd)
         .args(["rev-parse", "--is-inside-work-tree"])
         .output()?;
 
@@ -10282,7 +10691,74 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
         }
     }
 
-    // Check 3d: Build provenance / update pin (#320). Warning-only: it never
+    // Check 3d: Oh My Pi extension registration. OMP has no Claude-compatible
+    // fallback: without its native ExtensionAPI module, bash calls do not reach
+    // dcg at all.
+    if omp_appears_in_use() {
+        print!("Checking Oh My Pi extension registration... ");
+        match registered_omp_extension() {
+            Ok(OmpExtensionRegistration::Healthy(extension_path)) => {
+                println!("{}", "OK".green());
+                println!("  Found: {}", extension_path.display());
+            }
+            Err(error) => {
+                println!("{}", "MISCONFIGURED".red());
+                println!("  {error}");
+                issues += 1;
+                println!(
+                    "  → Resolve the reported OMP path, profile, or configuration error, then \
+                     run 'dcg install --omp' for user/profile scope or \
+                     'dcg install --omp --project' for the current directory"
+                );
+            }
+            Ok(OmpExtensionRegistration::OwnedUnhealthy { path, project }) => {
+                println!("{}", "OUTDATED OR DAMAGED".yellow());
+                println!(
+                    "  Found dcg-owned but non-current bytes at {}",
+                    path.display()
+                );
+                issues += 1;
+                if fix {
+                    println!("  Attempting extension refresh...");
+                    if refresh_loaded_owned_omp_extensions(project, true).is_ok() {
+                        println!("  {}", "Fixed!".green());
+                        fixed += 1;
+                    } else {
+                        println!("  {}", "Failed to fix".red());
+                    }
+                } else {
+                    println!(
+                        "  → Run 'dcg install --omp --force{}' to refresh the native extension",
+                        if project { " --project" } else { "" }
+                    );
+                    println!("    (OMP bash commands are NOT guarded by this unhealthy bridge)");
+                }
+            }
+            Ok(OmpExtensionRegistration::Missing) => {
+                println!("{}", "NOT REGISTERED".yellow());
+                issues += 1;
+                if fix {
+                    println!("  Attempting extension install...");
+                    if install_omp_extension(false, false, true).is_ok()
+                        && matches!(
+                            registered_omp_extension(),
+                            Ok(OmpExtensionRegistration::Healthy(_))
+                        )
+                    {
+                        println!("  {}", "Fixed!".green());
+                        fixed += 1;
+                    } else {
+                        println!("  {}", "Failed to fix".red());
+                    }
+                } else {
+                    println!("  → Run 'dcg install --omp' to install the native extension");
+                    println!("    (OMP bash commands are NOT guarded until it is installed)");
+                }
+            }
+        }
+    }
+
+    // Check 3e: Build provenance / update pin (#320). Warning-only: it never
     // increments `issues`, so it cannot fail `--strict` — it flags the state
     // that is one routine `dcg update` away from silently replacing a local
     // build. `collect_doctor_report` carries the same check.
@@ -10416,7 +10892,12 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
     // Check 5: Pattern packs
     print!("Checking pattern packs... ");
     let enabled = config.enabled_pack_ids();
-    println!("{} ({} enabled)", "OK".green(), enabled.len());
+    // Count the leaf packs the registry actually loads, which is what
+    // `dcg packs --enabled` lists. `enabled_pack_ids` deliberately keeps the
+    // bare `core` category marker for registry callers to expand, so counting
+    // the raw set reported one fewer pack than the listing every time (#335).
+    let enabled_leaf_count = REGISTRY.expand_enabled_ordered(&enabled).len();
+    println!("{} ({} enabled)", "OK".green(), enabled_leaf_count);
     println!(
         "  Hook evaluation budget: {} ms ({})",
         config.effective_hook_timeout_ms(),
@@ -10943,13 +11424,17 @@ fn collect_doctor_report(
 
     // Check 5: Pattern packs
     let enabled = config.enabled_pack_ids();
+    // See the interactive doctor: count registry leaf packs so this agrees
+    // with `dcg packs --enabled` instead of undercounting by the `core`
+    // category marker (#335).
+    let enabled_leaf_count = REGISTRY.expand_enabled_ordered(&enabled).len();
     checks.push(DoctorCheck {
         id: "packs",
         name: "Pattern packs",
         status: DoctorCheckStatus::Ok,
         message: format!(
             "{} packs enabled; hook evaluation budget {} ms ({})",
-            enabled.len(),
+            enabled_leaf_count,
             config.effective_hook_timeout_ms(),
             config.hook_timeout_source()
         ),
@@ -11236,6 +11721,98 @@ fn collect_doctor_report(
         });
     }
 
+    // Oh My Pi extension registration. Mirrored in `doctor_pretty` so strict,
+    // pretty, and JSON doctor output agree.
+    if omp_appears_in_use() {
+        let mut omp_fixed = false;
+        let (status, message, remediation) = match registered_omp_extension() {
+            Ok(OmpExtensionRegistration::Healthy(registered_path)) => (
+                DoctorCheckStatus::Ok,
+                format!(
+                    "Native Oh My Pi extension found at {}",
+                    registered_path.display()
+                ),
+                None,
+            ),
+            Err(error) => {
+                issues += 1;
+                (
+                    DoctorCheckStatus::Error,
+                    format!("Cannot resolve the Oh My Pi extension path: {error}"),
+                    Some(
+                        "Resolve the reported OMP path, profile, or configuration error, then \
+                         run 'dcg install --omp' for user/profile scope or \
+                         'dcg install --omp --project' for the current directory"
+                            .to_string(),
+                    ),
+                )
+            }
+            Ok(OmpExtensionRegistration::OwnedUnhealthy { path, project }) => {
+                issues += 1;
+                if fix && refresh_loaded_owned_omp_extensions(project, false).is_ok() {
+                    fixed += 1;
+                    omp_fixed = true;
+                    (
+                        DoctorCheckStatus::Ok,
+                        format!("Refreshed native Oh My Pi extension at {}", path.display()),
+                        None,
+                    )
+                } else {
+                    let project_flag = if project { " --project" } else { "" };
+                    (
+                        DoctorCheckStatus::Error,
+                        format!(
+                            "Oh My Pi extension at {} is dcg-owned but outdated, damaged, or disabled",
+                            path.display()
+                        ),
+                        Some(format!(
+                            "Run 'dcg install --omp --force{project_flag}' to refresh it"
+                        )),
+                    )
+                }
+            }
+            Ok(OmpExtensionRegistration::Missing) => {
+                issues += 1;
+                if fix
+                    && install_omp_extension(false, false, false).is_ok()
+                    && matches!(
+                        registered_omp_extension(),
+                        Ok(OmpExtensionRegistration::Healthy(_))
+                    )
+                {
+                    fixed += 1;
+                    omp_fixed = true;
+                    let installed_path = omp_user_extension_path()
+                        .expect("OMP extension path validated during installation");
+                    (
+                        DoctorCheckStatus::Ok,
+                        format!(
+                            "Installed native Oh My Pi extension at {}",
+                            installed_path.display()
+                        ),
+                        None,
+                    )
+                } else {
+                    (
+                        DoctorCheckStatus::Error,
+                        "Oh My Pi is in use but has no dcg extension — its bash commands are not \
+                     guarded"
+                            .to_string(),
+                        Some("Run 'dcg install --omp'".to_string()),
+                    )
+                }
+            }
+        };
+        checks.push(DoctorCheck {
+            id: "omp_extension",
+            name: "Oh My Pi extension registration",
+            status,
+            message,
+            remediation,
+            fixed: omp_fixed,
+        });
+    }
+
     // Build provenance vs. `dcg update` (#320). Warning-only: it never fails
     // `--strict`, it flags the state that is one routine `dcg update` away
     // from silently replacing a local build. Mirrored in `doctor_pretty`.
@@ -11434,8 +12011,7 @@ fn is_dcg_program_basename(program: &str) -> bool {
     stem.eq_ignore_ascii_case("dcg")
         || (std::path::Path::new(program).is_absolute()
             && std::env::current_exe()
-                .ok()
-                .is_some_and(|current| current == std::path::Path::new(program)))
+                .is_ok_and(|current| current == std::path::Path::new(program)))
 }
 
 fn dcg_command_program(cmd: &str) -> Option<String> {
@@ -11553,6 +12129,54 @@ fn is_dcg_hook_entry_for_matcher(entry: &serde_json::Value, matcher: &str) -> bo
             })
 }
 
+/// Hook-object keys that dcg owns and rewrites on install and self-heal.
+///
+/// Everything else on a hook object (`timeout`, and any field the host adds
+/// in the future) is operator- or host-owned: a repair carries those fields
+/// forward unchanged (#345) and their presence never marks a hook stale.
+/// `shell` is in this list even though only the Windows hook emits it, so a
+/// `settings.json` restored from another OS cannot carry a foreign `shell`
+/// value onto the repaired hook.
+const DCG_OWNED_HOOK_KEYS: &[&str] = &["type", "command", "shell"];
+
+/// Whether `hook` is the dcg hook `desired_hook` describes, judged on the
+/// dcg-owned keys only.
+///
+/// A hook with an extra `"timeout": 10` set by the operator is still the
+/// current dcg hook; comparing whole objects (the pre-#345 behavior) made
+/// every such hook look stale, and the "repair" then dropped the timeout.
+fn hook_has_dcg_identity(hook: &serde_json::Value, desired_hook: &serde_json::Value) -> bool {
+    hook.is_object()
+        && DCG_OWNED_HOOK_KEYS
+            .iter()
+            .all(|key| hook.get(key) == desired_hook.get(key))
+}
+
+/// Rebuild the hook object dcg will write, keeping host-owned fields from the
+/// hook it replaces (#345).
+///
+/// `desired_hook` supplies every dcg-owned key; `previous` (the dcg hook found
+/// in the existing settings, if any) supplies the rest. dcg-owned keys absent
+/// from `desired_hook` are dropped even when `previous` has them, so identity
+/// always ends up exactly as dcg defines it for this platform.
+fn merge_host_owned_hook_fields(
+    desired_hook: serde_json::Value,
+    previous: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let Some(previous) = previous.and_then(serde_json::Value::as_object) else {
+        return desired_hook;
+    };
+    let serde_json::Value::Object(desired) = desired_hook else {
+        return desired_hook;
+    };
+    let mut merged = previous.clone();
+    for key in DCG_OWNED_HOOK_KEYS {
+        merged.remove(*key);
+    }
+    merged.extend(desired);
+    serde_json::Value::Object(merged)
+}
+
 fn is_exact_hook_entry_for_matcher(
     entry: &serde_json::Value,
     matcher: &str,
@@ -11565,7 +12189,11 @@ fn is_exact_hook_entry_for_matcher(
         && entry
             .get("hooks")
             .and_then(serde_json::Value::as_array)
-            .is_some_and(|hooks| hooks.iter().any(|hook| hook == desired_hook))
+            .is_some_and(|hooks| {
+                hooks
+                    .iter()
+                    .any(|hook| hook_has_dcg_identity(hook, desired_hook))
+            })
 }
 
 fn remove_dcg_hooks_from_pre_tool_use(pre_tool_use: &mut Vec<serde_json::Value>) -> bool {
@@ -11633,6 +12261,11 @@ fn install_dcg_hook_for_matcher(
     let original = pre_tool_use.clone();
     let mut canonical_entry = None;
     let mut retained_entries = Vec::with_capacity(original.len());
+    // The dcg hook being replaced, so its host-owned fields (`timeout`, ...)
+    // survive the rewrite (#345). A hook under the canonical matcher is the
+    // best template; one under a legacy matcher is the fallback.
+    let mut previous_canonical_hook: Option<serde_json::Value> = None;
+    let mut previous_legacy_hook: Option<serde_json::Value> = None;
 
     for mut entry in original {
         let entry_matcher = entry
@@ -11653,10 +12286,14 @@ fn install_dcg_hook_for_matcher(
             };
             let original_len = entry_hooks.len();
             entry_hooks.retain(|hook| {
-                !hook
+                let is_dcg = hook
                     .get("command")
                     .and_then(|command| command.as_str())
-                    .is_some_and(is_dcg_command)
+                    .is_some_and(is_dcg_command);
+                if is_dcg && previous_canonical_hook.is_none() {
+                    previous_canonical_hook = Some(hook.clone());
+                }
+                !is_dcg
             });
             let keep_duplicate = entry_hooks.len() == original_len || !entry_hooks.is_empty();
 
@@ -11684,10 +12321,14 @@ fn install_dcg_hook_for_matcher(
                 Some(entry_hooks) => {
                     let original_len = entry_hooks.len();
                     entry_hooks.retain(|hook| {
-                        !hook
+                        let is_dcg = hook
                             .get("command")
                             .and_then(|command| command.as_str())
-                            .is_some_and(is_dcg_command)
+                            .is_some_and(is_dcg_command);
+                        if is_dcg && previous_legacy_hook.is_none() {
+                            previous_legacy_hook = Some(hook.clone());
+                        }
+                        !is_dcg
                     });
                     entry_hooks.len() < original_len && entry_hooks.is_empty()
                 }
@@ -11698,6 +12339,9 @@ fn install_dcg_hook_for_matcher(
             retained_entries.push(entry);
         }
     }
+
+    let previous_hook = previous_canonical_hook.or(previous_legacy_hook);
+    let desired_hook = merge_host_owned_hook_fields(desired_hook, previous_hook.as_ref());
 
     let mut canonical_entry = canonical_entry.unwrap_or(hook_config);
     canonical_entry["hooks"]
@@ -12099,10 +12743,19 @@ fn project_opencode_plugin_path() -> Result<std::path::PathBuf, Box<dyn std::err
 /// The dcg binary path is embedded as a JSON string literal (valid JSON
 /// strings are valid JS string literals), NOT shell-quoted — the plugin
 /// spawns dcg directly without a shell.
-fn build_opencode_plugin_source(executable: &std::path::Path) -> std::io::Result<String> {
-    let path_literal = serde_json::to_string(&executable.to_string_lossy()).map_err(|e| {
-        std::io::Error::other(format!("cannot encode dcg path as a JS literal: {e}"))
+fn executable_javascript_literal(executable: &std::path::Path) -> std::io::Result<String> {
+    let path = executable.to_str().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "dcg executable path is not valid UTF-8 and cannot be embedded in JavaScript",
+        )
     })?;
+    serde_json::to_string(path)
+        .map_err(|e| std::io::Error::other(format!("cannot encode dcg path as a JS literal: {e}")))
+}
+
+fn build_opencode_plugin_source(executable: &std::path::Path) -> std::io::Result<String> {
+    let path_literal = executable_javascript_literal(executable)?;
     Ok(format!(
         r#"// {OPENCODE_PLUGIN_MARKER}: generated by `dcg install --opencode` — do not edit.
 // Routes every OpenCode bash tool call through dcg (Destructive Command
@@ -12177,6 +12830,1077 @@ fn opencode_plugin_is_dcg_owned(path: &std::path::Path) -> bool {
     std::fs::read_to_string(path)
         .map(|content| content.contains(OPENCODE_PLUGIN_MARKER))
         .unwrap_or(false)
+}
+
+/// Ownership marker embedded in the generated Oh My Pi extension.
+///
+/// Installation refuses to overwrite a file without this marker, and the
+/// uninstallers use it to distinguish dcg-owned output from user code.
+pub(crate) const OMP_EXTENSION_MARKER: &str = "dcg-omp-extension";
+
+/// Hard parent-side ceiling for one generated OMP bridge child.
+///
+/// dcg's ordinary evaluator deadline is 1 second and the broad Windows preset
+/// defaults to 3 seconds, but an operator may configure a larger deadline.
+/// Keep this pathological-hang backstop generous enough not to compete with
+/// those evaluator budgets while still bounding a wedged child at the bridge.
+pub(crate) const OMP_CHILD_EVALUATION_TIMEOUT_MS: u64 = 30_000;
+
+/// Maximum time to drain stdout/stderr after Bun reports child termination.
+///
+/// A descendant can inherit either pipe after the direct dcg child exits, so
+/// process termination alone does not prove EOF. Keep a short grace for bytes
+/// already in flight, then cancel the local readers and classify every byte
+/// retained before that boundary.
+pub(crate) const OMP_CHILD_PIPE_DRAIN_GRACE_MS: u64 = 250;
+
+/// Independent ceiling for observing the direct child and both of its pipes.
+///
+/// Bun's native child timeout normally settles first. The extra two drain
+/// windows cover signal/reap propagation plus one bounded post-exit drain; if
+/// the exit capability itself never settles, this outer watchdog still closes
+/// the local observation boundary.
+pub(crate) const OMP_CHILD_OBSERVATION_TIMEOUT_MS: u64 =
+    OMP_CHILD_EVALUATION_TIMEOUT_MS + 2 * OMP_CHILD_PIPE_DRAIN_GRACE_MS;
+
+/// Normalize a profile name using the upstream OMP profile-name contract.
+/// Empty, whitespace-only, and `default` select the default profile. Invalid
+/// explicit values are errors: OMP's module-load fallback is only a bootstrap
+/// detail, and its CLI re-validates the environment and refuses startup before
+/// writing profile state.
+fn normalize_omp_profile_name(profile: &str) -> std::io::Result<Option<String>> {
+    let name = profile.trim();
+    if name.is_empty() || name == "default" {
+        return Ok(None);
+    }
+    if name == "." || name == ".." || name.ends_with('.') || name.len() > 64 {
+        return Err(invalid_omp_profile_error(profile));
+    }
+
+    let mut chars = name.chars();
+    if !chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-".contains(c))
+    {
+        return Err(invalid_omp_profile_error(profile));
+    }
+
+    let base = name.split('.').next().unwrap_or(name);
+    let upper = base.to_ascii_uppercase();
+    let reserved = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (upper.len() == 4
+            && (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.as_bytes()[3].is_ascii_digit());
+    if reserved {
+        return Err(invalid_omp_profile_error(profile));
+    }
+    Ok(Some(name.to_string()))
+}
+
+fn invalid_omp_profile_error(profile: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "Invalid OMP profile {profile:?}. Profile names must match \
+             ^[a-z0-9][a-z0-9._-]{{0,63}}$, cannot be '.' or '..', cannot end with '.', \
+             and cannot be a Windows reserved device name (CON, PRN, AUX, NUL, COM0-9, \
+             LPT0-9, or any of those with an extension)"
+        ),
+    )
+}
+
+/// Observable state of one OMP profile environment variable. Keeping absence
+/// distinct from an explicit default selection is what preserves the
+/// `OMP_PROFILE`-over-`PI_PROFILE` precedence rule.
+enum OmpProfileEnvValue {
+    Absent,
+    Default,
+    Named(String),
+}
+
+fn omp_profile_env_value(variable: &'static str) -> std::io::Result<OmpProfileEnvValue> {
+    match std::env::var(variable) {
+        Ok(profile) => normalize_omp_profile_name(&profile)
+            .map(|profile| profile.map_or(OmpProfileEnvValue::Default, OmpProfileEnvValue::Named))
+            .map_err(|error| std::io::Error::new(error.kind(), format!("{variable}: {error}"))),
+        Err(std::env::VarError::NotPresent) => Ok(OmpProfileEnvValue::Absent),
+        Err(std::env::VarError::NotUnicode(_)) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{variable} must contain valid Unicode; OMP rejects non-Unicode profile values"
+            ),
+        )),
+    }
+}
+
+/// Resolve OMP's active named profile. `OMP_PROFILE` takes precedence whenever
+/// it is set, including when it is explicitly empty; `PI_PROFILE` is the
+/// legacy fallback used only when `OMP_PROFILE` is absent.
+fn omp_active_profile() -> std::io::Result<Option<String>> {
+    match omp_profile_env_value("OMP_PROFILE")? {
+        OmpProfileEnvValue::Named(profile) => Ok(Some(profile)),
+        OmpProfileEnvValue::Default => Ok(None),
+        OmpProfileEnvValue::Absent => match omp_profile_env_value("PI_PROFILE")? {
+            OmpProfileEnvValue::Named(profile) => Ok(Some(profile)),
+            OmpProfileEnvValue::Absent | OmpProfileEnvValue::Default => Ok(None),
+        },
+    }
+}
+
+/// Resolve OMP's config root without allowing Rust's Windows path semantics to
+/// turn a drive-qualified config *name* into a path outside `home`.
+///
+/// Upstream passes `PI_CONFIG_DIR` to Node's `path.join(home, name)`. On
+/// Windows, a value such as `C:\\omp` becomes an invalid child beneath `home`;
+/// Rust's `Path::join` would instead replace `home` and target `C:\\omp`.
+/// Reject that malformed Windows-only value so dcg never writes somewhere OMP
+/// itself would not load from.
+fn lexically_normalize_omp_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut normalized = std::path::PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                normalized.push(component.as_os_str());
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                let can_pop = normalized
+                    .components()
+                    .next_back()
+                    .is_some_and(|last| matches!(last, std::path::Component::Normal(_)));
+                if can_pop {
+                    normalized.pop();
+                } else if !normalized.has_root() {
+                    normalized.push("..");
+                }
+            }
+            std::path::Component::Normal(value) => normalized.push(value),
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        normalized.push(".");
+    }
+    normalized
+}
+
+fn omp_config_root_from(
+    home: &std::path::Path,
+    config_name: &str,
+    windows_semantics: bool,
+) -> std::io::Result<std::path::PathBuf> {
+    // `path.join(home, name)` keeps a leading backslash as an ordinary byte on
+    // POSIX, while win32 treats both slash kinds as separators. Strip only the
+    // separators for the selected host before applying Node's lexical `.` / `..`
+    // normalization to the complete joined path.
+    let relative = if windows_semantics {
+        config_name.trim_start_matches(['/', '\\'])
+    } else {
+        config_name.trim_start_matches('/')
+    };
+    let bytes = relative.as_bytes();
+    let drive_qualified = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    if windows_semantics && drive_qualified {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "PI_CONFIG_DIR must be a directory name relative to HOME on Windows, not \
+                 drive-qualified path {config_name:?}"
+            ),
+        ));
+    }
+    Ok(lexically_normalize_omp_path(&home.join(relative)))
+}
+
+/// Select the default-profile agent directory from a possible legacy
+/// `PI_CODING_AGENT_DIR` override.
+///
+/// OMP's `setProfile()` exports the active profile's derived agent directory to
+/// child processes through `PI_CODING_AGENT_DIR`. When a higher-priority
+/// `OMP_PROFILE` explicitly selects the default profile, a lower-priority
+/// `PI_PROFILE` can therefore remain alongside that now-stale derived value.
+/// Upstream suppresses the value only when both pieces of provenance agree
+/// exactly. Every other non-empty value remains an operator override.
+fn omp_default_agent_dir_from(
+    config_root: &std::path::Path,
+    agent_dir_override: Option<&std::ffi::OsStr>,
+    legacy_profile: Option<&str>,
+) -> std::path::PathBuf {
+    let default_agent_dir = config_root.join("agent");
+    let Some(agent_dir_override) = agent_dir_override.filter(|value| !value.is_empty()) else {
+        return default_agent_dir;
+    };
+
+    if legacy_profile.is_some_and(|profile| {
+        let derived_agent_dir = config_root.join("profiles").join(profile).join("agent");
+        agent_dir_override == derived_agent_dir.as_os_str()
+    }) {
+        return default_agent_dir;
+    }
+
+    std::path::PathBuf::from(agent_dir_override)
+}
+
+fn omp_coding_agent_dir_env_value(
+    value: Option<std::ffi::OsString>,
+) -> std::io::Result<Option<std::ffi::OsString>> {
+    #[cfg(unix)]
+    if value.as_ref().is_some_and(|value| value.to_str().is_none()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "PI_CODING_AGENT_DIR must contain valid UTF-8 on Unix; OMP reads environment paths as JavaScript strings",
+        ));
+    }
+
+    Ok(value)
+}
+
+/// OMP's active user agent directory. The default is `~/.omp/agent`; named
+/// profiles live under `~/.omp/profiles/<name>/agent`. OMP ignores the legacy
+/// `PI_CODING_AGENT_DIR` override when a named profile is active, so dcg does
+/// the same.
+fn omp_user_agent_dir() -> std::io::Result<std::path::PathBuf> {
+    let home = dirs::home_dir().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "could not determine the home directory for Oh My Pi",
+        )
+    })?;
+    let config_name = match std::env::var("PI_CONFIG_DIR") {
+        Ok(value) if !value.is_empty() => value,
+        Ok(_) | Err(std::env::VarError::NotPresent) => ".omp".to_string(),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "PI_CONFIG_DIR must contain valid Unicode",
+            ));
+        }
+    };
+    let config_root = omp_config_root_from(&home, &config_name, cfg!(windows))?;
+
+    if let Some(profile) = omp_active_profile()? {
+        return Ok(config_root.join("profiles").join(profile).join("agent"));
+    }
+
+    // `OMP_PROFILE` may have explicitly selected default mode while a
+    // lower-priority `PI_PROFILE` and the agent dir derived from it remain in
+    // the inherited environment. Validate that losing profile independently:
+    // invalid/non-Unicode values carry no provenance and must not suppress a
+    // genuine custom override.
+    let legacy_profile = match omp_profile_env_value("PI_PROFILE") {
+        Ok(OmpProfileEnvValue::Named(profile)) => Some(profile),
+        Ok(OmpProfileEnvValue::Absent | OmpProfileEnvValue::Default) | Err(_) => None,
+    };
+    let agent_dir_override =
+        omp_coding_agent_dir_env_value(std::env::var_os("PI_CODING_AGENT_DIR"))?;
+    Ok(omp_default_agent_dir_from(
+        &config_root,
+        agent_dir_override.as_deref(),
+        legacy_profile.as_deref(),
+    ))
+}
+
+/// User-level OMP extension path for the active profile.
+fn omp_user_extension_path() -> std::io::Result<std::path::PathBuf> {
+    Ok(omp_user_agent_dir()?
+        .join("extensions")
+        .join("dcg-guard.ts"))
+}
+
+/// Project-level OMP extension path: `<cwd>/.omp/extensions/dcg-guard.ts`.
+///
+/// Unlike some of OMP's context-file providers, native extension discovery is
+/// anchored to the process working directory and never walks Git ancestors.
+/// Keep this resolver equally literal so an installed guard is one OMP will
+/// actually load, including when the cwd is not inside a Git repository.
+fn project_omp_extension_path() -> std::io::Result<std::path::PathBuf> {
+    Ok(std::env::current_dir()?
+        .join(".omp")
+        .join("extensions")
+        .join("dcg-guard.ts"))
+}
+
+/// Generate an OMP ExtensionAPI module that gates every `bash` tool call on
+/// dcg's robot-mode evaluator. The command is sent on stdin and dcg is spawned
+/// directly (never through a shell). A deny-like JSON verdict or exit 1 is a
+/// safety block; status-only infrastructure failures fail open with a visible
+/// diagnostic, consistent with dcg's other generated integration bridges. A
+/// separate generous parent-side ceiling kills a pathologically wedged child;
+/// it does not replace dcg's own configurable evaluation deadline.
+fn build_omp_extension_source(executable: &std::path::Path) -> std::io::Result<String> {
+    let path_literal = executable_javascript_literal(executable)?;
+    Ok(format!(
+        r#"// {OMP_EXTENSION_MARKER}: generated by `dcg install --omp` — do not edit.
+// Routes every Oh My Pi bash tool call through dcg (Destructive Command Guard)
+// before execution. Docs: https://github.com/Dicklesworthstone/destructive_command_guard
+import type {{ ExtensionAPI }} from "@oh-my-pi/pi-coding-agent";
+import {{ settings }} from "@oh-my-pi/pi-coding-agent/config/settings";
+import {{ procmgr }} from "@oh-my-pi/pi-utils";
+import {{ resolveToCwd }} from "@oh-my-pi/pi-coding-agent/tools/path-utils";
+import {{ extractLeadingCdTarget }} from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
+
+// This marker-owned install artifact binds the guard to the install-time
+// absolute dcg pathname. It does not attest the bytes later resolved there;
+// ambient environment must not redirect the pathname.
+const DCG_BIN = {path_literal};
+const DCG_CHILD_TIMEOUT_MS = {OMP_CHILD_EVALUATION_TIMEOUT_MS};
+export const DCG_CHILD_PIPE_DRAIN_GRACE_MS = {OMP_CHILD_PIPE_DRAIN_GRACE_MS};
+export const DCG_CHILD_OBSERVATION_TIMEOUT_MS = {OMP_CHILD_OBSERVATION_TIMEOUT_MS};
+export const DCG_STDOUT_MAX_BYTES = {OMP_CHILD_STDOUT_MAX_BYTES};
+export const DCG_STDERR_MAX_BYTES = {OMP_CHILD_STDERR_MAX_BYTES};
+export const DCG_STDIN_CHUNK_CODE_UNITS = {OMP_CHILD_STDIN_CHUNK_CODE_UNITS};
+const DCG_SIGNAL_CODE_MAX_CHARS = 64;
+type DcgChildOutcome = "spawn-throw" | "exit-0" | "exit-1" | "exit-2" | "exit-other" | "signal";
+type DcgParsedVerdict = "empty" | "malformed" | "allow" | "deny" | "ask" | "indeterminate" | "unknown";
+type DcgBridgeAction = "allow" | "block" | "infrastructure";
+type DcgParsedOutput = {{
+  verdict: DcgParsedVerdict;
+  reason?: string;
+  ruleId?: string;
+  framedBlockingWitness?: true;
+}};
+type DcgBoundedText = {{ text: string; overflowed: boolean; readFailure?: string }};
+type DcgObservationBoundary = "pipe-drain" | "hard-deadline";
+type DcgChildObservationResults = {{
+  stdoutResult: PromiseSettledResult<DcgBoundedText>;
+  stderrResult: PromiseSettledResult<DcgBoundedText>;
+  exitResult: PromiseSettledResult<unknown>;
+  boundary?: DcgObservationBoundary;
+  killFailure?: string;
+}};
+type OmpBashToolInput = {{ command?: unknown; cwd?: unknown; async?: unknown; pty?: unknown }};
+type OmpToolCallClassification =
+  | {{ kind: "other-tool" }}
+  | {{ kind: "invalid-bash" }}
+  | {{ kind: "bash"; input: OmpBashToolInput; command: string }};
+
+const BLOCKING_DECISIONS: ReadonlySet<DcgParsedVerdict> = new Set<DcgParsedVerdict>(["deny", "ask", "indeterminate"]);
+const DCG_OBSERVATION_ABORTED = Symbol("dcg-child-observation-aborted");
+// Bun exposes no stdout when spawn itself throws. That runtime catch remains a
+// visible infrastructure fail-open; this total row makes the pure classifier
+// exhaustive for replay/model tests and preserves deny-like monotonicity.
+const DCG_CHILD_TRANSITIONS: Record<DcgChildOutcome, Record<DcgParsedVerdict, DcgBridgeAction>> = {{
+  "spawn-throw": {{ empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }},
+  "exit-0": {{ empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }},
+  "exit-1": {{ empty: "block", malformed: "block", allow: "block", deny: "block", ask: "block", indeterminate: "block", unknown: "block" }},
+  "exit-2": {{ empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }},
+  "exit-other": {{ empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }},
+  "signal": {{ empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }},
+}};
+
+// OMP's agent loop schema-validates built-in bash arguments before emitting
+// tool_call, but direct/non-loop wrapper dispatch is also public. Preserve the
+// exact tool-name boundary and fail closed only when an identifiable bash call
+// violates the required object-with-string-command shape.
+export function classifyOmpToolCall(event: unknown): OmpToolCallClassification {{
+  if (typeof event !== "object" || event === null || Array.isArray(event)) return {{ kind: "other-tool" }};
+  const record = event as Record<string, unknown>;
+  if (record.toolName !== "bash") return {{ kind: "other-tool" }};
+  const input = record.input;
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return {{ kind: "invalid-bash" }};
+  const toolInput = input as OmpBashToolInput;
+  if (typeof toolInput.command !== "string") return {{ kind: "invalid-bash" }};
+  return {{ kind: "bash", input: toolInput, command: toolInput.command }};
+}}
+
+function parseDcgJson(text: string): DcgParsedOutput {{
+  let raw: unknown;
+  try {{
+    raw = JSON.parse(text);
+  }} catch {{
+    return {{ verdict: "malformed" }};
+  }}
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {{
+    return {{ verdict: "unknown" }};
+  }}
+
+  const record = raw as Record<string, unknown>;
+  const decision = record.decision;
+  const verdict: DcgParsedVerdict =
+    decision === "allow" ||
+    decision === "deny" ||
+    decision === "ask" ||
+    decision === "indeterminate"
+      ? decision
+      : "unknown";
+  return {{
+    verdict,
+    reason: typeof record.reason === "string" ? record.reason : undefined,
+    ruleId: typeof record.rule_id === "string" ? record.rule_id : undefined,
+  }};
+}}
+
+function parseDcgOutput(stdoutText: string): DcgParsedOutput {{
+  const text = stdoutText.trim();
+  if (!text) return {{ verdict: "empty" }};
+
+  const parsed = parseDcgJson(text);
+  if (parsed.verdict !== "malformed") return parsed;
+
+  // The private Rust producer emits exactly one compact JSON object followed
+  // by LF. If later bytes corrupt the aggregate, retain any independently
+  // parseable, delimiter-complete blocking frame as an absorbing witness.
+  // Never recover allow, never parse an unterminated suffix, and never infer a
+  // JSON prefix from same-line junk. OmpBridgeTestOutput declares `decision`
+  // first, so its exact prefixes cheaply skip arbitrary diagnostic lines
+  // before paying for JSON.parse on this cold path.
+  let frameStart = 0;
+  while (true) {{
+    const frameEnd = stdoutText.indexOf("\n", frameStart);
+    if (frameEnd < 0) break;
+    const frame = stdoutText.slice(frameStart, frameEnd).trim();
+    const mightBlock =
+      frame.startsWith('{{"decision":"deny"') ||
+      frame.startsWith('{{"decision":"ask"') ||
+      frame.startsWith('{{"decision":"indeterminate"');
+    if (mightBlock) {{
+      const candidate = parseDcgJson(frame);
+      if (BLOCKING_DECISIONS.has(candidate.verdict)) {{
+        return {{ ...candidate, framedBlockingWitness: true }};
+      }}
+    }}
+    frameStart = frameEnd + 1;
+  }}
+  return parsed;
+}}
+
+export function classifyDcgChild(
+  outcome: DcgChildOutcome,
+  stdoutText: string,
+): {{ action: DcgBridgeAction; output: DcgParsedOutput }} {{
+  const output = parseDcgOutput(stdoutText);
+  return {{ action: DCG_CHILD_TRANSITIONS[outcome][output.verdict], output }};
+}}
+
+function isDcgSignalName(signalCode: string): boolean {{
+  if (
+    signalCode.length <= 3 ||
+    signalCode.length > DCG_SIGNAL_CODE_MAX_CHARS ||
+    !signalCode.startsWith("SIG")
+  ) return false;
+  for (let index = 3; index < signalCode.length; index += 1) {{
+    const code = signalCode.charCodeAt(index);
+    if (!((code >= 0x41 && code <= 0x5a) || (code >= 0x30 && code <= 0x39))) return false;
+  }}
+  return true;
+}}
+
+function isDcgSignalCode(signalCode: unknown): signalCode is string | number {{
+  return (
+    (typeof signalCode === "string" && isDcgSignalName(signalCode)) ||
+    (typeof signalCode === "number" && Number.isInteger(signalCode) && signalCode > 0)
+  );
+}}
+
+function isDcgExitCode(exitCode: unknown): exitCode is number {{
+  return typeof exitCode === "number" && Number.isInteger(exitCode) && exitCode >= 0;
+}}
+
+export function childOutcomeFromTermination(
+  exitCode: unknown,
+  signalCode: unknown,
+): DcgChildOutcome {{
+  // Preserve dcg's independent blocking status even under an impossible or
+  // future runtime shape that reports both exit 1 and a signal.
+  if (exitCode === 1) return "exit-1";
+  // Bun's `.exited` resolves to 128 + signal on POSIX, which is identical to
+  // an ordinary process that chose that numeric exit. `signalCode`, populated
+  // after exit, is the authoritative provenance discriminator.
+  if (isDcgSignalCode(signalCode)) return "signal";
+  if (exitCode === 0) return "exit-0";
+  if (exitCode === 2) return "exit-2";
+  return "exit-other";
+}}
+
+function boundedDiagnosticText(text: string): string {{
+  const suffix = "\n[dcg: diagnostic truncated]";
+  const buffer = new Uint8Array(DCG_STDERR_MAX_BYTES - suffix.length);
+  const encoded = new TextEncoder().encodeInto(text, buffer);
+  if (encoded.read === text.length) return text;
+  // `stream: true` deliberately withholds a code point split by the byte cap.
+  const prefix = new TextDecoder().decode(buffer.subarray(0, encoded.written), {{ stream: true }});
+  return prefix + suffix;
+}}
+
+function describeChildCollectionFailure(reason: unknown): string {{
+  try {{
+    return boundedDiagnosticText(String(reason));
+  }} catch {{
+    return "<unprintable rejection>";
+  }}
+}}
+
+function childTerminationDetail(exitCode: unknown, signalCode: unknown): string {{
+  if (isDcgSignalCode(signalCode)) return ` (signal ${{signalCode}})`;
+  if (isDcgExitCode(exitCode)) return ` (exit ${{exitCode}})`;
+  if (exitCode === undefined) return " (exit status unavailable)";
+  if (exitCode === null) return " (exit status null)";
+  // Never echo an invalid runtime value: control characters or a hostile
+  // `toString` implementation could forge diagnostics.
+  return ` (exit status invalid: ${{typeof exitCode}})`;
+}}
+
+function observeChildCapability<T>(collect: () => Promise<T>): Promise<T> {{
+  try {{
+    return collect();
+  }} catch (reason) {{
+    return Promise.reject(reason);
+  }}
+}}
+
+export function commandUtf8Stream(command: string): ReadableStream<Uint8Array> {{
+  let offset = 0;
+  const text = new ReadableStream<string>({{
+    pull(controller): void {{
+      if (offset >= command.length) {{
+        controller.close();
+        return;
+      }}
+      let end = Math.min(offset + DCG_STDIN_CHUNK_CODE_UNITS, command.length);
+      // JavaScript slices by UTF-16 code unit. Keep an astral scalar together
+      // when the nominal boundary lands between its surrogate pair.
+      if (
+        end < command.length
+        && command.charCodeAt(end - 1) >= 0xd800
+        && command.charCodeAt(end - 1) <= 0xdbff
+        && command.charCodeAt(end) >= 0xdc00
+        && command.charCodeAt(end) <= 0xdfff
+      ) {{
+        end += 1;
+      }}
+      controller.enqueue(command.slice(offset, end));
+      offset = end;
+    }},
+  }});
+  // TextEncoderStream carries a valid surrogate pair across chunk boundaries,
+  // preserving its UTF-8 scalar without a command-sized allocation. As the
+  // Encoding Standard requires, both this path and `TextEncoder.encode()`
+  // canonicalize an unpaired UTF-16 surrogate to U+FFFD.
+  return text.pipeThrough(new TextEncoderStream());
+}}
+
+export function commandStdin(command: string): Uint8Array | ReadableStream<Uint8Array> {{
+  // Preserve Bun's low-overhead direct-byte path for ordinary commands. Only
+  // configured-large input pays the stream/object cost needed to bound peak
+  // encoding allocation.
+  return command.length <= DCG_STDIN_CHUNK_CODE_UNITS
+    ? new TextEncoder().encode(command)
+    : commandUtf8Stream(command);
+}}
+
+export async function collectBoundedText(
+  stream: ReadableStream<Uint8Array>,
+  maxBytes: number,
+  abortSignal?: AbortSignal,
+): Promise<DcgBoundedText> {{
+  // Grow only with observed output. Compact allow/deny envelopes stay compact
+  // instead of reserving the entire safety cap on every guarded command.
+  let retained = new Uint8Array(0);
+  let retainedBytes = 0;
+  let overflowed = false;
+  let readFailure: string | undefined;
+  const reader = stream.getReader();
+  let cancellationRequested = false;
+  const cancelReader = (): void => {{
+    if (cancellationRequested) return;
+    cancellationRequested = true;
+    try {{
+      // WHATWG stream cancellation settles pending reads. Attach a rejection
+      // handler even though the result is diagnostic-only, so a hostile or
+      // future stream implementation cannot create a late unhandled rejection.
+      void reader.cancel(DCG_OBSERVATION_ABORTED).catch(() => {{}});
+    }} catch {{
+      // A synchronous cancellation fault is a runtime contract violation.
+      // The independently bounded child observation still reports its fixed
+      // deadline diagnostic if the standard pending-read settlement occurs.
+    }}
+  }};
+  if (abortSignal?.aborted) cancelReader();
+  else abortSignal?.addEventListener("abort", cancelReader, {{ once: true }});
+  try {{
+    while (true) {{
+      const next = await reader.read();
+      if (next.done) break;
+      const chunk = next.value;
+      const available = maxBytes - retainedBytes;
+      const keep = Math.min(available, chunk.byteLength);
+      if (keep > 0) {{
+        const needed = retainedBytes + keep;
+        if (needed > retained.byteLength) {{
+          const doubled = retained.byteLength === 0 ? needed : retained.byteLength * 2;
+          const capacity = Math.min(maxBytes, Math.max(needed, doubled));
+          const grown = new Uint8Array(capacity);
+          grown.set(retained.subarray(0, retainedBytes));
+          retained = grown;
+        }}
+        retained.set(chunk.subarray(0, keep), retainedBytes);
+        retainedBytes += keep;
+      }}
+      if (keep < chunk.byteLength) overflowed = true;
+    }}
+  }} catch (reason) {{
+    // Preserve any complete verdict received before a stream fault. The fault
+    // remains independently visible and cannot downgrade an overflow block.
+    if (!cancellationRequested) readFailure = describeChildCollectionFailure(reason);
+  }} finally {{
+    abortSignal?.removeEventListener("abort", cancelReader);
+    reader.releaseLock();
+  }}
+
+  const bytes = retained.subarray(0, retainedBytes);
+  // When the cap cuts a multi-byte scalar, streaming decode withholds that
+  // incomplete suffix instead of manufacturing U+FFFD. At/below the cap the
+  // final decode flushes normally, including chunks split inside a scalar.
+  const text = overflowed
+    ? new TextDecoder().decode(bytes, {{ stream: true }})
+    : new TextDecoder().decode(bytes);
+  return {{ text, overflowed, readFailure }};
+}}
+
+function visibleStderrDetail(stderr: DcgBoundedText): string {{
+  const detail = stderr.text.trim();
+  if (!stderr.overflowed) return detail;
+  const suffix = `[dcg: stderr exceeded ${{DCG_STDERR_MAX_BYTES}}-byte display cap; additional bytes omitted]`;
+  return detail ? `${{detail}}\n${{suffix}}` : suffix;
+}}
+
+function observeChildCapabilityUntil<T>(
+  capability: Promise<T>,
+  abortSignal: AbortSignal,
+): Promise<T> {{
+  if (abortSignal.aborted) return Promise.reject(DCG_OBSERVATION_ABORTED);
+  return new Promise<T>((resolve, reject) => {{
+    let settled = false;
+    const finishResolve = (value: T): void => {{
+      if (settled) return;
+      settled = true;
+      abortSignal.removeEventListener("abort", onAbort);
+      resolve(value);
+    }};
+    const finishReject = (reason: unknown): void => {{
+      if (settled) return;
+      settled = true;
+      abortSignal.removeEventListener("abort", onAbort);
+      reject(reason);
+    }};
+    const onAbort = (): void => finishReject(DCG_OBSERVATION_ABORTED);
+    abortSignal.addEventListener("abort", onAbort, {{ once: true }});
+    // Both handlers remain attached even if the watchdog wins. A late
+    // fulfillment or rejection is consumed rather than becoming unhandled.
+    capability.then(finishResolve, finishReject);
+  }});
+}}
+
+function killDcgChild(proc: Bun.ReadableSubprocess): string | undefined {{
+  try {{
+    proc.kill("SIGKILL");
+    return undefined;
+  }} catch (reason) {{
+    return describeChildCollectionFailure(reason);
+  }}
+}}
+
+async function observeDcgChild(proc: Bun.ReadableSubprocess): Promise<DcgChildObservationResults> {{
+  const observationAbort = new AbortController();
+  const observationDeadline = performance.now() + DCG_CHILD_OBSERVATION_TIMEOUT_MS;
+  let observationFinished = false;
+  let boundary: DcgObservationBoundary | undefined;
+  let killFailure: string | undefined;
+  const abortObservation = (nextBoundary: DcgObservationBoundary, killChild: boolean): void => {{
+    if (observationFinished || observationAbort.signal.aborted) return;
+    boundary = nextBoundary;
+    if (killChild) killFailure = killDcgChild(proc);
+    observationAbort.abort(DCG_OBSERVATION_ABORTED);
+  }};
+
+  // Arm immediately after the successful spawn. This is independent of Bun's
+  // native process timeout and therefore also bounds an exit observation that
+  // never settles. Synchronous Bun.spawn/event-loop stalls remain outside any
+  // in-process JavaScript timer's authority.
+  let observationTimer = setTimeout(
+    () => abortObservation("hard-deadline", true),
+    DCG_CHILD_OBSERVATION_TIMEOUT_MS,
+  );
+  const rawExitObservation = observeChildCapability(() => proc.exited);
+  const armPipeDrainDeadline = (killChild: boolean): void => {{
+    if (observationFinished || observationAbort.signal.aborted) return;
+    if (killChild) killFailure = killDcgChild(proc);
+    clearTimeout(observationTimer);
+    const remainingHardBudget = Math.max(0, observationDeadline - performance.now());
+    const pipeDrainWins = remainingHardBudget > DCG_CHILD_PIPE_DRAIN_GRACE_MS;
+    observationTimer = setTimeout(
+      () => abortObservation(pipeDrainWins ? "pipe-drain" : "hard-deadline", false),
+      Math.min(DCG_CHILD_PIPE_DRAIN_GRACE_MS, remainingHardBudget),
+    );
+  }};
+  rawExitObservation.then(
+    () => armPipeDrainDeadline(false),
+    () => armPipeDrainDeadline(true),
+  );
+
+  try {{
+    const [stdoutResult, stderrResult, exitResult] = await Promise.allSettled([
+      observeChildCapability(() => collectBoundedText(
+        proc.stdout,
+        DCG_STDOUT_MAX_BYTES,
+        observationAbort.signal,
+      )),
+      observeChildCapability(() => collectBoundedText(
+        proc.stderr,
+        DCG_STDERR_MAX_BYTES,
+        observationAbort.signal,
+      )),
+      observeChildCapabilityUntil(rawExitObservation, observationAbort.signal),
+    ]);
+    return {{ stdoutResult, stderrResult, exitResult, boundary, killFailure }};
+  }} finally {{
+    observationFinished = true;
+    clearTimeout(observationTimer);
+  }}
+}}
+
+export default function dcgGuard(pi: ExtensionAPI): void {{
+  pi.on("tool_call", async (event, ctx) => {{
+    const toolCall = classifyOmpToolCall(event);
+    if (toolCall.kind === "other-tool") return;
+    if (toolCall.kind === "invalid-bash") {{
+      return {{
+        block: true,
+        reason: "[dcg] OMP guard received malformed bash input (expected an object with a string command)",
+      }};
+    }}
+    const {{ input: toolInput, command }} = toolCall;
+    // OMP's schema permits the empty string and its BashTool treats it as a
+    // no-op. Preserve that exact case; every non-empty string, including
+    // whitespace, still crosses the dcg decision boundary.
+    if (command.length === 0) return;
+
+    // Match OMP's BashTool filesystem-cwd derivation. Structured cwd wins;
+    // when it is absent OMP extracts only its conservative
+    // `cd <path> && ...` prefix. Reusing OMP's exported helpers keeps tilde,
+    // absolute, relative, Windows-drive-alias, and bare-root semantics
+    // synchronized upstream.
+    // An internal protocol URL is expanded only later by BashTool, with state
+    // this callback does not expose. resolveToCwd rejects it here, and the
+    // catch fails closed rather than evaluating under an unrelated policy.
+    let commandCwd: string;
+    try {{
+      const structuredCwd = typeof toolInput?.cwd === "string" && toolInput.cwd
+        ? toolInput.cwd
+        : undefined;
+      const requestedCwd = structuredCwd || extractLeadingCdTarget(command)?.path;
+      commandCwd = requestedCwd ? resolveToCwd(requestedCwd, ctx.cwd) : ctx.cwd;
+    }} catch (err) {{
+      return {{
+        block: true,
+        reason: `[dcg] OMP guard could not resolve the bash working directory safely: ${{describeChildCollectionFailure(err)}}`,
+      }};
+    }}
+
+    // OMP executes ordinary and managed-async BashTool calls in its embedded
+    // Brush shell, including on native Windows. Only an eligible local PTY
+    // bypasses Brush for the configured external shell. Mirror OMP's route
+    // predicate exactly: async wins before PTY, and PI_NO_PTY=1 disables PTY.
+    // OMP does not expose its ClientBridge terminal capability to extensions;
+    // ACP and JSON-RPC both report ctx.mode="rpc", so never guess from mode.
+    let shellDialect: "posix" | "ps" | "cmd" = "posix";
+    const usesLocalPty =
+      toolInput?.pty === true && toolInput?.async !== true && ctx.hasUI && process.env.PI_NO_PTY !== "1";
+    if (usesLocalPty) {{
+      try {{
+        const shell = settings.getShellConfig().shell;
+        shellDialect = procmgr.isCmdShell(shell) ? "cmd" : procmgr.isPowerShell(shell) ? "ps" : "posix";
+      }} catch (err) {{
+        return {{
+          block: true,
+          reason: `[dcg] OMP guard could not resolve the local PTY shell dialect safely: ${{describeChildCollectionFailure(err)}}`,
+        }};
+      }}
+    }}
+
+    let proc: Bun.ReadableSubprocess;
+    try {{
+      proc = Bun.spawn([
+        DCG_BIN,
+        "--robot", "test", "--stdin", "--agent", "omp", "--dialect", shellDialect,
+        "--format", "json",
+        "--omp-bridge-output",
+      ], {{
+        cwd: commandCwd,
+        stdin: commandStdin(command),
+        stdout: "pipe",
+        stderr: "pipe",
+        // Bun owns this timer and process reap. SIGKILL makes the ceiling a
+        // hard backstop even when a wedged evaluator cannot handle SIGTERM.
+        timeout: DCG_CHILD_TIMEOUT_MS,
+        killSignal: "SIGKILL",
+      }});
+    }} catch (err) {{
+      console.error(`[dcg] OMP guard could not run dcg: ${{describeChildCollectionFailure(err)}}`);
+      return;
+    }}
+
+    // Observe each child capability independently under one cleared watchdog.
+    // Fail-fast aggregation could erase a completed safety signal; waiting for
+    // bare pipe EOF could outlive the direct child when a descendant inherits
+    // an fd. The observer preserves retained bytes, bounds the drain, and
+    // kills the direct child if exit observation itself faults or stalls.
+    const {{
+      stdoutResult,
+      stderrResult,
+      exitResult,
+      boundary: observationBoundary,
+      killFailure: observationKillFailure,
+    }} = await observeDcgChild(proc);
+    const collectionFailures: string[] = [];
+    let stdoutText: DcgBoundedText = {{ text: "", overflowed: false }};
+    if (stdoutResult.status === "fulfilled") {{
+      stdoutText = stdoutResult.value;
+      if (stdoutText.readFailure) collectionFailures.push(`stdout read failed: ${{stdoutText.readFailure}}`);
+    }} else {{
+      collectionFailures.push(`stdout read failed: ${{describeChildCollectionFailure(stdoutResult.reason)}}`);
+    }}
+    let stderrText: DcgBoundedText = {{ text: "", overflowed: false }};
+    if (stderrResult.status === "fulfilled") {{
+      stderrText = stderrResult.value;
+      if (stderrText.readFailure) collectionFailures.push(`stderr read failed: ${{stderrText.readFailure}}`);
+    }} else {{
+      collectionFailures.push(`stderr read failed: ${{describeChildCollectionFailure(stderrResult.reason)}}`);
+    }}
+    let exitCode: unknown = undefined;
+    if (exitResult.status === "fulfilled") {{
+      exitCode = exitResult.value;
+    }} else if (exitResult.reason !== DCG_OBSERVATION_ABORTED) {{
+      collectionFailures.push(`exit status failed: ${{describeChildCollectionFailure(exitResult.reason)}}`);
+    }}
+    if (observationBoundary === "pipe-drain") {{
+      collectionFailures.push(
+        `child pipes exceeded the ${{DCG_CHILD_PIPE_DRAIN_GRACE_MS}}-millisecond post-exit drain grace`,
+      );
+    }} else if (observationBoundary === "hard-deadline") {{
+      collectionFailures.push(
+        `child observation exceeded the ${{DCG_CHILD_OBSERVATION_TIMEOUT_MS}}-millisecond outer deadline`,
+      );
+    }}
+    if (observationKillFailure) {{
+      collectionFailures.push(`direct-child SIGKILL failed: ${{observationKillFailure}}`);
+    }}
+    // Bun populates `signalCode` only after termination. Read it after both
+    // pipes and `.exited` have independently settled so an early rejection of
+    // the exit observation cannot hide a later signal that arrives before EOF.
+    // The property is synchronous; retain a throwing getter as its own fault.
+    let signalCode: unknown = undefined;
+    try {{
+      signalCode = proc.signalCode;
+      if (signalCode !== null && !isDcgSignalCode(signalCode)) {{
+        // Never echo an invalid runtime value: control characters could forge
+        // a diagnostic line. Its type is enough to identify the contract fault.
+        collectionFailures.push(`signal status invalid: ${{typeof signalCode}}`);
+      }}
+    }} catch (reason) {{
+      collectionFailures.push(`signal status failed: ${{describeChildCollectionFailure(reason)}}`);
+    }}
+
+    // Treat the two child streams as separate capabilities: stdout alone may
+    // carry the robot decision; stderr is diagnostic-only but never discarded.
+    // An overflow is itself a conservative block. Never parse a retained JSON
+    // prefix: it might be a complete allow followed by a discarded denial.
+    const childOutcome = childOutcomeFromTermination(exitCode, signalCode);
+    const classification = stdoutText.overflowed
+      ? {{ action: "block" as const, output: {{ verdict: "unknown" as const }} }}
+      : classifyDcgChild(childOutcome, stdoutText.text);
+    const stderrDetail = visibleStderrDetail(stderrText);
+    const protocolDetail = stdoutText.overflowed
+      ? ""
+      : classification.output.framedBlockingWitness
+        ? "dcg stdout contained extra or incomplete data around a complete blocking verdict"
+        : classification.output.verdict === "malformed"
+          ? "dcg stdout was malformed"
+          : classification.output.verdict === "unknown"
+            ? "dcg stdout carried an unrecognized decision"
+            : "";
+    if (stdoutText.overflowed) {{
+      console.error(`[dcg] OMP guard dcg stdout exceeded ${{DCG_STDOUT_MAX_BYTES}}-byte safety-verdict cap; blocking conservatively`);
+    }}
+    const hasInfrastructureDiagnostic =
+      classification.action === "infrastructure" ||
+      childOutcome === "exit-other" ||
+      isDcgSignalCode(signalCode) ||
+      Boolean(protocolDetail) ||
+      collectionFailures.length > 0;
+    if (hasInfrastructureDiagnostic) {{
+      const terminationDetail = childTerminationDetail(exitCode, signalCode);
+      const details = boundedDiagnosticText([protocolDetail, stderrDetail, ...collectionFailures].filter(Boolean).join("; "));
+      console.error(`[dcg] OMP guard infrastructure failure${{terminationDetail}}${{details ? `: ${{details}}` : ""}}`);
+      // A collection fault is not allowed to erase a completed deny-like
+      // stdout verdict or the independent blocking exit-1 signal.
+      if (classification.action !== "block") return;
+    }}
+    if (!hasInfrastructureDiagnostic && stderrDetail) {{
+      console.error(`[dcg] OMP guard dcg stderr: ${{stderrDetail}}`);
+    }}
+    if (classification.action === "allow") return;
+
+    const output = classification.output;
+    const reason = stdoutText.overflowed
+      ? `Blocked by dcg because evaluator stdout exceeded the ${{DCG_STDOUT_MAX_BYTES}}-byte safety-verdict cap`
+      : BLOCKING_DECISIONS.has(output.verdict)
+        ? output.reason || "Blocked by dcg"
+        : "Blocked by dcg (exit 1 without a blocking decision)";
+    const rule = output.ruleId ? `\n\nRule: ${{output.ruleId}}` : "";
+    return {{ block: true, reason: `${{reason}}${{rule}}` }};
+  }});
+}}
+"#
+    ))
+}
+
+/// Whether this machine plausibly uses OMP. This gates doctor output so users
+/// without OMP are not prompted to install an irrelevant extension.
+fn omp_appears_in_use() -> bool {
+    if std::env::var_os("OMP_PROFILE").is_some()
+        || std::env::var_os("PI_PROFILE").is_some()
+        || which_executable("omp").is_some()
+    {
+        return true;
+    }
+    let default_root_exists = dirs::home_dir().is_some_and(|home| home.join(".omp").is_dir());
+    default_root_exists
+        || omp_user_agent_dir().is_ok_and(|path| path.is_dir())
+        || project_omp_extension_path()
+            .is_ok_and(|path| omp_extension_entry_exists(&path).unwrap_or(true))
+}
+
+fn omp_extension_text_is_dcg_owned(content: &str) -> bool {
+    content.contains(OMP_EXTENSION_MARKER)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OmpExtensionInspection {
+    Absent,
+    Foreign,
+    OwnedUnhealthy,
+    Healthy,
+}
+
+/// Test whether the final extension directory entry exists without following
+/// it. `Path::exists` follows symlinks, so it would mistake a dangling link for
+/// an absent path and incorrectly grant the installer authority to replace it.
+fn omp_extension_entry_exists(path: &std::path::Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(std::io::Error::new(
+            error.kind(),
+            format!("could not inspect {}: {error}", path.display()),
+        )),
+    }
+}
+
+fn read_omp_extension_entry(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    std::fs::read(path).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("could not inspect {}: {error}", path.display()),
+        )
+    })
+}
+
+fn inspect_omp_extension(
+    path: &std::path::Path,
+    expected_source: &str,
+) -> std::io::Result<OmpExtensionInspection> {
+    if !omp_extension_entry_exists(path)? {
+        return Ok(OmpExtensionInspection::Absent);
+    }
+    let content = read_omp_extension_entry(path)?;
+
+    if content == expected_source.as_bytes() {
+        Ok(OmpExtensionInspection::Healthy)
+    } else if std::str::from_utf8(&content).is_ok_and(omp_extension_text_is_dcg_owned) {
+        Ok(OmpExtensionInspection::OwnedUnhealthy)
+    } else {
+        Ok(OmpExtensionInspection::Foreign)
+    }
+}
+
+#[derive(Debug)]
+enum OmpExtensionRegistration {
+    Healthy(std::path::PathBuf),
+    OwnedUnhealthy {
+        path: std::path::PathBuf,
+        project: bool,
+    },
+    Missing,
+}
+
+/// Inspect the project and active-profile extension paths OMP actually loads.
+/// A marker grants overwrite/removal authority, but only exact generated bytes
+/// prove that the bridge is current and enabled.
+fn registered_omp_extension() -> std::io::Result<OmpExtensionRegistration> {
+    // Validate the live profile environment before doctor claims that OMP can
+    // start and load either extension.
+    let _validated_profile = omp_active_profile()?;
+    let executable = current_dcg_executable()?;
+    let expected_source = build_omp_extension_source(&executable)?;
+
+    let project_path = project_omp_extension_path()?;
+    let project_state = inspect_omp_extension(&project_path, &expected_source)?;
+    let user_path = omp_user_extension_path()?;
+    let user_state = inspect_omp_extension(&user_path, &expected_source)?;
+
+    // OMP loads both locations. A current copy at one scope must not hide a
+    // stale dcg-owned copy at the other scope: both callbacks would run.
+    if project_state == OmpExtensionInspection::OwnedUnhealthy {
+        return Ok(OmpExtensionRegistration::OwnedUnhealthy {
+            path: project_path,
+            project: true,
+        });
+    }
+    if user_state == OmpExtensionInspection::OwnedUnhealthy {
+        return Ok(OmpExtensionRegistration::OwnedUnhealthy {
+            path: user_path,
+            project: false,
+        });
+    }
+    if project_state == OmpExtensionInspection::Healthy {
+        return Ok(OmpExtensionRegistration::Healthy(project_path));
+    }
+    if user_state == OmpExtensionInspection::Healthy {
+        return Ok(OmpExtensionRegistration::Healthy(user_path));
+    }
+
+    Ok(OmpExtensionRegistration::Missing)
+}
+
+/// Refresh every dcg-owned unhealthy extension OMP will load. There are only
+/// two authoritative scopes (project and active user/profile), so two attempts
+/// are a complete bound rather than an open-ended repair loop. Each install
+/// independently rechecks marker ownership before its atomic replacement.
+fn refresh_loaded_owned_omp_extensions(
+    first_project: bool,
+    announce: bool,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut project = first_project;
+    for refreshed in 1..=2 {
+        install_omp_extension(true, project, announce)?;
+        match registered_omp_extension()? {
+            OmpExtensionRegistration::Healthy(_) => return Ok(refreshed),
+            OmpExtensionRegistration::OwnedUnhealthy {
+                project: next_project,
+                ..
+            } => project = next_project,
+            OmpExtensionRegistration::Missing => {
+                return Err("OMP extension disappeared while doctor was refreshing it".into());
+            }
+        }
+    }
+
+    Err("OMP extensions remained unhealthy after refreshing both loaded scopes".into())
 }
 
 /// Shared doctor verdict for the build-provenance / update-pin check (#320),
@@ -12258,7 +13982,7 @@ fn install_opencode_plugin(force: bool, project: bool) -> Result<(), Box<dyn std
     if let Some(parent) = plugin_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&plugin_path, source)?;
+    write_settings_atomic(&plugin_path, &source)?;
 
     let level = if project { "project" } else { "user" };
     println!(
@@ -12271,6 +13995,65 @@ fn install_opencode_plugin(force: bool, project: bool) -> Result<(), Box<dyn std
         "{}",
         "Restart OpenCode (start a new session) for the plugin to load.".yellow()
     );
+    Ok(())
+}
+
+/// Install the native Oh My Pi ExtensionAPI guard. `announce` is false when a
+/// structured doctor renderer owns stdout; ordinary install and pretty doctor
+/// keep the existing human-facing progress output.
+fn install_omp_extension(
+    force: bool,
+    project: bool,
+    announce: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    let extension_path = if project {
+        // Project extension discovery is cwd-only, but OMP still resolves and
+        // validates its active profile before loading any project extension.
+        let _validated_profile = omp_active_profile()?;
+        project_omp_extension_path()?
+    } else {
+        omp_user_extension_path()?
+    };
+
+    if omp_extension_entry_exists(&extension_path)? {
+        let existing = read_omp_extension_entry(&extension_path)?;
+        if !std::str::from_utf8(&existing).is_ok_and(omp_extension_text_is_dcg_owned) {
+            return Err(format!(
+                "{} exists but was not generated by dcg (missing the '{OMP_EXTENSION_MARKER}' \
+                 marker). Refusing to overwrite a user-owned extension — move it aside or merge \
+                 the dcg guard into it manually.",
+                extension_path.display()
+            )
+            .into());
+        }
+        if !force {
+            if announce {
+                println!("{}", "OMP extension already installed!".yellow());
+                println!("Use --force to reinstall");
+            }
+            return Ok(());
+        }
+    }
+
+    let executable = current_dcg_executable()?;
+    let source = build_omp_extension_source(&executable)?;
+    if let Some(parent) = extension_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    write_settings_atomic(&extension_path, &source)?;
+
+    if announce {
+        let level = if project { "project" } else { "user/profile" };
+        println!("{}", "OMP extension installed successfully!".green().bold());
+        println!("Extension written ({level}): {}", extension_path.display());
+        println!();
+        println!(
+            "{}",
+            "Restart Oh My Pi (start a new session) for the extension to load.".yellow()
+        );
+    }
     Ok(())
 }
 
@@ -12895,6 +14678,24 @@ fn verify_installer_checksum(
     }
 }
 
+fn require_verified_installer(
+    script_path: &std::path::Path,
+    checksum_path: &std::path::Path,
+    artifact_name: &str,
+    checksum_downloaded: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !checksum_downloaded {
+        return Err(format!(
+            "{artifact_name}.sha256 is required; refusing to execute an unverified installer"
+        )
+        .into());
+    }
+
+    verify_installer_checksum(script_path, checksum_path, artifact_name)?;
+    eprintln!("dcg update: {artifact_name} sha256 verified.");
+    Ok(())
+}
+
 fn download_verified_installer(
     script_url: &str,
     sha_url: &str,
@@ -12905,14 +14706,13 @@ fn download_verified_installer(
     let checksum_path = temp_dir.path().join(format!("{artifact_name}.sha256"));
 
     download_file(script_url, &script_path)?;
-    if try_download_file(sha_url, &checksum_path)? {
-        verify_installer_checksum(&script_path, &checksum_path, artifact_name)?;
-        eprintln!("dcg update: {artifact_name} sha256 verified.");
-    } else {
-        eprintln!(
-            "dcg update: {artifact_name}.sha256 not published for this tag; proceeding without verification."
-        );
-    }
+    let checksum_downloaded = try_download_file(sha_url, &checksum_path)?;
+    require_verified_installer(
+        &script_path,
+        &checksum_path,
+        artifact_name,
+        checksum_downloaded,
+    )?;
 
     Ok((temp_dir, script_path))
 }
@@ -12922,18 +14722,17 @@ fn self_update_unix(update: UpdateCommand) -> Result<(), Box<dyn std::error::Err
     // requested version, or from the latest release for the default update path
     // (not whatever is on `main`).
     //
-    // Per `git_safety_guard-ythp`, we additionally download install.sh to a
-    // temp file and verify install.sh.sha256 when the matching release
-    // publishes it. Older tags will not have the checksum; we warn and proceed
-    // to preserve the update path for stale binaries.
+    // Download the tag-pinned installer to a temp file and require the matching
+    // release checksum before executing it. A missing checksum fails closed:
+    // the installer itself is executable code, so archive verification later
+    // in that script cannot repair an unverified handoff.
     let requested_version = update.version.clone();
     let normalized_tag = update_installer_tag(requested_version.as_deref())?;
     let script_url = format!(
         "https://raw.githubusercontent.com/Pimpmuckl/destructive_command_guard/{normalized_tag}/install.sh"
     );
-    // Releases-download URL where install.sh.sha256 is published from
-    // dist.yml. Pre-ythp tags will 404 here; the verification step
-    // detects that and warns rather than aborting.
+    // Releases-download URL where the DSR release contract publishes
+    // install.sh.sha256.
     let sha_url = format!(
         "https://github.com/Pimpmuckl/destructive_command_guard/releases/download/{normalized_tag}/install.sh.sha256"
     );
@@ -13358,10 +15157,16 @@ fn config_path() -> std::path::PathBuf {
 
 /// Check if dcg is in PATH
 fn which_dcg() -> Option<std::path::PathBuf> {
-    // The installed binary is `dcg.exe` on Windows and `dcg` elsewhere. Probe for
-    // the platform-correct filename (`EXE_SUFFIX` is ".exe" on Windows, "" on
-    // Unix), otherwise `dcg doctor` reports a false "NOT FOUND in PATH" on Windows.
-    let exe_name = format!("dcg{}", std::env::consts::EXE_SUFFIX);
+    which_executable("dcg")
+}
+
+/// Find a native executable in PATH using the platform's executable suffix.
+/// OMP and dcg both ship native `.exe` files on Windows rather than command
+/// shims, so the same exact lookup is appropriate for doctor discovery.
+fn which_executable(name: &str) -> Option<std::path::PathBuf> {
+    // Probe for the platform-correct filename (`EXE_SUFFIX` is ".exe" on
+    // Windows and empty on Unix), otherwise native executables appear missing.
+    let exe_name = format!("{name}{}", std::env::consts::EXE_SUFFIX);
     std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths).find_map(|dir| {
             let path = dir.join(&exe_name);
@@ -14012,11 +15817,7 @@ fn run_smoke_test(config: &Config) -> bool {
         &allowlists,
         &heredoc_settings,
     );
-    if deny_result.is_allowed() {
-        return false;
-    }
-
-    true
+    !deny_result.is_allowed()
 }
 
 // ============================================================================
@@ -14151,9 +15952,7 @@ fn resolve_layer(project: bool, user: bool) -> AllowlistLayer {
 }
 
 fn project_allowlist_is_trusted() -> bool {
-    std::env::current_dir()
-        .ok()
-        .is_some_and(|cwd| crate::config::explicitly_trusts_project_policy(&cwd))
+    std::env::current_dir().is_ok_and(|cwd| crate::config::explicitly_trusts_project_policy(&cwd))
 }
 
 fn ensure_allowlist_layer_is_writable(
@@ -16858,6 +18657,165 @@ fn dev_generate_fixtures(
 mod tests {
     use super::*;
 
+    fn robot_history_deny_fixture() -> EvaluationResult {
+        EvaluationResult::denied_by_pack_pattern(
+            "core.git",
+            "reset-hard",
+            "test denial",
+            None,
+            PackSeverity::Critical,
+            &[],
+        )
+    }
+
+    #[test]
+    fn robot_history_is_enabled_only_for_the_robot_integration_boundary() {
+        assert!(should_record_robot_history(true, true));
+        assert!(
+            !should_record_robot_history(false, true),
+            "human dcg test diagnostics must not pollute persistent command history"
+        );
+        assert!(
+            !should_record_robot_history(true, false),
+            "disabled history must not construct a writer"
+        );
+    }
+
+    #[test]
+    fn robot_history_preserves_agent_attribution_and_final_policy_outcome() {
+        let denied = robot_history_deny_fixture();
+        let cases = [
+            (DecisionMode::Deny, Outcome::Deny),
+            (DecisionMode::Ask, Outcome::Deny),
+            (DecisionMode::Warn, Outcome::Warn),
+            (DecisionMode::Log, Outcome::Allow),
+        ];
+
+        for (mode, expected) in cases {
+            let entry = build_robot_history_entry(
+                "omp",
+                "git reset --hard HEAD",
+                "/tmp/omp-project",
+                &denied,
+                Some(mode),
+                std::time::Duration::from_micros(41),
+            );
+            assert_eq!(entry.agent_type, "omp");
+            assert_eq!(entry.outcome, expected, "mode {mode:?}");
+            assert_eq!(entry.pack_id.as_deref(), Some("core.git"));
+            assert_eq!(entry.pattern_name.as_deref(), Some("reset-hard"));
+            assert_eq!(entry.eval_duration_us, 41);
+        }
+
+        let codex = build_robot_history_entry(
+            "codex-cli",
+            "git reset --hard HEAD",
+            "/tmp/codex-project",
+            &denied,
+            Some(DecisionMode::Deny),
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(
+            codex.agent_type, "codex-cli",
+            "OMP attribution must come from explicit agent detection, not a hard-coded label"
+        );
+    }
+
+    #[test]
+    fn robot_history_uses_the_final_allow_and_conservative_indeterminate_states() {
+        let denied = robot_history_deny_fixture();
+        let mut forced_allow = denied.clone();
+        forced_allow.decision = EvaluationDecision::Allow;
+        forced_allow.bypass_method = Some(crate::evaluator::BypassMethod::Force);
+        let forced_entry = build_robot_history_entry(
+            "omp",
+            "git reset --hard HEAD",
+            "/tmp/omp-project",
+            &forced_allow,
+            Some(DecisionMode::Deny),
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(forced_entry.outcome, Outcome::Allow);
+        assert_eq!(forced_entry.pack_id.as_deref(), Some("core.git"));
+        assert_eq!(forced_entry.pattern_name.as_deref(), Some("reset-hard"));
+
+        let indeterminate = EvaluationResult::indeterminate_due_to_budget();
+        let indeterminate_entry = build_robot_history_entry(
+            "omp",
+            "candidate command",
+            "/tmp/omp-project",
+            &indeterminate,
+            None,
+            std::time::Duration::from_millis(10),
+        );
+        assert_eq!(indeterminate_entry.outcome, Outcome::Deny);
+        assert_eq!(
+            indeterminate_entry.pack_id.as_deref(),
+            Some(ROBOT_INDETERMINATE_HISTORY_PACK)
+        );
+        assert_eq!(
+            indeterminate_entry.pattern_name.as_deref(),
+            Some(ROBOT_INDETERMINATE_HISTORY_PATTERN)
+        );
+    }
+
+    #[test]
+    fn robot_history_retains_allowlist_provenance() {
+        let matched = robot_history_deny_fixture()
+            .pattern_info
+            .expect("deny fixture has pattern metadata");
+        let allowed = EvaluationResult::allowed_by_allowlist(
+            matched,
+            crate::allowlist::AllowlistLayer::Agent,
+            "OMP profile allowlist".to_string(),
+        );
+        let entry = build_robot_history_entry(
+            "omp",
+            "git reset --hard HEAD",
+            "/tmp/omp-project",
+            &allowed,
+            Some(DecisionMode::Deny),
+            std::time::Duration::ZERO,
+        );
+
+        assert_eq!(entry.outcome, Outcome::Allow);
+        assert_eq!(entry.pack_id.as_deref(), Some("core.git"));
+        assert_eq!(entry.pattern_name.as_deref(), Some("reset-hard"));
+        assert_eq!(entry.allowlist_layer.as_deref(), Some("agent"));
+    }
+
+    /// #335: `dcg doctor` counted the raw enabled-pack set, which carries the
+    /// bare `core` category marker, while `dcg packs --enabled` lists the two
+    /// registry leaves it expands into. The two numbers must agree.
+    #[test]
+    fn doctor_pack_count_matches_packs_enabled_listing() {
+        let config = crate::config::Config::default();
+        let enabled = config.enabled_pack_ids();
+
+        let doctor_count = REGISTRY.expand_enabled_ordered(&enabled).len();
+        let listing_count = REGISTRY
+            .list_packs(&enabled)
+            .iter()
+            .filter(|info| info.enabled)
+            .count();
+
+        assert_eq!(
+            doctor_count, listing_count,
+            "doctor's pack count must match what `dcg packs --enabled` lists"
+        );
+
+        // The marker is why the raw set was the wrong thing to count: it is
+        // present, is not a registry pack, and stands in for two that are.
+        assert!(
+            enabled.contains("core"),
+            "core marker is expected in the raw set"
+        );
+        assert!(
+            REGISTRY.get_entry("core").is_none(),
+            "core is a category marker, not a registry pack"
+        );
+    }
+
     /// The shell startup check self-repairs a stale marker-guarded block
     /// instead of skipping it (the Unix analog of install.ps1's #282 fix).
     #[cfg(unix)]
@@ -17427,6 +19385,19 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_parse_create_new_requires_exactly_one_path() {
+        let cli = Cli::try_parse_from(["dcg", "create-new", "artifact.bin"])
+            .expect("parse create-new path");
+        let Some(Command::CreateNew { path }) = cli.command else {
+            unreachable!("Expected CreateNew command");
+        };
+        assert_eq!(path, std::path::PathBuf::from("artifact.bin"));
+
+        assert!(Cli::try_parse_from(["dcg", "create-new"]).is_err());
+        assert!(Cli::try_parse_from(["dcg", "create-new", "one", "two"]).is_err());
+    }
+
+    #[test]
     fn test_cli_parse_packs() {
         let cli = Cli::parse_from(["dcg", "packs"]);
         assert!(matches!(cli.command, Some(Command::ListPacks { .. })));
@@ -17490,6 +19461,81 @@ mod tests {
         }
         assert!(Cli::try_parse_from(["dcg", "test"]).is_err());
         assert!(Cli::try_parse_from(["dcg", "test", "--stdin", "git status"]).is_err());
+    }
+
+    #[test]
+    fn test_stdin_reader_preserves_raw_omp_bytes_but_keeps_human_line_mode() {
+        let raw = "printf 'control'\0\t\u{1b}\n🛸\\\r\n";
+
+        let omp = read_test_command(std::io::Cursor::new(raw.as_bytes()), raw.len(), true)
+            .expect("private OMP stdin accepts valid UTF-8 shell source");
+        assert_eq!(omp.as_bytes(), raw.as_bytes());
+
+        let human = read_test_command(std::io::Cursor::new(raw.as_bytes()), raw.len(), false)
+            .expect("human line-oriented stdin accepts the same source");
+        assert_eq!(human.as_bytes(), &raw.as_bytes()[..raw.len() - 2]);
+        assert_ne!(
+            omp, human,
+            "restoring unconditional terminal-CRLF trimming must make this test fail"
+        );
+
+        let newline_only = read_test_command(std::io::Cursor::new(b"\n"), 1, true)
+            .expect("OMP newline-only shell no-op remains a command");
+        assert_eq!(newline_only.as_bytes(), b"\n");
+        assert_eq!(
+            read_test_command(std::io::Cursor::new(b"echo ok\n\n"), 9, false)
+                .expect("human stdin removes exactly one line ending")
+                .as_bytes(),
+            b"echo ok\n"
+        );
+    }
+
+    #[test]
+    fn test_stdin_reader_bounds_and_utf8_errors_remain_conservative() {
+        let at_limit = "🛸\0\n";
+        assert_eq!(
+            read_test_command(
+                std::io::Cursor::new(at_limit.as_bytes()),
+                at_limit.len(),
+                true,
+            )
+            .expect("exact byte limit is accepted")
+            .as_bytes(),
+            at_limit.as_bytes()
+        );
+
+        let configured_limit = crate::config::DEFAULT_MAX_COMMAND_BYTES;
+        let exact_limit = vec![b'x'; configured_limit];
+        assert_eq!(
+            read_test_command(
+                std::io::Cursor::new(exact_limit.as_slice()),
+                configured_limit,
+                true,
+            )
+            .expect("the shipped byte limit is accepted exactly")
+            .len(),
+            configured_limit
+        );
+
+        let over_limit_bytes = vec![b'x'; configured_limit + 1];
+        let over_limit = read_test_command(
+            std::io::Cursor::new(over_limit_bytes.as_slice()),
+            configured_limit,
+            true,
+        )
+        .expect_err("one byte over the limit must fail");
+        assert_eq!(over_limit.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            over_limit
+                .to_string()
+                .contains("exceeds general.max_command_bytes")
+        );
+
+        let invalid_utf8 =
+            read_test_command(std::io::Cursor::new([0xf0, 0x28, 0x8c, 0x28]), 4, true)
+                .expect_err("non-UTF-8 stdin must fail instead of being lossily decoded");
+        assert_eq!(invalid_utf8.kind(), std::io::ErrorKind::InvalidData);
+        assert!(invalid_utf8.to_string().contains("not valid UTF-8"));
     }
 
     #[test]
@@ -17812,6 +19858,40 @@ mod tests {
     }
 
     #[test]
+    fn update_installer_refuses_missing_checksum() {
+        let temp_dir = InstallerTempDir::create().unwrap();
+        let script_path = temp_dir.path().join("install.ps1");
+        let checksum_path = temp_dir.path().join("install.ps1.sha256");
+        std::fs::write(&script_path, "Write-Host verified\n").unwrap();
+
+        let error = require_verified_installer(&script_path, &checksum_path, "install.ps1", false)
+            .expect_err("missing installer checksum must fail closed");
+
+        assert!(error.to_string().contains("install.ps1.sha256 is required"));
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to execute an unverified installer")
+        );
+    }
+
+    #[test]
+    fn update_installer_accepts_matching_checksum() {
+        let temp_dir = InstallerTempDir::create().unwrap();
+        let script_path = temp_dir.path().join("install.sh");
+        let checksum_path = temp_dir.path().join("install.sh.sha256");
+        let script = b"#!/bin/sh\necho verified\n";
+        std::fs::write(&script_path, script).unwrap();
+        std::fs::write(
+            &checksum_path,
+            "9c76ec33e2b9013ce136f3bf6750ce60f6a40def87b4a724c89c7d55af27b4f7  install.sh\n",
+        )
+        .unwrap();
+
+        require_verified_installer(&script_path, &checksum_path, "install.sh", true).unwrap();
+    }
+
+    #[test]
     fn windows_update_runner_waits_before_replacing_the_binary() {
         let wait = WINDOWS_UPDATE_RUNNER
             .find("Wait-Process")
@@ -17928,6 +20008,7 @@ if ($errors.Count -ne 0) {
             grok,
             agy,
             opencode,
+            omp,
         }) = cli.command
         {
             assert!(!force);
@@ -17935,6 +20016,7 @@ if ($errors.Count -ne 0) {
             assert!(!grok);
             assert!(!agy);
             assert!(!opencode);
+            assert!(!omp);
         } else {
             unreachable!("Expected Install command");
         }
@@ -17949,6 +20031,7 @@ if ($errors.Count -ne 0) {
             grok,
             agy,
             opencode,
+            omp,
         }) = cli.command
         {
             assert!(force);
@@ -17956,6 +20039,7 @@ if ($errors.Count -ne 0) {
             assert!(!grok);
             assert!(!agy);
             assert!(!opencode);
+            assert!(!omp);
         } else {
             unreachable!("Expected Install command");
         }
@@ -17970,6 +20054,7 @@ if ($errors.Count -ne 0) {
             grok,
             agy,
             opencode,
+            omp,
         }) = cli.command
         {
             assert!(!force);
@@ -17977,6 +20062,7 @@ if ($errors.Count -ne 0) {
             assert!(grok);
             assert!(!agy);
             assert!(!opencode);
+            assert!(!omp);
         } else {
             unreachable!("Expected Install command");
         }
@@ -17991,6 +20077,7 @@ if ($errors.Count -ne 0) {
             grok,
             agy,
             opencode,
+            omp,
         }) = cli.command
         {
             assert!(!force);
@@ -17998,6 +20085,7 @@ if ($errors.Count -ne 0) {
             assert!(grok);
             assert!(!agy);
             assert!(!opencode);
+            assert!(!omp);
         } else {
             unreachable!("Expected Install command");
         }
@@ -18012,6 +20100,7 @@ if ($errors.Count -ne 0) {
             grok,
             agy,
             opencode,
+            omp,
         }) = cli.command
         {
             assert!(!force);
@@ -18019,6 +20108,7 @@ if ($errors.Count -ne 0) {
             assert!(!grok);
             assert!(agy);
             assert!(!opencode);
+            assert!(!omp);
         } else {
             unreachable!("Expected Install command");
         }
@@ -18033,6 +20123,7 @@ if ($errors.Count -ne 0) {
             grok,
             agy,
             opencode,
+            omp,
         }) = cli.command
         {
             assert!(!force);
@@ -18040,6 +20131,7 @@ if ($errors.Count -ne 0) {
             assert!(!grok);
             assert!(agy);
             assert!(!opencode);
+            assert!(!omp);
         } else {
             unreachable!("Expected Install command");
         }
@@ -18054,6 +20146,7 @@ if ($errors.Count -ne 0) {
             grok,
             agy,
             opencode,
+            omp,
         }) = cli.command
         {
             assert!(!force);
@@ -18061,6 +20154,7 @@ if ($errors.Count -ne 0) {
             assert!(!grok);
             assert!(!agy);
             assert!(opencode);
+            assert!(!omp);
         } else {
             unreachable!("Expected Install command");
         }
@@ -18075,6 +20169,7 @@ if ($errors.Count -ne 0) {
             grok,
             agy,
             opencode,
+            omp,
         }) = cli.command
         {
             assert!(force);
@@ -18082,8 +20177,49 @@ if ($errors.Count -ne 0) {
             assert!(!grok);
             assert!(!agy);
             assert!(opencode);
+            assert!(!omp);
         } else {
             unreachable!("Expected Install command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_install_omp_with_project_and_force() {
+        let cli = Cli::parse_from(["dcg", "install", "--omp", "--project", "--force"]);
+        if let Some(Command::Install {
+            force,
+            project,
+            grok,
+            agy,
+            opencode,
+            omp,
+        }) = cli.command
+        {
+            assert!(force);
+            assert!(project);
+            assert!(!grok);
+            assert!(!agy);
+            assert!(!opencode);
+            assert!(omp);
+        } else {
+            unreachable!("Expected Install command");
+        }
+    }
+
+    #[test]
+    fn install_agent_targets_are_mutually_exclusive() {
+        for (left, right) in [
+            ("--grok", "--agy"),
+            ("--grok", "--opencode"),
+            ("--grok", "--omp"),
+            ("--agy", "--opencode"),
+            ("--agy", "--omp"),
+            ("--opencode", "--omp"),
+        ] {
+            assert!(
+                Cli::try_parse_from(["dcg", "install", left, right]).is_err(),
+                "install must reject conflicting targets {left} and {right}"
+            );
         }
     }
 
@@ -18118,6 +20254,3042 @@ if ($errors.Count -ne 0) {
         assert_ne!(parsed, "dcg", "never a bare PATH lookup");
         // An `ask` verdict must fail closed (OpenCode has no review UI).
         assert!(source.contains("verdict === \"deny\" || verdict === \"ask\""));
+    }
+
+    /// Real filesystem regression for the no-follow ownership preflight. The
+    /// caller supplies a fresh persistent directory so the evidence survives
+    /// the run and this test never needs deletion-based cleanup:
+    /// `DCG_OMP_PATH_ALIAS_ROOT=/fresh/persistent/path cargo test --lib \
+    /// cli::tests::omp_install_refuses_a_dangling_final_symlink -- --ignored --exact`.
+    #[test]
+    #[cfg(unix)]
+    #[ignore = "requires a caller-owned fresh persistent evidence directory"]
+    fn omp_install_refuses_a_dangling_final_symlink() {
+        let root = std::env::var_os("DCG_OMP_PATH_ALIAS_ROOT")
+            .map(std::path::PathBuf::from)
+            .expect("DCG_OMP_PATH_ALIAS_ROOT must name a fresh persistent directory");
+        std::fs::create_dir(&root).expect("create fresh persistent path-alias root");
+        let isolated_home = root.join("isolated-home");
+        std::fs::create_dir(&isolated_home).expect("create isolated OMP detection home");
+        let extension_path = root.join(".omp/extensions/dcg-guard.ts");
+        std::fs::create_dir_all(extension_path.parent().expect("extension parent"))
+            .expect("create extension directory");
+        let dangling_target = root.join("foreign-target-does-not-exist.ts");
+        std::os::unix::fs::symlink(&dangling_target, &extension_path)
+            .expect("plant foreign dangling extension symlink");
+
+        assert!(
+            omp_extension_entry_exists(&extension_path).expect("lstat extension entry"),
+            "a dangling final symlink is an occupied directory entry"
+        );
+        assert!(
+            inspect_omp_extension(&extension_path, "expected generated bytes").is_err(),
+            "doctor inspection must not downgrade an uninspectable entry to Absent"
+        );
+
+        let original_dir = std::env::current_dir().expect("current directory before probe");
+        std::env::set_current_dir(&root).expect("enter persistent project fixture");
+        assert_eq!(
+            dirs::home_dir().as_deref(),
+            Some(isolated_home.as_path()),
+            "run this gate with HOME bound to its isolated-home fixture"
+        );
+        for variable in [
+            "OMP_PROFILE",
+            "PI_PROFILE",
+            "PI_CONFIG_DIR",
+            "PI_CODING_AGENT_DIR",
+        ] {
+            assert!(
+                std::env::var_os(variable).is_none(),
+                "run this gate with {variable} removed"
+            );
+        }
+        assert!(
+            which_executable("omp").is_none(),
+            "the regression PATH must not contain an unrelated OMP executable"
+        );
+        assert!(
+            !isolated_home.join(".omp").is_dir(),
+            "the isolated home must not independently trigger OMP detection"
+        );
+        assert!(
+            omp_appears_in_use(),
+            "doctor must notice a dangling project extension without any other OMP signal"
+        );
+        let ordinary_install = install_omp_extension(false, true, false);
+        let forced_install = install_omp_extension(true, true, false);
+        let doctor_inspection = registered_omp_extension();
+        let doctor_fix = refresh_loaded_owned_omp_extensions(true, false);
+        std::env::set_current_dir(original_dir).expect("restore current directory after probe");
+
+        for (operation, refused) in [
+            ("ordinary install", ordinary_install.is_err()),
+            ("forced install", forced_install.is_err()),
+            ("doctor inspection", doctor_inspection.is_err()),
+            ("doctor fix", doctor_fix.is_err()),
+        ] {
+            assert!(refused, "{operation} must refuse the dangling entry");
+        }
+        assert!(
+            std::fs::symlink_metadata(&extension_path)
+                .expect("dangling extension entry remains")
+                .file_type()
+                .is_symlink(),
+            "no install or doctor path may replace the foreign symlink"
+        );
+        assert_eq!(
+            std::fs::read_link(&extension_path).expect("read preserved symlink target"),
+            dangling_target
+        );
+        assert!(
+            !dangling_target.exists(),
+            "the preserved link must remain dangling after every operation"
+        );
+    }
+
+    #[test]
+    fn omp_extension_source_has_native_blocking_contract() {
+        let executable = current_dcg_executable().expect("current executable");
+        let source = build_omp_extension_source(&executable).expect("extension generation");
+
+        assert!(source.contains(OMP_EXTENSION_MARKER));
+        assert!(source.contains("pi.on(\"tool_call\""));
+        // The bridge reads the tool name off the normalized `record`, not the
+        // raw `event`. The generator moved to that spelling when schema
+        // validation landed (fe2cb7b) and this assertion was left on the old
+        // one, so it has been failing against the source it checks ever since.
+        assert!(source.contains("record.toolName !== \"bash\""));
+        assert!(source.contains("\"--robot\", \"test\", \"--stdin\""));
+        assert!(source.contains("\"--agent\", \"omp\""));
+        assert!(
+            source.contains("\"--format\", \"json\",\n        \"--omp-bridge-output\","),
+            "the private robot bridge must pin compact JSON before Clap reads ambient DCG_FORMAT"
+        );
+        assert!(source.contains("\"deny\", \"ask\", \"indeterminate\""));
+        assert!(source.contains("return { block: true, reason:"));
+        assert!(source.contains("classifyDcgChild("));
+        assert!(
+            source.contains(
+                "import { resolveToCwd } from \"@oh-my-pi/pi-coding-agent/tools/path-utils\";"
+            ),
+            "the bridge must use OMP's own cwd resolver so tilde, absolute, relative, and workspace-root aliases match bash execution"
+        );
+        assert!(
+            source.contains(
+                "import { extractLeadingCdTarget } from \"@oh-my-pi/pi-coding-agent/tools/shell-tokenize\";"
+            ),
+            "OMP also derives cwd from a leading cd prefix when the structured cwd is absent"
+        );
+        assert!(
+            source.contains("pi.on(\"tool_call\", async (event, ctx) =>"),
+            "the callback context carries OMP's session cwd"
+        );
+        assert!(
+            source.contains(
+                "const requestedCwd = structuredCwd || extractLeadingCdTarget(command)?.path;"
+            ),
+            "the structured cwd must win, with OMP's exact leading-cd derivation as fallback"
+        );
+        assert!(
+            source.contains(
+                "commandCwd = requestedCwd ? resolveToCwd(requestedCwd, ctx.cwd) : ctx.cwd;"
+            ),
+            "each effective bash cwd must be resolved against the callback's session cwd"
+        );
+        assert!(
+            source.contains("cwd: commandCwd,"),
+            "dcg must run in the same effective cwd as the guarded bash call"
+        );
+
+        let line = source
+            .lines()
+            .find(|line| line.starts_with("const DCG_BIN = "))
+            .expect("extension embeds DCG_BIN");
+        let literal = line
+            .trim_start_matches("const DCG_BIN = ")
+            .trim_end_matches(';');
+        let parsed: String = serde_json::from_str(literal).expect("valid JSON string literal");
+        assert_eq!(std::path::Path::new(&parsed), executable);
+        assert_ne!(parsed, "dcg", "never a bare PATH lookup");
+        assert!(
+            source.contains(
+                "binds the guard to the install-time\n// absolute dcg pathname. It does not attest the bytes later resolved there;"
+            ),
+            "the generated artifact must describe its authority as pathname binding, not byte identity"
+        );
+        assert!(
+            !source.contains("exact dcg binary"),
+            "the generated artifact must not overstate pathname authority as byte identity"
+        );
+        assert!(
+            source.contains("proc = Bun.spawn([\n        DCG_BIN,"),
+            "the installed absolute executable must be the direct child capability"
+        );
+        assert!(
+            !source.contains("process.env.DCG_BIN"),
+            "ambient environment must not redirect the marker-owned OMP guard"
+        );
+    }
+
+    /// OMP must not wait forever when the evaluator process or one of its
+    /// inherited pipes wedges. Bun's native process timeout owns the direct
+    /// child, while one cleared JavaScript watchdog independently bounds exit
+    /// observation and post-exit pipe draining.
+    #[test]
+    fn omp_extension_source_bounds_the_child_evaluator() {
+        let executable = current_dcg_executable().expect("current executable");
+        let source = build_omp_extension_source(&executable).expect("extension generation");
+
+        const {
+            assert!(
+                OMP_CHILD_EVALUATION_TIMEOUT_MS
+                    > crate::perf::CAREFUL_COMPANY_HOOK_EVALUATION_BUDGET_MS,
+                "the bridge backstop must leave headroom above the largest shipped evaluator default"
+            );
+            assert!(
+                OMP_CHILD_EVALUATION_TIMEOUT_MS <= 60_000,
+                "a wedged evaluator must not stall an OMP bash call for more than one minute"
+            );
+        }
+        assert!(source.contains(&format!(
+            "const DCG_CHILD_TIMEOUT_MS = {OMP_CHILD_EVALUATION_TIMEOUT_MS};"
+        )));
+        assert!(source.contains(&format!(
+            "export const DCG_CHILD_PIPE_DRAIN_GRACE_MS = {OMP_CHILD_PIPE_DRAIN_GRACE_MS};"
+        )));
+        assert!(source.contains(&format!(
+            "export const DCG_CHILD_OBSERVATION_TIMEOUT_MS = {OMP_CHILD_OBSERVATION_TIMEOUT_MS};"
+        )));
+        assert!(source.contains("timeout: DCG_CHILD_TIMEOUT_MS,"));
+        assert!(source.contains("killSignal: \"SIGKILL\","));
+        assert!(
+            !source.contains("Promise.race("),
+            "a bare race would leave losing observations and rejections detached"
+        );
+        assert!(source.contains("let observationTimer = setTimeout("));
+        assert!(source.contains(
+            "const observationDeadline = performance.now() + DCG_CHILD_OBSERVATION_TIMEOUT_MS;"
+        ));
+        assert!(source.contains(
+            "const remainingHardBudget = Math.max(0, observationDeadline - performance.now());"
+        ));
+        assert!(source.contains(
+            "const pipeDrainWins = remainingHardBudget > DCG_CHILD_PIPE_DRAIN_GRACE_MS;"
+        ));
+        assert!(source.contains("Math.min(DCG_CHILD_PIPE_DRAIN_GRACE_MS, remainingHardBudget),"));
+        assert!(source.contains(
+            "() => abortObservation(pipeDrainWins ? \"pipe-drain\" : \"hard-deadline\", false),"
+        ));
+        assert!(source.contains("clearTimeout(observationTimer);"));
+        assert!(source.contains("observationFinished = true;"));
+        assert!(source.contains("observationAbort.abort(DCG_OBSERVATION_ABORTED);"));
+        assert!(source.contains("reader.cancel(DCG_OBSERVATION_ABORTED).catch(() => {});"));
+        assert!(source.contains("if (killChild) killFailure = killDcgChild(proc);"));
+
+        let spawn = source.find("proc = Bun.spawn").expect("dcg spawn");
+        let observe = source
+            .find("} = await observeDcgChild(proc);")
+            .expect("bounded child observation");
+        let classify = source
+            .find("const classification = stdoutText.overflowed")
+            .expect("monotone classifier");
+        assert!(
+            spawn < observe && observe < classify,
+            "the watchdog must start immediately after successful spawn and settle before classification"
+        );
+    }
+
+    /// The bridge's private robot envelope and both child pipes have explicit
+    /// byte ceilings. Collection must retain only observed bytes, keep draining
+    /// after overflow, and make overflow dominate any parseable prefix.
+    #[test]
+    fn omp_extension_source_bounds_streams_without_eager_cap_allocation() {
+        let executable = current_dcg_executable().expect("current executable");
+        let source = build_omp_extension_source(&executable).expect("extension generation");
+
+        let has_bounded_compact_contract = |candidate: &str| {
+            candidate.contains("\"--omp-bridge-output\",")
+                && candidate.contains(
+                    "collectBoundedText(\n        proc.stdout,\n        DCG_STDOUT_MAX_BYTES,\n        observationAbort.signal,"
+                )
+                && candidate.contains(
+                    "collectBoundedText(\n        proc.stderr,\n        DCG_STDERR_MAX_BYTES,\n        observationAbort.signal,"
+                )
+                && !candidate.contains("new Response(proc.stdout).text()")
+                && !candidate.contains("new Response(proc.stderr).text()")
+        };
+        assert!(has_bounded_compact_contract(&source));
+
+        let unbounded_collector_mutant = source
+            .replace(
+                "collectBoundedText(\n        proc.stdout,\n        DCG_STDOUT_MAX_BYTES,\n        observationAbort.signal,\n      )",
+                "new Response(proc.stdout).text()",
+            )
+            .replace(
+                "collectBoundedText(\n        proc.stderr,\n        DCG_STDERR_MAX_BYTES,\n        observationAbort.signal,\n      )",
+                "new Response(proc.stderr).text()",
+            );
+        assert!(
+            !has_bounded_compact_contract(&unbounded_collector_mutant),
+            "the source contract must reject the former unbounded `.text()` collectors"
+        );
+        let full_envelope_mutant = source.replacen("        \"--omp-bridge-output\",\n", "", 1);
+        assert!(
+            !has_bounded_compact_contract(&full_envelope_mutant),
+            "the source contract must reject restoring the command-echoing general robot envelope"
+        );
+
+        assert!(source.contains(&format!(
+            "export const DCG_STDOUT_MAX_BYTES = {OMP_CHILD_STDOUT_MAX_BYTES};"
+        )));
+        assert!(source.contains(&format!(
+            "export const DCG_STDERR_MAX_BYTES = {OMP_CHILD_STDERR_MAX_BYTES};"
+        )));
+        assert!(source.contains("\"--omp-bridge-output\","));
+        assert!(source.contains(
+            "proc.stdout,\n        DCG_STDOUT_MAX_BYTES,\n        observationAbort.signal,"
+        ));
+        assert!(source.contains(
+            "proc.stderr,\n        DCG_STDERR_MAX_BYTES,\n        observationAbort.signal,"
+        ));
+        assert!(source.contains("while (true) {"));
+        assert!(source.contains("const next = await reader.read();"));
+        assert!(source.contains("reader.releaseLock();"));
+        assert!(source.contains("let retained = new Uint8Array(0);"));
+        assert!(source.contains("const capacity = Math.min(maxBytes, Math.max(needed, doubled));"));
+        assert!(
+            !source.contains("new Uint8Array(maxBytes)"),
+            "the ordinary compact verdict must not reserve the full safety cap"
+        );
+        assert!(
+            !source.contains("new Response(proc.stdout).text()")
+                && !source.contains("new Response(proc.stderr).text()"),
+            "Response.text() buffers child output without the bridge's explicit limits"
+        );
+        assert!(source.contains("return command.length <= DCG_STDIN_CHUNK_CODE_UNITS"));
+        assert!(source.contains("stdin: commandStdin(command),"));
+        assert_eq!(
+            source.matches("new TextEncoder().encode(command)").count(),
+            1,
+            "only the bounded ordinary-command fast path may encode in one allocation"
+        );
+        assert!(source.contains(
+            "if (!cancellationRequested) readFailure = describeChildCollectionFailure(reason);"
+        ));
+        assert!(
+            source.contains("OMP guard could not run dcg: ${describeChildCollectionFailure(err)}")
+        );
+        assert_eq!(
+            source
+                .matches("${describeChildCollectionFailure(err)}")
+                .count(),
+            3,
+            "cwd, PTY-dialect, and spawn failures must all be bounded and total over hostile thrown values"
+        );
+        assert!(source.contains(
+            "if (stdoutText.readFailure) collectionFailures.push(`stdout read failed: ${stdoutText.readFailure}`);"
+        ));
+
+        let overflow = source
+            .find("const classification = stdoutText.overflowed")
+            .expect("overflow-first classification");
+        let parse = source[overflow..]
+            .find(": classifyDcgChild(")
+            .map(|offset| overflow + offset)
+            .expect("non-overflow classifier");
+        assert!(
+            overflow < parse,
+            "stdout overflow must block before any retained prefix is parsed"
+        );
+    }
+
+    #[test]
+    fn omp_bridge_field_bounds_and_json_cap_are_exact_and_utf8_safe() {
+        const {
+            assert!(OMP_BRIDGE_REASON_TRUNCATION_SUFFIX.len() < OMP_BRIDGE_REASON_MAX_BYTES);
+            assert!(OMP_BRIDGE_RULE_ID_TRUNCATION_SUFFIX.len() < OMP_BRIDGE_RULE_ID_MAX_BYTES);
+            assert!(
+                OMP_CHILD_STDOUT_MAX_BYTES
+                    == OMP_BRIDGE_JSON_ESCAPE_EXPANSION
+                        * (OMP_BRIDGE_REASON_MAX_BYTES + OMP_BRIDGE_RULE_ID_MAX_BYTES)
+                        + OMP_BRIDGE_JSON_ENVELOPE_MAX_BYTES
+            );
+        }
+
+        let just_under = "r".repeat(OMP_BRIDGE_REASON_MAX_BYTES - 1);
+        let bounded = bounded_omp_bridge_reason(&just_under);
+        assert!(matches!(bounded, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(bounded.len(), OMP_BRIDGE_REASON_MAX_BYTES - 1);
+
+        let at = "r".repeat(OMP_BRIDGE_REASON_MAX_BYTES);
+        let bounded = bounded_omp_bridge_reason(&at);
+        assert!(matches!(bounded, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(bounded.len(), OMP_BRIDGE_REASON_MAX_BYTES);
+
+        let multibyte_over = "🛸".repeat(OMP_BRIDGE_REASON_MAX_BYTES / 4 + 1);
+        let bounded = bounded_omp_bridge_reason(&multibyte_over);
+        assert_eq!(bounded.len(), OMP_BRIDGE_REASON_MAX_BYTES);
+        assert!(bounded.ends_with(OMP_BRIDGE_REASON_TRUNCATION_SUFFIX));
+        assert!(!bounded.contains('\u{fffd}'));
+
+        let giant_rule = "界".repeat(OMP_BRIDGE_RULE_ID_MAX_BYTES / 3 + 1);
+        let bounded_rule = bounded_omp_bridge_rule_id(giant_rule);
+        assert!(bounded_rule.len() <= OMP_BRIDGE_RULE_ID_MAX_BYTES);
+        assert!(bounded_rule.ends_with(OMP_BRIDGE_RULE_ID_TRUNCATION_SUFFIX));
+        assert!(!bounded_rule.contains('\u{fffd}'));
+
+        let control_reason = "\0".repeat(OMP_BRIDGE_REASON_MAX_BYTES);
+        let control_rule = "\0".repeat(OMP_BRIDGE_RULE_ID_MAX_BYTES);
+        let maximum = OmpBridgeTestOutput {
+            decision: "indeterminate",
+            reason: Some(std::borrow::Cow::Borrowed(&control_reason)),
+            rule_id: Some(std::borrow::Cow::Borrowed(&control_rule)),
+        };
+        let encoded = serde_json::to_string(&maximum).expect("serialize maximum compact envelope");
+        assert_eq!(encoded.len() + 1, OMP_CHILD_STDOUT_MAX_BYTES);
+    }
+
+    #[test]
+    fn omp_bridge_private_envelope_omits_command_and_general_robot_metadata() {
+        let allow_result = EvaluationResult::allowed();
+        let allowed = omp_bridge_test_output(&allow_result, None);
+        assert_eq!(
+            serde_json::to_string(&allowed).expect("serialize compact allow"),
+            r#"{"decision":"allow"}"#
+        );
+
+        let mut denied = EvaluationResult::allowed();
+        denied.decision = EvaluationDecision::Deny;
+        denied.pattern_info = Some(crate::evaluator::PatternMatch {
+            pack_id: Some("external.test".to_string()),
+            pattern_name: Some("danger".to_string()),
+            severity: None,
+            reason: "bounded reason".to_string(),
+            source: MatchSource::Pack,
+            matched_span: None,
+            matched_text_preview: None,
+            explanation: None,
+            suggestions: &[],
+        });
+        let compact =
+            serde_json::to_string(&omp_bridge_test_output(&denied, Some(DecisionMode::Deny)))
+                .expect("serialize compact deny");
+        assert_eq!(
+            compact,
+            r#"{"decision":"deny","reason":"bounded reason","rule_id":"external.test:danger"}"#
+        );
+        assert!(!compact.contains("command"));
+        for omitted in [
+            "schema_version",
+            "dcg_version",
+            "pack_id",
+            "pattern_name",
+            "explanation",
+            "severity",
+        ] {
+            assert!(
+                !compact.contains(omitted),
+                "private envelope unexpectedly contains {omitted}"
+            );
+        }
+    }
+
+    #[test]
+    fn omp_extension_source_keeps_astral_input_scalar_across_chunk_boundary() {
+        let executable = current_dcg_executable().expect("current executable");
+        let source = build_omp_extension_source(&executable).expect("extension generation");
+
+        assert!(source.contains(&format!(
+            "export const DCG_STDIN_CHUNK_CODE_UNITS = {OMP_CHILD_STDIN_CHUNK_CODE_UNITS};"
+        )));
+        assert!(source.contains("command.charCodeAt(end - 1) >= 0xd800"));
+        assert!(source.contains("command.charCodeAt(end) <= 0xdfff"));
+        assert!(source.contains("end += 1;"));
+        assert!(source.contains("return text.pipeThrough(new TextEncoderStream());"));
+        assert!(source.contains("return command.length <= DCG_STDIN_CHUNK_CODE_UNITS"));
+    }
+
+    /// Each child observation is an independent, deadline-bounded capability.
+    /// A rejected stderr or exit-status promise must not discard a completed
+    /// blocking stdout verdict, and cancellation must retain bytes observed
+    /// before the boundary. The direct child is killed when exit observation
+    /// faults or stalls; both fulfillment and rejection handlers remain
+    /// attached so late settlement cannot become unhandled.
+    #[test]
+    fn omp_extension_source_isolates_child_collection_faults() {
+        let executable = current_dcg_executable().expect("current executable");
+        let source = build_omp_extension_source(&executable).expect("extension generation");
+
+        assert!(source.contains(
+            "const [stdoutResult, stderrResult, exitResult] = await Promise.allSettled(["
+        ));
+        assert!(
+            source
+                .contains("const rawExitObservation = observeChildCapability(() => proc.exited);")
+        );
+        assert!(
+            source.contains(
+                "observeChildCapabilityUntil(rawExitObservation, observationAbort.signal),"
+            )
+        );
+        assert!(source.contains("capability.then(finishResolve, finishReject);"));
+        assert!(source.contains("() => armPipeDrainDeadline(true),"));
+        assert!(source.contains("if (killChild) killFailure = killDcgChild(proc);"));
+        assert!(source.contains("return { text, overflowed, readFailure };"));
+        assert!(source.contains("signalCode = proc.signalCode;"));
+        let settled = source
+            .find("const [stdoutResult, stderrResult, exitResult] = await Promise.allSettled([")
+            .expect("settled child capabilities");
+        let signal = source
+            .find("signalCode = proc.signalCode;")
+            .expect("post-settlement signal read");
+        assert!(
+            settled < signal,
+            "signal provenance must be read after the streams and exit observation settle"
+        );
+        assert!(source.contains("let proc: Bun.ReadableSubprocess;"));
+        assert_eq!(
+            source.matches("observeChildCapability(() =>").count(),
+            3,
+            "stdout, stderr, and exit setup must each convert synchronous setup faults into independent rejections"
+        );
+        assert!(!source.contains("signalObservation"));
+        assert!(source.contains("function observeChildCapability<T>("));
+        assert!(
+            !source.contains("Promise.all(["),
+            "fail-fast aggregation can erase a safety verdict completed on another child channel"
+        );
+        for capability in ["stdout read", "stderr read", "exit status", "signal status"] {
+            assert!(
+                source.contains(&format!("{capability} failed:")),
+                "generated bridge must diagnose a rejected {capability} capability"
+            );
+        }
+        assert!(source.contains("childOutcome === \"exit-other\" ||"));
+        assert!(source.contains("isDcgSignalCode(signalCode) ||"));
+        assert!(source.contains("Boolean(protocolDetail) ||"));
+        assert!(source.contains("if (classification.action !== \"block\") return;"));
+    }
+
+    /// OMP's ordinary agent-loop path validates BashToolInput before emitting
+    /// `tool_call`, but the extension wrapper also supports direct/non-loop
+    /// dispatch. Keep the generated boundary total over adversarial runtime
+    /// shapes: ignore other tools, block an identifiable malformed bash call,
+    /// preserve OMP's valid empty-string no-op, and evaluate every non-empty
+    /// string (including whitespace) without trimming it into an exemption.
+    #[test]
+    fn omp_extension_source_structurally_classifies_tool_calls() {
+        let executable = current_dcg_executable().expect("current executable");
+        let source = build_omp_extension_source(&executable).expect("extension generation");
+
+        assert!(source.contains("type OmpToolCallClassification ="));
+        assert!(source.contains(
+            "export function classifyOmpToolCall(event: unknown): OmpToolCallClassification"
+        ));
+        assert!(source.contains(
+            r#"if (typeof event !== "object" || event === null || Array.isArray(event)) return { kind: "other-tool" };"#
+        ));
+        assert!(
+            source.contains(r#"if (record.toolName !== "bash") return { kind: "other-tool" };"#)
+        );
+        assert!(source.contains(
+            r#"if (typeof input !== "object" || input === null || Array.isArray(input)) return { kind: "invalid-bash" };"#
+        ));
+        assert!(source.contains(
+            r#"if (typeof toolInput.command !== "string") return { kind: "invalid-bash" };"#
+        ));
+        assert!(
+            source.contains(
+                r#"return { kind: "bash", input: toolInput, command: toolInput.command };"#
+            )
+        );
+        assert!(source.contains("const toolCall = classifyOmpToolCall(event);"));
+        assert!(source.contains("if (toolCall.kind === \"other-tool\") return;"));
+        assert!(source.contains("if (toolCall.kind === \"invalid-bash\") {"));
+        assert!(source.contains("const { input: toolInput, command } = toolCall;"));
+        assert!(source.contains("if (command.length === 0) return;"));
+        assert!(
+            !source.contains("command.trim()"),
+            "whitespace is a non-empty OMP command and must still reach dcg"
+        );
+        assert!(
+            !source.contains("typeof command !== \"string\" || !command"),
+            "malformed bash input must block instead of sharing the empty-command no-op"
+        );
+
+        let classify = source
+            .find("const toolCall = classifyOmpToolCall(event);")
+            .expect("structural classification call");
+        let spawn = source.find("proc = Bun.spawn").expect("dcg spawn");
+        assert!(
+            classify < spawn,
+            "the structural boundary must classify the event before dcg is spawned"
+        );
+    }
+
+    /// A machine-readable safety verdict must be monotone across the child
+    /// process's data and status channels: no exit status may erase a parsed
+    /// deny-like verdict, and dcg's blocking exit status must win even when
+    /// stdout is absent, damaged, or contradictory. Keep the complete finite
+    /// state machine in generated TypeScript so pass-level executable tests can
+    /// drive the same pure classifier without reconstructing its policy.
+    #[test]
+    fn omp_extension_source_encodes_monotonic_child_transition_table() {
+        let executable = current_dcg_executable().expect("current executable");
+        let source = build_omp_extension_source(&executable).expect("extension generation");
+
+        assert!(source.contains("type DcgChildOutcome ="));
+        assert!(source.contains("type DcgParsedVerdict ="));
+        assert!(source.contains("const DCG_CHILD_TRANSITIONS:"));
+        for row in [
+            r#""spawn-throw": { empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }"#,
+            r#""exit-0": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }"#,
+            r#""exit-1": { empty: "block", malformed: "block", allow: "block", deny: "block", ask: "block", indeterminate: "block", unknown: "block" }"#,
+            r#""exit-2": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }"#,
+            r#""exit-other": { empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }"#,
+            r#""signal": { empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }"#,
+        ] {
+            assert!(
+                source.contains(row),
+                "generated bridge is missing transition row: {row}"
+            );
+        }
+        assert!(source.contains("function parseDcgJson("));
+        assert!(source.contains("function parseDcgOutput("));
+        assert!(source.contains("const frameEnd = stdoutText.indexOf(\"\\n\", frameStart);"));
+        assert!(source.contains("if (frameEnd < 0) break;"));
+        assert!(source.contains("return { ...candidate, framedBlockingWitness: true };"));
+        assert!(source.contains("Never recover allow, never parse an unterminated suffix"));
+        assert!(source.contains("export function classifyDcgChild("));
+        assert!(source.contains("export function childOutcomeFromTermination("));
+        assert!(source.contains("const DCG_SIGNAL_CODE_MAX_CHARS = 64;"));
+        assert!(source.contains("function isDcgSignalName(signalCode: string): boolean"));
+        assert!(source.contains("!signalCode.startsWith(\"SIG\")"));
+        assert!(source.contains("code >= 0x41 && code <= 0x5a"));
+        assert!(source.contains("code >= 0x30 && code <= 0x39"));
+        assert!(source.contains("signal status invalid: ${typeof signalCode}"));
+        assert!(source.contains("exit status invalid: ${typeof exitCode}"));
+        assert!(!source.contains("describeChildCollectionFailure(exitCode)"));
+        assert!(source.contains("if (exitCode === 1) return \"exit-1\";"));
+        assert!(source.contains("if (isDcgSignalCode(signalCode)) return \"signal\";"));
+        assert!(source.contains("const classification = stdoutText.overflowed"));
+        assert!(
+            source.contains(
+                "const childOutcome = childOutcomeFromTermination(exitCode, signalCode);"
+            )
+        );
+        assert!(source.contains(": classifyDcgChild(childOutcome, stdoutText.text);"));
+        assert!(!source.contains("childOutcomeFromExitCode"));
+        assert!(
+            source.contains(
+                "reason: typeof record.reason === \"string\" ? record.reason : undefined"
+            )
+        );
+        assert!(
+            source.contains(
+                "ruleId: typeof record.rule_id === \"string\" ? record.rule_id : undefined"
+            )
+        );
+        assert!(
+            !source.contains("DCG_MAX_JSON_CHARS"),
+            "a post-buffer parse cap is not a resource bound and could erase a valid deny verdict"
+        );
+        assert!(
+            !source.contains("if (exitCode === 0 || exitCode === 2) return;"),
+            "an early status-only allow would erase a parsed blocking verdict"
+        );
+    }
+
+    /// The robot protocol is a two-channel contract: stdout alone carries the
+    /// machine decision, while stderr carries diagnostics that must remain
+    /// visible. Keep both properties explicit so swapping the pipes cannot
+    /// either fabricate a block from diagnostic JSON or erase a blocking exit.
+    #[test]
+    fn omp_extension_source_keeps_stdout_authoritative_and_stderr_visible() {
+        let executable = current_dcg_executable().expect("current executable");
+        let source = build_omp_extension_source(&executable).expect("extension generation");
+
+        assert!(source.contains(
+            r#"const classification = stdoutText.overflowed
+      ? { action: "block" as const, output: { verdict: "unknown" as const } }
+      : classifyDcgChild(childOutcome, stdoutText.text);"#
+        ));
+        assert_eq!(
+            source.matches("classifyDcgChild(").count(),
+            2,
+            "the generated module must contain only the pure classifier and its stdout-fed call"
+        );
+        let classifier = &source[source
+            .find("export function classifyDcgChild(")
+            .expect("classifier declaration")
+            ..source
+                .find("function isDcgSignalCode(")
+                .expect("classifier boundary")];
+        assert!(
+            !classifier.contains("stderr"),
+            "stderr JSON is diagnostic text, never a decision input"
+        );
+        assert!(source.contains("const stderrDetail = visibleStderrDetail(stderrText);"));
+        assert_eq!(
+            source
+                .matches("if (!hasInfrastructureDiagnostic && stderrDetail) {")
+                .count(),
+            1,
+            "allow and block must share one non-infrastructure stderr forwarding point"
+        );
+        assert_eq!(
+            source.matches(
+                "console.error(`[dcg] OMP guard infrastructure failure${terminationDetail}${details ? `: ${details}` : \"\"}`);"
+            ).count(),
+            1,
+            "the infrastructure diagnostic must include child stderr exactly once"
+        );
+
+        let infrastructure = source
+            .find("if (hasInfrastructureDiagnostic)")
+            .expect("infrastructure outcome branch");
+        let forward = source
+            .find("if (!hasInfrastructureDiagnostic && stderrDetail) {")
+            .expect("non-infrastructure stderr forwarding");
+        let allow = source
+            .find("if (classification.action === \"allow\") return;")
+            .expect("allow outcome branch");
+        let block = source
+            .find("return { block: true, reason: `${reason}${rule}` };")
+            .expect("block outcome return");
+        assert!(
+            infrastructure < forward && forward < allow && allow < block,
+            "stderr must be emitted once before either non-infrastructure outcome returns"
+        );
+        assert!(source.contains(
+            r#""exit-1": { empty: "block", malformed: "block", allow: "block", deny: "block", ask: "block", indeterminate: "block", unknown: "block" }"#
+        ));
+    }
+
+    /// Write the exact generated OMP module plus the smallest runtime surface
+    /// needed to load it. These stubs deliberately expose only the four values
+    /// imported by the bridge; the replay is a bridge/VM certificate, not a
+    /// claim that a real OMP installation was exercised.
+    fn write_omp_bridge_bun_fixture(root: &std::path::Path, source: &str) {
+        let coding_agent = root.join("node_modules/@oh-my-pi/pi-coding-agent");
+        let pi_utils = root.join("node_modules/@oh-my-pi/pi-utils");
+        std::fs::create_dir_all(coding_agent.join("config"))
+            .expect("create coding-agent config stub directory");
+        std::fs::create_dir_all(coding_agent.join("tools"))
+            .expect("create coding-agent tools stub directory");
+        std::fs::create_dir_all(&pi_utils).expect("create pi-utils stub directory");
+
+        std::fs::write(root.join("dcg-guard.ts"), source)
+            .expect("write exact generated OMP bridge bytes");
+        std::fs::write(
+            coding_agent.join("package.json"),
+            r#"{
+  "name": "@oh-my-pi/pi-coding-agent",
+  "type": "module",
+  "exports": {
+    ".": "./index.ts",
+    "./config/settings": "./config/settings.ts",
+    "./tools/path-utils": "./tools/path-utils.ts",
+    "./tools/shell-tokenize": "./tools/shell-tokenize.ts"
+  }
+}"#,
+        )
+        .expect("write coding-agent stub package manifest");
+        std::fs::write(coding_agent.join("index.ts"), "export {};\n")
+            .expect("write type-only coding-agent root stub");
+        std::fs::write(
+            coding_agent.join("config/settings.ts"),
+            r#"export const settings = {
+  getShellConfig(): { shell: string } {
+    return { shell: "/bin/bash" };
+  },
+};
+"#,
+        )
+        .expect("write settings stub");
+        std::fs::write(
+            coding_agent.join("tools/path-utils.ts"),
+            r#"import path from "node:path";
+
+export function resolveToCwd(requested: string, cwd: string): string {
+  return path.resolve(cwd, requested);
+}
+"#,
+        )
+        .expect("write cwd resolver stub");
+        std::fs::write(
+            coding_agent.join("tools/shell-tokenize.ts"),
+            r"export function extractLeadingCdTarget(_command: string): undefined {
+  return undefined;
+}
+",
+        )
+        .expect("write shell-tokenizer stub");
+        std::fs::write(
+            pi_utils.join("package.json"),
+            r#"{
+  "name": "@oh-my-pi/pi-utils",
+  "type": "module",
+  "exports": { ".": "./index.ts" }
+}"#,
+        )
+        .expect("write pi-utils stub package manifest");
+        std::fs::write(
+            pi_utils.join("index.ts"),
+            r"export const procmgr = {
+  isCmdShell(shell: string): boolean {
+    return /(?:^|[/\\])cmd(?:\.exe)?$/i.test(shell);
+  },
+  isPowerShell(shell: string): boolean {
+    return /(?:^|[/\\])(?:pwsh|powershell)(?:\.exe)?$/i.test(shell);
+  },
+};
+",
+        )
+        .expect("write process-manager stub");
+
+        std::fs::write(
+            root.join("runner.ts"),
+            r#"import dcgGuard, {
+  collectBoundedText,
+  commandStdin,
+  commandUtf8Stream,
+  DCG_CHILD_OBSERVATION_TIMEOUT_MS,
+  DCG_CHILD_PIPE_DRAIN_GRACE_MS,
+  DCG_STDERR_MAX_BYTES,
+  DCG_STDIN_CHUNK_CODE_UNITS,
+  DCG_STDOUT_MAX_BYTES,
+  childOutcomeFromTermination,
+  classifyDcgChild,
+  classifyOmpToolCall,
+} from "./dcg-guard.ts";
+
+function check(condition: unknown, message: string): asserts condition {
+  if (!condition) throw new Error(`replay assertion failed: ${message}`);
+}
+
+function equal(actual: unknown, expected: unknown, caseId: string): void {
+  const left = JSON.stringify(actual);
+  const right = JSON.stringify(expected);
+  check(left === right, `${caseId}: expected ${right}, received ${left}`);
+}
+
+const toolCaseIds: string[] = [];
+const toolCases: Array<[string, unknown, string, string?]> = [
+  ["tool/null-event", null, "other-tool"],
+  ["tool/array-event", [], "other-tool"],
+  ["tool/primitive-event", "bash", "other-tool"],
+  ["tool/missing-name", {}, "other-tool"],
+  ["tool/name-case", { toolName: "Bash", input: { command: "echo ok" } }, "other-tool"],
+  ["tool/other-name", { toolName: "read", input: { command: "echo ok" } }, "other-tool"],
+  ["tool/null-input", { toolName: "bash", input: null }, "invalid-bash"],
+  ["tool/array-input", { toolName: "bash", input: [] }, "invalid-bash"],
+  ["tool/missing-command", { toolName: "bash", input: {} }, "invalid-bash"],
+  ["tool/null-command", { toolName: "bash", input: { command: null } }, "invalid-bash"],
+  ["tool/numeric-command", { toolName: "bash", input: { command: 7 } }, "invalid-bash"],
+  ["tool/empty-command", { toolName: "bash", input: { command: "" } }, "bash", ""],
+  ["tool/whitespace-command", { toolName: "bash", input: { command: " \t" } }, "bash", " \t"],
+  ["tool/string-command", { toolName: "bash", input: { command: "echo ok" } }, "bash", "echo ok"],
+];
+for (const [caseId, event, expectedKind, expectedCommand] of toolCases) {
+  const classified = classifyOmpToolCall(event);
+  equal(classified.kind, expectedKind, caseId);
+  if (expectedKind === "bash") {
+    check(classified.kind === "bash", `${caseId}: missing bash classification`);
+    equal(classified.command, expectedCommand, `${caseId}/command`);
+  }
+  toolCaseIds.push(caseId);
+}
+
+const outcomes = ["spawn-throw", "exit-0", "exit-1", "exit-2", "exit-other", "signal"] as const;
+const verdictFixtures = {
+  empty: " \n\t",
+  malformed: "{",
+  allow: JSON.stringify({ decision: "allow" }),
+  deny: JSON.stringify({ decision: "deny", reason: "danger", rule_id: "core.git:test" }),
+  ask: JSON.stringify({ decision: "ask" }),
+  indeterminate: JSON.stringify({ decision: "indeterminate" }),
+  unknown: JSON.stringify({ decision: "bogus" }),
+} as const;
+const expectedActions = {
+  "spawn-throw": { empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" },
+  "exit-0": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" },
+  "exit-1": { empty: "block", malformed: "block", allow: "block", deny: "block", ask: "block", indeterminate: "block", unknown: "block" },
+  "exit-2": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" },
+  "exit-other": { empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" },
+  "signal": { empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" },
+} as const;
+const transitionCaseIds: string[] = [];
+for (const outcome of outcomes) {
+  for (const verdict of Object.keys(verdictFixtures) as Array<keyof typeof verdictFixtures>) {
+    const caseId = `transition/${outcome}/${verdict}`;
+    const classified = classifyDcgChild(outcome, verdictFixtures[verdict]);
+    equal(classified.output.verdict, verdict, `${caseId}/parsed-verdict`);
+    equal(classified.action, expectedActions[outcome][verdict], `${caseId}/action`);
+    transitionCaseIds.push(caseId);
+  }
+}
+const typedMetadata = classifyDcgChild(
+  "exit-0",
+  JSON.stringify({ decision: "deny", reason: 9, rule_id: ["not", "a", "string"] }),
+);
+equal(typedMetadata.output.reason, undefined, "transition/non-string-reason");
+equal(typedMetadata.output.ruleId, undefined, "transition/non-string-rule-id");
+
+const terminationCaseIds: string[] = [];
+for (const [caseId, exitCode, signalCode, expectedOutcome] of [
+  ["termination/exit-0", 0, null, "exit-0"],
+  ["termination/exit-1", 1, null, "exit-1"],
+  ["termination/exit-2", 2, null, "exit-2"],
+  ["termination/exit-9", 9, null, "exit-other"],
+  ["termination/normal-exit-137", 137, null, "exit-other"],
+  ["termination/sigkill", 137, "SIGKILL", "signal"],
+  ["termination/numeric-signal", 137, 9, "signal"],
+  ["termination/signal-beats-exit-0", 0, "SIGTERM", "signal"],
+  ["termination/exit-1-beats-signal", 1, "SIGKILL", "exit-1"],
+  ["termination/undefined-exit", undefined, null, "exit-other"],
+  ["termination/null-exit", null, null, "exit-other"],
+  ["termination/string-exit", "0", null, "exit-other"],
+  ["termination/fractional-exit", 0.5, null, "exit-other"],
+  ["termination/nan-exit", Number.NaN, null, "exit-other"],
+  ["termination/empty-signal", 137, "", "exit-other"],
+  ["termination/control-signal", 137, "SIGKILL\n\u001b[31mFORGED", "exit-other"],
+  ["termination/lowercase-signal", 137, "sigkill", "exit-other"],
+  ["termination/bare-sig", 137, "SIG", "exit-other"],
+  ["termination/oversized-signal", 137, "S".repeat(65), "exit-other"],
+  ["termination/object-signal", 137, { signal: "SIGKILL" }, "exit-other"],
+] as const) {
+  equal(
+    childOutcomeFromTermination(exitCode, signalCode),
+    expectedOutcome,
+    `${caseId}/outcome`,
+  );
+  terminationCaseIds.push(caseId);
+}
+
+const framingCaseIds: string[] = [];
+for (const [baseCaseId, stdout, expectedVerdict, expectedWitness] of [
+  ["framing/deny-before-partial-junk", `${verdictFixtures.deny}\n{`, "deny", true],
+  ["framing/ask-before-partial-junk", `${verdictFixtures.ask}\n{`, "ask", true],
+  ["framing/indeterminate-before-partial-junk", `${verdictFixtures.indeterminate}\n{`, "indeterminate", true],
+  ["framing/allow-then-deny", `${verdictFixtures.allow}\n${verdictFixtures.deny}\n`, "deny", true],
+  ["framing/deny-then-allow", `${verdictFixtures.deny}\n${verdictFixtures.allow}\n`, "deny", true],
+  ["framing/junk-then-deny", `diagnostic junk\n${verdictFixtures.deny}\n`, "deny", true],
+  ["framing/partial-deny-then-deny", `{"decision":"den\n${verdictFixtures.deny}\n`, "deny", true],
+  ["framing/deny-crlf-before-partial-junk", `${verdictFixtures.deny}\r\n{`, "deny", true],
+  ["framing/partial-deny-then-allow", `{"decision":"den\n${verdictFixtures.allow}\n`, "malformed", false],
+  ["framing/allow-before-partial-junk", `${verdictFixtures.allow}\n{`, "malformed", false],
+  ["framing/deny-prefix-incomplete-json", `{"decision":"deny"\n`, "malformed", false],
+  ["framing/ask-prefix-incomplete-json", `{"decision":"ask"\n`, "malformed", false],
+  ["framing/indeterminate-prefix-incomplete-json", `{"decision":"indeterminate"\n`, "malformed", false],
+  ["framing/deny-with-same-line-junk", `${verdictFixtures.deny}junk\n`, "malformed", false],
+] as const) {
+  for (const outcome of outcomes) {
+    const caseId = `${baseCaseId}/${outcome}`;
+    const classified = classifyDcgChild(outcome, stdout);
+    equal(classified.output.verdict, expectedVerdict, `${caseId}/parsed-verdict`);
+    equal(
+      classified.output.framedBlockingWitness === true,
+      expectedWitness,
+      `${caseId}/blocking-witness`,
+    );
+    equal(
+      classified.action,
+      expectedWitness ? "block" : expectedActions[outcome].malformed,
+      `${caseId}/action`,
+    );
+    framingCaseIds.push(caseId);
+  }
+}
+
+const byteStream = (chunks: Uint8Array[], error?: string): ReadableStream<Uint8Array> => {
+  let offset = 0;
+  return new ReadableStream<Uint8Array>({
+    pull(controller): void {
+      if (offset < chunks.length) {
+        controller.enqueue(chunks[offset++]!);
+      } else if (error) {
+        controller.error(new Error(error));
+      } else {
+        controller.close();
+      }
+    },
+  });
+};
+const encoder = new TextEncoder();
+for (const [caseId, size, expectedOverflow] of [
+  ["collector/just-under", DCG_STDOUT_MAX_BYTES - 1, false],
+  ["collector/at", DCG_STDOUT_MAX_BYTES, false],
+  ["collector/over", DCG_STDOUT_MAX_BYTES + 1, true],
+] as const) {
+  const collected = await collectBoundedText(
+    byteStream([encoder.encode("x".repeat(size))]),
+    DCG_STDOUT_MAX_BYTES,
+  );
+  equal(collected.text.length, Math.min(size, DCG_STDOUT_MAX_BYTES), `${caseId}/retained`);
+  equal(collected.overflowed, expectedOverflow, `${caseId}/overflow`);
+}
+const saucerBytes = encoder.encode("🛸");
+const splitScalar = await collectBoundedText(
+  byteStream([saucerBytes.subarray(0, 2), saucerBytes.subarray(2)]),
+  DCG_STDOUT_MAX_BYTES,
+);
+equal(splitScalar.text, "🛸", "collector/multibyte-split/text");
+equal(splitScalar.overflowed, false, "collector/multibyte-split/overflow");
+const cutScalar = await collectBoundedText(
+  byteStream([encoder.encode("x".repeat(DCG_STDOUT_MAX_BYTES - 1)), saucerBytes]),
+  DCG_STDOUT_MAX_BYTES,
+);
+equal(cutScalar.text.length, DCG_STDOUT_MAX_BYTES - 1, "collector/multibyte-cap/text");
+check(!cutScalar.text.includes("�"), "collector/multibyte-cap/no-replacement");
+equal(cutScalar.overflowed, true, "collector/multibyte-cap/overflow");
+const boundaryCommand = "x".repeat(DCG_STDIN_CHUNK_CODE_UNITS - 1) + "🛸tail";
+equal(await new Response(commandUtf8Stream(boundaryCommand)).text(), boundaryCommand, "stdin/astral-boundary");
+check(commandStdin("echo ok") instanceof Uint8Array, "stdin/small-fast-path");
+check(commandStdin(boundaryCommand) instanceof ReadableStream, "stdin/large-stream-path");
+
+const loneHigh = JSON.parse('"\\ud800"') as string;
+const loneLow = JSON.parse('"\\udc00"') as string;
+equal(Array.from(encoder.encode(loneHigh)), [0xef, 0xbf, 0xbd], "stdin/lone-high/replacement");
+equal(Array.from(encoder.encode(loneLow)), [0xef, 0xbf, 0xbd], "stdin/lone-low/replacement");
+
+const encodedCommandStdin = async (command: string): Promise<Uint8Array> => {
+  const stdin = commandStdin(command);
+  return stdin instanceof Uint8Array
+    ? stdin
+    : new Uint8Array(await new Response(stdin).arrayBuffer());
+};
+const equalBytes = (actual: Uint8Array, expected: Uint8Array, caseId: string): void => {
+  equal(actual.byteLength, expected.byteLength, `${caseId}/length`);
+  for (let index = 0; index < expected.byteLength; index += 1) {
+    check(actual[index] === expected[index], `${caseId}/byte-${index}`);
+  }
+};
+const stdinCaseIds: string[] = [];
+for (const [caseId, command, expectedPath] of [
+  ["stdin/direct-controls", "nul\0lf\ncr\rtab\tesc\u001b", "direct"],
+  ["stdin/direct-astral", "界🛸é", "direct"],
+  ["stdin/direct-lone-high", `head${loneHigh}`, "direct"],
+  ["stdin/direct-lone-low", `${loneLow}tail`, "direct"],
+  ["stdin/stream-just-over", "x".repeat(DCG_STDIN_CHUNK_CODE_UNITS + 1), "stream"],
+  ["stdin/stream-astral-boundary", boundaryCommand, "stream"],
+  ["stdin/stream-lone-high-boundary", "x".repeat(DCG_STDIN_CHUNK_CODE_UNITS - 1) + loneHigh + "tail", "stream"],
+  ["stdin/stream-lone-low-boundary", "x".repeat(DCG_STDIN_CHUNK_CODE_UNITS) + loneLow + "tail", "stream"],
+  ["stdin/stream-reversed-surrogates", "x".repeat(DCG_STDIN_CHUNK_CODE_UNITS) + loneLow + loneHigh, "stream"],
+] as const) {
+  const stdin = commandStdin(command);
+  equal(stdin instanceof Uint8Array ? "direct" : "stream", expectedPath, `${caseId}/path`);
+  equalBytes(await encodedCommandStdin(command), encoder.encode(command), caseId);
+  stdinCaseIds.push(caseId);
+}
+
+type ChildCase = {
+  stdout?: string;
+  stdoutChunks?: string[];
+  stderr?: string;
+  exitCode?: unknown;
+  signalCode?: unknown;
+  signalAfterStdout?: unknown;
+  stdoutInitialDelayMs?: number;
+  stdoutTerminalDelayMs?: number;
+  stderrInitialDelayMs?: number;
+  stderrTerminalDelayMs?: number;
+  exitDelayMs?: number;
+  exitAtHardDeadlineMinusMs?: number;
+  stdoutError?: string;
+  stderrError?: string;
+  stdoutCancelError?: string;
+  stderrCancelError?: string;
+  exitError?: string;
+  signalError?: string;
+  signalAfterKill?: unknown;
+  signalAfterKillDelayMs?: number;
+  killError?: string;
+  spawnError?: string;
+  stuckUntilTimeout?: boolean;
+};
+type SpawnRecord = {
+  argv: string[];
+  cwd: string;
+  stdin: string;
+  timeout: number;
+  killSignal: string | number;
+  killCalls: number;
+  stdoutCancelCalls: number;
+  stderrCancelCalls: number;
+};
+let activeChild: ChildCase = {};
+let callback: ((event: unknown, ctx: unknown) => Promise<unknown>) | undefined;
+let spawnRecords: SpawnRecord[] = [];
+let diagnostics: string[] = [];
+let observedExecutable: string | undefined;
+const originalSpawn = Bun.spawn;
+const originalConsoleError = console.error;
+const originalSetTimeout = globalThis.setTimeout;
+const originalClearTimeout = globalThis.clearTimeout;
+const originalPerformanceNow = performance.now.bind(performance);
+const activeWatchdogTimers = new Set<ReturnType<typeof setTimeout>>();
+let watchdogFireCount = 0;
+let watchdogScheduleCount = 0;
+let virtualNowMs = 0;
+let pendingWatchdogRearm = false;
+let currentCasePeakWatchdogs = 0;
+let peakWatchdogCount = 0;
+const unhandledRejections: unknown[] = [];
+const recordUnhandledRejection = (reason: unknown): void => {
+  unhandledRejections.push(reason);
+};
+process.on("unhandledRejection", recordUnhandledRejection);
+(performance as unknown as { now: () => number }).now = (): number => virtualNowMs;
+
+// Execute production watchdog branches without waiting 30 seconds. Clearing a
+// known watchdog transfers ownership to at most one rearm, so a shortened
+// absolute-deadline delay is still recognized. Advancing the monotonic virtual
+// clock by the requested delay keeps deadline arithmetic faithful while wall
+// time remains compressed.
+globalThis.setTimeout = ((
+  handler: (...args: unknown[]) => void,
+  delay?: number,
+  ...args: unknown[]
+) => {
+  const requestedDelay = Math.max(0, delay ?? 0);
+  const isInitialWatchdog = delay === DCG_CHILD_OBSERVATION_TIMEOUT_MS;
+  const isRearmedWatchdog =
+    !isInitialWatchdog && pendingWatchdogRearm && requestedDelay <= DCG_CHILD_PIPE_DRAIN_GRACE_MS;
+  const isWatchdog = isInitialWatchdog || isRearmedWatchdog;
+  if (isWatchdog) pendingWatchdogRearm = false;
+  const effectiveDelay = isInitialWatchdog
+    ? 25
+    : isRearmedWatchdog
+      ? requestedDelay >= DCG_CHILD_PIPE_DRAIN_GRACE_MS
+        ? 8
+        : Math.max(1, requestedDelay)
+      : requestedDelay;
+  const virtualDeadline = virtualNowMs + requestedDelay;
+  let timer: ReturnType<typeof setTimeout>;
+  timer = originalSetTimeout(() => {
+    virtualNowMs = Math.max(virtualNowMs, virtualDeadline);
+    if (isWatchdog) {
+      activeWatchdogTimers.delete(timer);
+      watchdogFireCount += 1;
+    }
+    handler(...args);
+  }, effectiveDelay);
+  if (isWatchdog) {
+    activeWatchdogTimers.add(timer);
+    watchdogScheduleCount += 1;
+    currentCasePeakWatchdogs = Math.max(currentCasePeakWatchdogs, activeWatchdogTimers.size);
+    peakWatchdogCount = Math.max(peakWatchdogCount, activeWatchdogTimers.size);
+  }
+  return timer;
+}) as typeof setTimeout;
+globalThis.clearTimeout = ((timer: ReturnType<typeof setTimeout>): void => {
+  if (activeWatchdogTimers.delete(timer)) pendingWatchdogRearm = true;
+  originalClearTimeout(timer);
+}) as typeof clearTimeout;
+
+(Bun as unknown as { spawn: typeof Bun.spawn }).spawn = ((argv: string[], options: {
+  cwd: string;
+  stdin: Uint8Array | ReadableStream<Uint8Array>;
+  timeout: number;
+  killSignal: string | number;
+}) => {
+  if (activeChild.spawnError) throw new Error(activeChild.spawnError);
+  if (observedExecutable === undefined) observedExecutable = argv[0];
+  equal(argv[0], observedExecutable, "callback/spawn/executable-stability");
+  equal(options.timeout, 30_000, "callback/spawn/parent-timeout");
+  equal(options.killSignal, "SIGKILL", "callback/spawn/kill-signal");
+  const record: SpawnRecord = {
+    argv: [...argv],
+    cwd: options.cwd,
+    stdin: "",
+    timeout: options.timeout,
+    killSignal: options.killSignal,
+    killCalls: 0,
+    stdoutCancelCalls: 0,
+    stderrCancelCalls: 0,
+  };
+  spawnRecords.push(record);
+  const stdinCollected = new Response(options.stdin).text().then(text => {
+    record.stdin = text;
+  });
+  const childStream = (
+    chunks: string[],
+    error: string | undefined,
+    beforeTerminal?: () => void,
+    initialDelayMs = 0,
+    terminalDelayMs = 0,
+    cancelError?: string,
+    onCancel?: () => void,
+  ): ReadableStream<Uint8Array> => {
+    let offset = 0;
+    let initialDelayComplete = initialDelayMs === 0;
+    let cancelled = false;
+    let releaseDelay: (() => void) | undefined;
+    const cancellableDelay = (delayMs: number): Promise<void> => new Promise(resolve => {
+      let settled = false;
+      const finish = (): void => {
+        if (settled) return;
+        settled = true;
+        releaseDelay = undefined;
+        originalClearTimeout(timer);
+        resolve();
+      };
+      const timer = originalSetTimeout(finish, delayMs);
+      releaseDelay = finish;
+    });
+    return new ReadableStream<Uint8Array>({
+      async pull(controller): Promise<void> {
+        if (!initialDelayComplete) {
+          await cancellableDelay(initialDelayMs);
+          initialDelayComplete = true;
+          if (cancelled) return;
+        }
+        while (offset < chunks.length) {
+          const chunk = encoder.encode(chunks[offset++]!);
+          if (chunk.byteLength > 0) {
+            controller.enqueue(chunk);
+            return;
+          }
+        }
+        if (terminalDelayMs > 0) await cancellableDelay(terminalDelayMs);
+        if (cancelled) return;
+        beforeTerminal?.();
+        if (error) controller.error(new Error(error));
+        else controller.close();
+      },
+      cancel(): void | Promise<void> {
+        onCancel?.();
+        cancelled = true;
+        releaseDelay?.();
+        if (cancelError) return Promise.reject(new Error(cancelError));
+      },
+    });
+  };
+  const childExitValue = Object.hasOwn(activeChild, "exitCode") ? activeChild.exitCode : 0;
+  const childExitError = activeChild.exitError;
+  const childExitDelayMs = activeChild.exitDelayMs;
+  const exitAtHardDeadlineMinusMs = activeChild.exitAtHardDeadlineMinusMs;
+  let childSignalValue = Object.hasOwn(activeChild, "signalCode")
+    ? activeChild.signalCode
+    : null;
+  const childExit = activeChild.stuckUntilTimeout
+    ? new Promise<unknown>(resolve => setTimeout(() => {
+        childSignalValue = "SIGKILL";
+        resolve(137);
+      }, 5))
+    : exitAtHardDeadlineMinusMs !== undefined
+      ? new Promise<unknown>((resolve, reject) => originalSetTimeout(() => {
+          virtualNowMs = Math.max(
+            virtualNowMs,
+            DCG_CHILD_OBSERVATION_TIMEOUT_MS - exitAtHardDeadlineMinusMs,
+          );
+          if (childExitError) reject(new Error(childExitError));
+          else resolve(childExitValue);
+        }, 24))
+    : childExitDelayMs
+      ? new Promise<unknown>((resolve, reject) => originalSetTimeout(() => {
+          if (childExitError) reject(new Error(childExitError));
+          else resolve(childExitValue);
+        }, childExitDelayMs))
+      : childExitError
+        ? Promise.reject(new Error(childExitError))
+        : Promise.resolve(childExitValue);
+  const childSignalError = activeChild.signalError;
+  const hasSignalAfterStdout = Object.hasOwn(activeChild, "signalAfterStdout");
+  const signalAfterStdout = activeChild.signalAfterStdout;
+  const hasSignalAfterKill = Object.hasOwn(activeChild, "signalAfterKill");
+  const signalAfterKill = activeChild.signalAfterKill;
+  const signalAfterKillDelayMs = activeChild.signalAfterKillDelayMs ?? 0;
+  return {
+    stdout: childStream(
+      activeChild.stdoutChunks ?? [activeChild.stdout ?? ""],
+      activeChild.stdoutError,
+      hasSignalAfterStdout ? () => { childSignalValue = signalAfterStdout; } : undefined,
+      activeChild.stdoutInitialDelayMs,
+      activeChild.stdoutTerminalDelayMs,
+      activeChild.stdoutCancelError,
+      () => { record.stdoutCancelCalls += 1; },
+    ),
+    stderr: childStream(
+      [activeChild.stderr ?? ""],
+      activeChild.stderrError,
+      undefined,
+      activeChild.stderrInitialDelayMs,
+      activeChild.stderrTerminalDelayMs,
+      activeChild.stderrCancelError,
+      () => { record.stderrCancelCalls += 1; },
+    ),
+    // Model Bun's native timeout without making the certificate wait for the
+    // production 30-second ceiling. The exact configured value and kill
+    // signal are asserted above, so removing either production option turns
+    // this replay red before the compressed timer can resolve.
+    exited: Promise.all([childExit, stdinCollected]).then(([exitCode]) => exitCode),
+    get signalCode(): unknown {
+      if (childSignalError) throw new Error(childSignalError);
+      return childSignalValue;
+    },
+    kill(signal: string | number): void {
+      record.killCalls += 1;
+      if (activeChild.killError) throw new Error(activeChild.killError);
+      if (hasSignalAfterKill) {
+        if (signalAfterKillDelayMs > 0) {
+          originalSetTimeout(() => { childSignalValue = signalAfterKill; }, signalAfterKillDelayMs);
+        } else {
+          childSignalValue = signalAfterKill;
+        }
+      }
+    },
+  };
+}) as typeof Bun.spawn;
+console.error = (...values: unknown[]): void => {
+  diagnostics.push(values.map(String).join(" "));
+};
+
+const callbackCaseIds: string[] = [];
+try {
+  dcgGuard({
+    on(eventName: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>): void {
+      equal(eventName, "tool_call", "callback/registration/event-name");
+      check(callback === undefined, "callback/registration/registered-more-than-once");
+      callback = handler;
+    },
+  } as never);
+  check(callback !== undefined, "callback/registration/missing-handler");
+
+  const invoke = async (caseId: string, event: unknown, child: ChildCase = {}) => {
+    virtualNowMs = 0;
+    pendingWatchdogRearm = false;
+    currentCasePeakWatchdogs = 0;
+    activeChild = child;
+    spawnRecords = [];
+    diagnostics = [];
+    const watchdogSchedulesBefore = watchdogScheduleCount;
+    const watchdogFiresBefore = watchdogFireCount;
+    const started = originalPerformanceNow();
+    const virtualStarted = performance.now();
+    const result = await callback!(event, { cwd: process.cwd(), hasUI: false, mode: "rpc" });
+    const elapsedMs = originalPerformanceNow() - started;
+    const virtualElapsedMs = performance.now() - virtualStarted;
+    check(activeWatchdogTimers.size === 0, `${caseId}/watchdog-cleared`);
+    callbackCaseIds.push(caseId);
+    return {
+      result,
+      spawns: [...spawnRecords],
+      errors: [...diagnostics],
+      elapsedMs,
+      virtualElapsedMs,
+      peakWatchdogs: currentCasePeakWatchdogs,
+      watchdogSchedules: watchdogScheduleCount - watchdogSchedulesBefore,
+      watchdogFires: watchdogFireCount - watchdogFiresBefore,
+    };
+  };
+
+  let replay = await invoke("callback/other-tool", { toolName: "read", input: {} });
+  equal(replay.result, undefined, "callback/other-tool/result");
+  equal(replay.spawns.length, 0, "callback/other-tool/spawn-count");
+  equal(replay.errors, [], "callback/other-tool/diagnostics");
+
+  replay = await invoke("callback/malformed-bash", { toolName: "bash", input: null });
+  equal(replay.result, {
+    block: true,
+    reason: "[dcg] OMP guard received malformed bash input (expected an object with a string command)",
+  }, "callback/malformed-bash/result");
+  equal(replay.spawns.length, 0, "callback/malformed-bash/spawn-count");
+
+  replay = await invoke("callback/empty-command", { toolName: "bash", input: { command: "" } });
+  equal(replay.result, undefined, "callback/empty-command/result");
+  equal(replay.spawns.length, 0, "callback/empty-command/spawn-count");
+
+  replay = await invoke(
+    "callback/whitespace-allow",
+    { toolName: "bash", input: { command: " \t" } },
+    { stdout: JSON.stringify({ decision: "allow" }), stderr: "allow diagnostic\n", exitCode: 0 },
+  );
+  equal(replay.result, undefined, "callback/whitespace-allow/result");
+  equal(replay.spawns.length, 1, "callback/whitespace-allow/spawn-count");
+  equal(replay.spawns[0]!.stdin, " \t", "callback/whitespace-allow/stdin-bytes");
+  equal(replay.spawns[0]!.cwd, process.cwd(), "callback/whitespace-allow/cwd");
+  equal(replay.spawns[0]!.argv.slice(1), ["--robot", "test", "--stdin", "--agent", "omp", "--dialect", "posix", "--format", "json", "--omp-bridge-output"], "callback/whitespace-allow/argv");
+  equal(replay.spawns[0]!.timeout, 30_000, "callback/whitespace-allow/parent-timeout");
+  equal(replay.spawns[0]!.killSignal, "SIGKILL", "callback/whitespace-allow/kill-signal");
+  equal(replay.errors, ["[dcg] OMP guard dcg stderr: allow diagnostic"], "callback/whitespace-allow/diagnostics");
+
+  for (const [caseId, command] of [
+    ["callback/stdin-newline-only", "\n"],
+    ["callback/stdin-crlf-only", "\r\n"],
+    ["callback/stdin-controls", "nul\0lf\ncr\rtab\tesc\u001b"],
+    ["callback/stdin-astral-boundary", boundaryCommand],
+    ["callback/stdin-lone-high-direct", `head${loneHigh}`],
+    ["callback/stdin-lone-high-stream", "x".repeat(DCG_STDIN_CHUNK_CODE_UNITS - 1) + loneHigh + "tail"],
+  ] as const) {
+    replay = await invoke(
+      caseId,
+      { toolName: "bash", input: { command } },
+      { stdout: JSON.stringify({ decision: "allow" }), exitCode: 0 },
+    );
+    equal(replay.result, undefined, `${caseId}/result`);
+    equal(replay.spawns.length, 1, `${caseId}/spawn-count`);
+    equal(
+      replay.spawns[0]!.stdin,
+      new TextDecoder().decode(encoder.encode(command)),
+      `${caseId}/canonical-utf8`,
+    );
+  }
+
+  replay = await invoke(
+    "callback/exit-zero-deny",
+    { toolName: "bash", input: { command: "git reset --hard" } },
+    { stdout: JSON.stringify({ decision: "deny", reason: "danger", rule_id: "core.git:test" }), stderr: "block diagnostic", exitCode: 0 },
+  );
+  equal(replay.result, { block: true, reason: "danger\n\nRule: core.git:test" }, "callback/exit-zero-deny/result");
+  equal(replay.errors, ["[dcg] OMP guard dcg stderr: block diagnostic"], "callback/exit-zero-deny/diagnostics");
+
+  replay = await invoke(
+    "callback/oversized-deny",
+    { toolName: "bash", input: { command: "danger" } },
+    { stdout: JSON.stringify({ decision: "deny", reason: "complete denial" }) + "x".repeat(DCG_STDOUT_MAX_BYTES), exitCode: 0 },
+  );
+  equal(replay.result, {
+    block: true,
+    reason: `Blocked by dcg because evaluator stdout exceeded the ${DCG_STDOUT_MAX_BYTES}-byte safety-verdict cap`,
+  }, "callback/oversized-deny/result");
+  check(replay.errors.some(error => error.includes("blocking conservatively")), "callback/oversized-deny/diagnostic");
+
+  replay = await invoke(
+    "callback/oversized-non-verdict",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { stdout: "not-json" + "x".repeat(DCG_STDOUT_MAX_BYTES), exitCode: 0 },
+  );
+  equal(replay.result, {
+    block: true,
+    reason: `Blocked by dcg because evaluator stdout exceeded the ${DCG_STDOUT_MAX_BYTES}-byte safety-verdict cap`,
+  }, "callback/oversized-non-verdict/result");
+
+  replay = await invoke(
+    "callback/deny-then-stdout-fault",
+    { toolName: "bash", input: { command: "danger" } },
+    { stdout: JSON.stringify({ decision: "deny", reason: "deny survives midstream fault" }), stdoutError: "after verdict", exitCode: 0 },
+  );
+  equal(replay.result, { block: true, reason: "deny survives midstream fault" }, "callback/deny-then-stdout-fault/result");
+  check(replay.errors.some(error => error.includes("stdout read failed: Error: after verdict")), "callback/deny-then-stdout-fault/diagnostic");
+
+  replay = await invoke(
+    "callback/framed-deny-split-junk-fault",
+    { toolName: "bash", input: { command: "danger" } },
+    {
+      stdoutChunks: [
+        '{"decision":"de',
+        'ny","reason":"framed deny survives split"}',
+        "\n",
+        "{",
+      ],
+      stdoutError: "after framed junk",
+      exitCode: 0,
+    },
+  );
+  equal(replay.result, { block: true, reason: "framed deny survives split" }, "callback/framed-deny-split-junk-fault/result");
+  equal(replay.errors, [
+    "[dcg] OMP guard infrastructure failure (exit 0): dcg stdout contained extra or incomplete data around a complete blocking verdict; stdout read failed: Error: after framed junk",
+  ], "callback/framed-deny-split-junk-fault/diagnostics");
+
+  replay = await invoke(
+    "callback/allow-then-stdout-fault",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { stdout: JSON.stringify({ decision: "allow" }), stdoutError: "after apparent allow", exitCode: 0 },
+  );
+  equal(replay.result, undefined, "callback/allow-then-stdout-fault/result");
+  check(replay.errors.some(error => error.includes("stdout read failed: Error: after apparent allow")), "callback/allow-then-stdout-fault/diagnostic");
+
+  replay = await invoke(
+    "callback/malformed-exit-zero-visible",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { stdout: "not-json", exitCode: 0 },
+  );
+  equal(replay.result, undefined, "callback/malformed-exit-zero-visible/result");
+  equal(replay.errors, [
+    "[dcg] OMP guard infrastructure failure (exit 0): dcg stdout was malformed",
+  ], "callback/malformed-exit-zero-visible/diagnostics");
+
+  replay = await invoke(
+    "callback/unknown-exit-two-visible",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { stdout: JSON.stringify({ decision: "future" }), exitCode: 2 },
+  );
+  equal(replay.result, undefined, "callback/unknown-exit-two-visible/result");
+  equal(replay.errors, [
+    "[dcg] OMP guard infrastructure failure (exit 2): dcg stdout carried an unrecognized decision",
+  ], "callback/unknown-exit-two-visible/diagnostics");
+
+  replay = await invoke(
+    "callback/stderr-overflow",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { stdout: JSON.stringify({ decision: "allow" }), stderr: "d".repeat(DCG_STDERR_MAX_BYTES + 1), exitCode: 0 },
+  );
+  equal(replay.result, undefined, "callback/stderr-overflow/result");
+  check(replay.errors.some(error => error.includes("additional bytes omitted")), "callback/stderr-overflow/visible-marker");
+
+  replay = await invoke(
+    "callback/stderr-json-is-diagnostic",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { stdout: "", stderr: JSON.stringify({ decision: "deny", reason: "wrong channel" }), exitCode: 0 },
+  );
+  equal(replay.result, undefined, "callback/stderr-json-is-diagnostic/result");
+  equal(replay.errors, ["[dcg] OMP guard dcg stderr: {\"decision\":\"deny\",\"reason\":\"wrong channel\"}"], "callback/stderr-json-is-diagnostic/diagnostics");
+
+  replay = await invoke(
+    "callback/exit-one-stderr-only",
+    { toolName: "bash", input: { command: "danger" } },
+    { stdout: "", stderr: "status-only diagnostic", exitCode: 1 },
+  );
+  equal(replay.result, { block: true, reason: "Blocked by dcg (exit 1 without a blocking decision)" }, "callback/exit-one-stderr-only/result");
+  equal(replay.errors, ["[dcg] OMP guard dcg stderr: status-only diagnostic"], "callback/exit-one-stderr-only/diagnostics");
+
+  replay = await invoke(
+    "callback/stderr-reject-deny",
+    { toolName: "bash", input: { command: "danger" } },
+    {
+      stdout: JSON.stringify({ decision: "deny", reason: "deny survives stderr fault" }),
+      stderrError: "synthetic stderr read failure",
+      exitCode: 0,
+    },
+  );
+  equal(replay.result, { block: true, reason: "deny survives stderr fault" }, "callback/stderr-reject-deny/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 0): stderr read failed: Error: synthetic stderr read failure"], "callback/stderr-reject-deny/diagnostics");
+
+  replay = await invoke(
+    "callback/stdout-reject-exit-one",
+    { toolName: "bash", input: { command: "danger" } },
+    {
+      stdoutError: "synthetic stdout read failure",
+      stderr: "status diagnostic",
+      exitCode: 1,
+    },
+  );
+  equal(replay.result, { block: true, reason: "Blocked by dcg (exit 1 without a blocking decision)" }, "callback/stdout-reject-exit-one/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 1): status diagnostic; stdout read failed: Error: synthetic stdout read failure"], "callback/stdout-reject-exit-one/diagnostics");
+
+  replay = await invoke(
+    "callback/exit-reject-deny",
+    { toolName: "bash", input: { command: "danger" } },
+    {
+      stdout: JSON.stringify({ decision: "deny", reason: "deny survives exit fault" }),
+      exitError: "synthetic exit status failure",
+    },
+  );
+  equal(replay.result, { block: true, reason: "deny survives exit fault" }, "callback/exit-reject-deny/result");
+  equal(replay.spawns[0]!.killCalls, 1, "callback/exit-reject-deny/direct-child-kill");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status unavailable): exit status failed: Error: synthetic exit status failure"], "callback/exit-reject-deny/diagnostics-without-unobserved-signal");
+
+  replay = await invoke(
+    "callback/signal-reject-deny",
+    { toolName: "bash", input: { command: "danger" } },
+    {
+      stdout: JSON.stringify({ decision: "deny", reason: "deny survives signal fault" }),
+      exitCode: 0,
+      signalError: "synthetic signal status failure",
+    },
+  );
+  equal(replay.result, { block: true, reason: "deny survives signal fault" }, "callback/signal-reject-deny/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 0): signal status failed: Error: synthetic signal status failure"], "callback/signal-reject-deny/diagnostics");
+
+  replay = await invoke(
+    "callback/signal-reject-exit-one",
+    { toolName: "bash", input: { command: "danger" } },
+    { stdout: "", exitCode: 1, signalError: "synthetic signal status failure" },
+  );
+  equal(replay.result, { block: true, reason: "Blocked by dcg (exit 1 without a blocking decision)" }, "callback/signal-reject-exit-one/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 1): signal status failed: Error: synthetic signal status failure"], "callback/signal-reject-exit-one/diagnostics");
+
+  replay = await invoke(
+    "callback/stdout-reject-exit-zero",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { stdoutError: "synthetic stdout read failure", exitCode: 0 },
+  );
+  equal(replay.result, undefined, "callback/stdout-reject-exit-zero/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 0): stdout read failed: Error: synthetic stdout read failure"], "callback/stdout-reject-exit-zero/diagnostics");
+
+  replay = await invoke(
+    "callback/exit-reject-no-verdict",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { exitError: "synthetic exit status failure" },
+  );
+  equal(replay.result, undefined, "callback/exit-reject-no-verdict/result");
+  equal(replay.spawns[0]!.killCalls, 1, "callback/exit-reject-no-verdict/direct-child-kill");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status unavailable): exit status failed: Error: synthetic exit status failure"], "callback/exit-reject-no-verdict/diagnostics-without-unobserved-signal");
+
+  replay = await invoke(
+    "callback/exit-reject-late-sigkill-deny",
+    { toolName: "bash", input: { command: "danger" } },
+    {
+      stdout: JSON.stringify({ decision: "deny", reason: "deny survives late signal" }),
+      exitError: "synthetic early exit status failure",
+      signalAfterKill: "SIGKILL",
+      signalAfterKillDelayMs: 5,
+      stdoutTerminalDelayMs: 80,
+    },
+  );
+  equal(replay.result, { block: true, reason: "deny survives late signal" }, "callback/exit-reject-late-sigkill-deny/result");
+  equal(replay.spawns[0]!.killCalls, 1, "callback/exit-reject-late-sigkill-deny/direct-child-kill");
+  equal(replay.errors, [
+    "[dcg] OMP guard infrastructure failure (signal SIGKILL): exit status failed: Error: synthetic early exit status failure; child pipes exceeded the 250-millisecond post-exit drain grace",
+  ], "callback/exit-reject-late-sigkill-deny/diagnostics");
+
+  replay = await invoke(
+    "callback/exit-two-deny",
+    { toolName: "bash", input: { command: "danger" } },
+    { stdout: JSON.stringify({ decision: "deny", reason: "deny beats status two" }), exitCode: 2 },
+  );
+  equal(replay.result, { block: true, reason: "deny beats status two" }, "callback/exit-two-deny/result");
+
+  replay = await invoke(
+    "callback/infrastructure-exit",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { stdout: "", stderr: "child crash", exitCode: 9 },
+  );
+  equal(replay.result, undefined, "callback/infrastructure-exit/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 9): child crash"], "callback/infrastructure-exit/diagnostics");
+
+  replay = await invoke(
+    "callback/exit-nine-after-deny",
+    { toolName: "bash", input: { command: "danger" } },
+    { stdout: JSON.stringify({ decision: "deny", reason: "deny survives exit nine" }), exitCode: 9 },
+  );
+  equal(replay.result, { block: true, reason: "deny survives exit nine" }, "callback/exit-nine-after-deny/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 9)"], "callback/exit-nine-after-deny/diagnostics");
+
+  replay = await invoke(
+    "callback/normal-exit-137",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { exitCode: 137, signalCode: null },
+  );
+  equal(replay.result, undefined, "callback/normal-exit-137/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 137)"], "callback/normal-exit-137/diagnostics");
+
+  replay = await invoke(
+    "callback/normal-exit-137-after-deny",
+    { toolName: "bash", input: { command: "danger" } },
+    { stdout: JSON.stringify({ decision: "deny", reason: "deny survives exit 137" }), exitCode: 137, signalCode: null },
+  );
+  equal(replay.result, { block: true, reason: "deny survives exit 137" }, "callback/normal-exit-137-after-deny/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 137)"], "callback/normal-exit-137-after-deny/diagnostics");
+
+  replay = await invoke(
+    "callback/sigkill-no-verdict",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { exitCode: 137, signalCode: "SIGKILL" },
+  );
+  equal(replay.result, undefined, "callback/sigkill-no-verdict/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (signal SIGKILL)"], "callback/sigkill-no-verdict/diagnostics");
+
+  replay = await invoke(
+    "callback/sigkill-after-deny",
+    { toolName: "bash", input: { command: "danger" } },
+    {
+      stdout: JSON.stringify({ decision: "deny", reason: "deny survives signal" }),
+      stderr: "signal-side diagnostic",
+      exitCode: 137,
+      signalCode: "SIGKILL",
+    },
+  );
+  equal(replay.result, { block: true, reason: "deny survives signal" }, "callback/sigkill-after-deny/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (signal SIGKILL): signal-side diagnostic"], "callback/sigkill-after-deny/diagnostics");
+
+  replay = await invoke(
+    "callback/exit-one-beats-signal",
+    { toolName: "bash", input: { command: "danger" } },
+    { stderr: "exit-one signal diagnostic", exitCode: 1, signalCode: "SIGKILL" },
+  );
+  equal(replay.result, { block: true, reason: "Blocked by dcg (exit 1 without a blocking decision)" }, "callback/exit-one-beats-signal/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (signal SIGKILL): exit-one signal diagnostic"], "callback/exit-one-beats-signal/diagnostics");
+
+  replay = await invoke(
+    "callback/undefined-exit",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { exitCode: undefined },
+  );
+  equal(replay.result, undefined, "callback/undefined-exit/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status unavailable)"], "callback/undefined-exit/diagnostics");
+
+  replay = await invoke(
+    "callback/null-exit",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { exitCode: null },
+  );
+  equal(replay.result, undefined, "callback/null-exit/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status null)"], "callback/null-exit/diagnostics");
+
+  replay = await invoke(
+    "callback/control-exit",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { exitCode: "137\n\u001b[31mFORGED" },
+  );
+  equal(replay.result, undefined, "callback/control-exit/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status invalid: string)"], "callback/control-exit/diagnostics");
+
+  replay = await invoke(
+    "callback/oversized-exit",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { exitCode: "7".repeat(DCG_STDERR_MAX_BYTES + 1) },
+  );
+  equal(replay.result, undefined, "callback/oversized-exit/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status invalid: string)"], "callback/oversized-exit/diagnostics");
+
+  replay = await invoke(
+    "callback/hostile-object-exit",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { exitCode: { toString(): string { throw new Error("invalid exit status must not be coerced"); } } },
+  );
+  equal(replay.result, undefined, "callback/hostile-object-exit/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status invalid: object)"], "callback/hostile-object-exit/diagnostics");
+
+  replay = await invoke(
+    "callback/invalid-signal",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { exitCode: 137, signalCode: { signal: "SIGKILL" } },
+  );
+  equal(replay.result, undefined, "callback/invalid-signal/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 137): signal status invalid: object"], "callback/invalid-signal/diagnostics");
+
+  replay = await invoke(
+    "callback/control-signal",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { exitCode: 137, signalCode: "SIGKILL\n\u001b[31mFORGED" },
+  );
+  equal(replay.result, undefined, "callback/control-signal/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 137): signal status invalid: string"], "callback/control-signal/diagnostics");
+
+  replay = await invoke(
+    "callback/oversized-signal",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { exitCode: 137, signalCode: "S".repeat(DCG_STDERR_MAX_BYTES + 1) },
+  );
+  equal(replay.result, undefined, "callback/oversized-signal/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 137): signal status invalid: string"], "callback/oversized-signal/diagnostics");
+
+  replay = await invoke(
+    "callback/pipe-deadline-before-deny",
+    { toolName: "bash", input: { command: "danger" } },
+    {
+      stdout: JSON.stringify({ decision: "deny", reason: "too late" }),
+      stdoutInitialDelayMs: 80,
+      exitCode: 0,
+    },
+  );
+  equal(replay.result, undefined, "callback/pipe-deadline-before-deny/result");
+  check(replay.elapsedMs < 50, "callback/pipe-deadline-before-deny/remained-bounded");
+  equal(replay.watchdogFires, 1, "callback/pipe-deadline-before-deny/watchdog-fire-count");
+  equal(replay.errors, [
+    "[dcg] OMP guard infrastructure failure (exit 0): child pipes exceeded the 250-millisecond post-exit drain grace",
+  ], "callback/pipe-deadline-before-deny/diagnostics-exactly-once");
+
+  replay = await invoke(
+    "callback/pipe-deadline-after-deny",
+    { toolName: "bash", input: { command: "danger" } },
+    {
+      stdout: JSON.stringify({ decision: "deny", reason: "retained deny survives cancellation" }),
+      stdoutTerminalDelayMs: 80,
+      exitCode: 0,
+    },
+  );
+  equal(replay.result, { block: true, reason: "retained deny survives cancellation" }, "callback/pipe-deadline-after-deny/result");
+  check(replay.elapsedMs < 50, "callback/pipe-deadline-after-deny/remained-bounded");
+  equal(replay.watchdogFires, 1, "callback/pipe-deadline-after-deny/watchdog-fire-count");
+  equal(replay.errors, [
+    "[dcg] OMP guard infrastructure failure (exit 0): child pipes exceeded the 250-millisecond post-exit drain grace",
+  ], "callback/pipe-deadline-after-deny/diagnostics-exactly-once");
+
+  replay = await invoke(
+    "callback/stderr-pipe-deadline-after-deny",
+    { toolName: "bash", input: { command: "danger" } },
+    {
+      stdout: JSON.stringify({ decision: "deny", reason: "deny survives held stderr" }),
+      stderr: "retained stderr",
+      stderrTerminalDelayMs: 80,
+      exitCode: 0,
+    },
+  );
+  equal(replay.result, { block: true, reason: "deny survives held stderr" }, "callback/stderr-pipe-deadline-after-deny/result");
+  check(replay.elapsedMs < 50, "callback/stderr-pipe-deadline-after-deny/remained-bounded");
+  equal(replay.errors, [
+    "[dcg] OMP guard infrastructure failure (exit 0): retained stderr; child pipes exceeded the 250-millisecond post-exit drain grace",
+  ], "callback/stderr-pipe-deadline-after-deny/diagnostics-exactly-once");
+
+  replay = await invoke(
+    "callback/pipe-deadline-after-overflow",
+    { toolName: "bash", input: { command: "danger" } },
+    {
+      stdout: "x".repeat(DCG_STDOUT_MAX_BYTES + 1),
+      stdoutTerminalDelayMs: 80,
+      exitCode: 0,
+    },
+  );
+  equal(replay.result, {
+    block: true,
+    reason: `Blocked by dcg because evaluator stdout exceeded the ${DCG_STDOUT_MAX_BYTES}-byte safety-verdict cap`,
+  }, "callback/pipe-deadline-after-overflow/result");
+  check(replay.elapsedMs < 50, "callback/pipe-deadline-after-overflow/remained-bounded");
+  equal(replay.errors, [
+    `[dcg] OMP guard dcg stdout exceeded ${DCG_STDOUT_MAX_BYTES}-byte safety-verdict cap; blocking conservatively`,
+    "[dcg] OMP guard infrastructure failure (exit 0): child pipes exceeded the 250-millisecond post-exit drain grace",
+  ], "callback/pipe-deadline-after-overflow/diagnostics-each-exactly-once");
+
+  replay = await invoke(
+    "callback/cancel-reject-after-deny",
+    { toolName: "bash", input: { command: "danger" } },
+    {
+      stdout: JSON.stringify({ decision: "deny", reason: "deny survives rejected cancellation" }),
+      stdoutTerminalDelayMs: 80,
+      stdoutCancelError: "synthetic stdout cancel rejection",
+      exitCode: 0,
+    },
+  );
+  equal(replay.result, { block: true, reason: "deny survives rejected cancellation" }, "callback/cancel-reject-after-deny/result");
+  equal(replay.spawns[0]!.stdoutCancelCalls, 1, "callback/cancel-reject-after-deny/cancel-owner-once");
+  equal(replay.errors, [
+    "[dcg] OMP guard infrastructure failure (exit 0): child pipes exceeded the 250-millisecond post-exit drain grace",
+  ], "callback/cancel-reject-after-deny/boundary-diagnostic-exactly-once");
+
+  replay = await invoke(
+    "callback/cancel-reject-after-overflow",
+    { toolName: "bash", input: { command: "danger" } },
+    {
+      stdout: "x".repeat(DCG_STDOUT_MAX_BYTES + 1),
+      stdoutTerminalDelayMs: 80,
+      stdoutCancelError: "synthetic overflow cancel rejection",
+      exitCode: 0,
+    },
+  );
+  equal(replay.result, {
+    block: true,
+    reason: `Blocked by dcg because evaluator stdout exceeded the ${DCG_STDOUT_MAX_BYTES}-byte safety-verdict cap`,
+  }, "callback/cancel-reject-after-overflow/result");
+  equal(replay.spawns[0]!.stdoutCancelCalls, 1, "callback/cancel-reject-after-overflow/cancel-owner-once");
+  equal(replay.errors, [
+    `[dcg] OMP guard dcg stdout exceeded ${DCG_STDOUT_MAX_BYTES}-byte safety-verdict cap; blocking conservatively`,
+    "[dcg] OMP guard infrastructure failure (exit 0): child pipes exceeded the 250-millisecond post-exit drain grace",
+  ], "callback/cancel-reject-after-overflow/diagnostics-each-exactly-once");
+  await new Promise<void>(resolve => originalSetTimeout(resolve, 0));
+  equal(unhandledRejections, [], "callback/cancel-reject/no-unhandled-rejection");
+
+  replay = await invoke(
+    "callback/exit-one-tick-before-hard-deadline",
+    { toolName: "bash", input: { command: "danger" } },
+    {
+      stdout: JSON.stringify({ decision: "deny", reason: "deny survives absolute deadline" }),
+      stdoutTerminalDelayMs: 80,
+      exitCode: 0,
+      exitAtHardDeadlineMinusMs: 1,
+    },
+  );
+  equal(replay.result, { block: true, reason: "deny survives absolute deadline" }, "callback/exit-one-tick-before-hard-deadline/result");
+  equal(replay.virtualElapsedMs, DCG_CHILD_OBSERVATION_TIMEOUT_MS, "callback/exit-one-tick-before-hard-deadline/absolute-virtual-deadline");
+  check(replay.elapsedMs < 55, "callback/exit-one-tick-before-hard-deadline/remained-wall-bounded");
+  equal(replay.spawns[0]!.killCalls, 0, "callback/exit-one-tick-before-hard-deadline/no-dead-child-rekill");
+  equal(replay.spawns[0]!.stdoutCancelCalls, 1, "callback/exit-one-tick-before-hard-deadline/cancel-owner-once");
+  equal(replay.watchdogSchedules, 2, "callback/exit-one-tick-before-hard-deadline/initial-plus-clamped-rearm");
+  equal(replay.watchdogFires, 1, "callback/exit-one-tick-before-hard-deadline/watchdog-fire-count");
+  equal(replay.peakWatchdogs, 1, "callback/exit-one-tick-before-hard-deadline/peak-active-watchdog");
+  equal(replay.errors, [
+    "[dcg] OMP guard infrastructure failure (exit 0): child observation exceeded the 30500-millisecond outer deadline",
+  ], "callback/exit-one-tick-before-hard-deadline/diagnostic-exactly-once");
+  const absoluteDeadlineDiagnostics = [...diagnostics];
+  const absoluteDeadlineFires = watchdogFireCount;
+  await new Promise<void>(resolve => originalSetTimeout(resolve, 40));
+  equal(diagnostics, absoluteDeadlineDiagnostics, "callback/exit-one-tick-before-hard-deadline/no-late-diagnostic");
+  equal(watchdogFireCount, absoluteDeadlineFires, "callback/exit-one-tick-before-hard-deadline/no-late-watchdog");
+  equal(unhandledRejections, [], "callback/exit-one-tick-before-hard-deadline/no-late-unhandled-rejection");
+
+  replay = await invoke(
+    "callback/exit-reject-kill-failure",
+    { toolName: "bash", input: { command: "danger" } },
+    {
+      stdout: JSON.stringify({ decision: "deny", reason: "deny survives kill failure" }),
+      exitError: "synthetic exit status failure",
+      killError: "synthetic kill failure",
+    },
+  );
+  equal(replay.result, { block: true, reason: "deny survives kill failure" }, "callback/exit-reject-kill-failure/result");
+  equal(replay.spawns[0]!.killCalls, 1, "callback/exit-reject-kill-failure/direct-child-kill-attempt");
+  equal(replay.errors, [
+    "[dcg] OMP guard infrastructure failure (exit status unavailable): exit status failed: Error: synthetic exit status failure; direct-child SIGKILL failed: Error: synthetic kill failure",
+  ], "callback/exit-reject-kill-failure/diagnostics-exactly-once");
+
+  replay = await invoke(
+    "callback/hard-deadline-after-deny",
+    { toolName: "bash", input: { command: "danger" } },
+    {
+      stdout: JSON.stringify({ decision: "deny", reason: "deny survives hard deadline" }),
+      stdoutTerminalDelayMs: 80,
+      stderrTerminalDelayMs: 80,
+      exitDelayMs: 70,
+      exitError: "late exit observation rejection",
+      signalAfterKill: "SIGKILL",
+      signalAfterKillDelayMs: 60,
+    },
+  );
+  equal(replay.result, { block: true, reason: "deny survives hard deadline" }, "callback/hard-deadline-after-deny/result");
+  check(replay.elapsedMs < 55, "callback/hard-deadline-after-deny/remained-bounded");
+  equal(replay.spawns[0]!.killCalls, 1, "callback/hard-deadline-after-deny/direct-child-kill");
+  equal(replay.watchdogSchedules, 1, "callback/hard-deadline-after-deny/one-watchdog-at-a-time");
+  equal(replay.watchdogFires, 1, "callback/hard-deadline-after-deny/watchdog-fire-count");
+  equal(replay.errors, [
+    "[dcg] OMP guard infrastructure failure (exit status unavailable): child observation exceeded the 30500-millisecond outer deadline",
+  ], "callback/hard-deadline-after-deny/no-unobserved-signal-diagnostic");
+  const settledDiagnostics = [...diagnostics];
+  const settledWatchdogFires = watchdogFireCount;
+  await new Promise<void>(resolve => originalSetTimeout(resolve, 90));
+  equal(diagnostics, settledDiagnostics, "callback/hard-deadline-after-deny/no-late-diagnostic");
+  equal(watchdogFireCount, settledWatchdogFires, "callback/hard-deadline-after-deny/no-late-watchdog");
+  equal(unhandledRejections, [], "callback/hard-deadline-after-deny/no-late-unhandled-rejection");
+
+  replay = await invoke(
+    "callback/timeout-no-verdict",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { stuckUntilTimeout: true },
+  );
+  check(replay.elapsedMs < 1_000, "callback/timeout-no-verdict/remained-bounded");
+  equal(replay.result, undefined, "callback/timeout-no-verdict/result");
+  equal(replay.spawns.length, 1, "callback/timeout-no-verdict/spawn-count");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (signal SIGKILL)"], "callback/timeout-no-verdict/diagnostics");
+
+  replay = await invoke(
+    "callback/timeout-after-deny",
+    { toolName: "bash", input: { command: "git reset --hard" } },
+    {
+      stdout: JSON.stringify({ decision: "deny", reason: "deny survives timeout", rule_id: "core.git:test" }),
+      stuckUntilTimeout: true,
+    },
+  );
+  equal(replay.result, { block: true, reason: "deny survives timeout\n\nRule: core.git:test" }, "callback/timeout-after-deny/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (signal SIGKILL)"], "callback/timeout-after-deny/diagnostics");
+
+  replay = await invoke(
+    "callback/spawn-throw",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { spawnError: "synthetic spawn failure" },
+  );
+  equal(replay.result, undefined, "callback/spawn-throw/result");
+  equal(replay.spawns.length, 0, "callback/spawn-throw/spawn-count");
+  equal(replay.watchdogSchedules, 0, "callback/spawn-throw/no-watchdog-before-successful-spawn");
+  equal(replay.errors, ["[dcg] OMP guard could not run dcg: Error: synthetic spawn failure"], "callback/spawn-throw/diagnostics");
+} finally {
+  (Bun as unknown as { spawn: typeof Bun.spawn }).spawn = originalSpawn;
+  console.error = originalConsoleError;
+  globalThis.setTimeout = originalSetTimeout;
+  globalThis.clearTimeout = originalClearTimeout;
+  (performance as unknown as { now: () => number }).now = originalPerformanceNow;
+  process.off("unhandledRejection", recordUnhandledRejection);
+}
+
+const bridgeBytes = new Uint8Array(await Bun.file(new URL("./dcg-guard.ts", import.meta.url)).arrayBuffer());
+const digestBytes = new Uint8Array(await crypto.subtle.digest("SHA-256", bridgeBytes));
+const bridgeSha256 = Array.from(digestBytes, byte => byte.toString(16).padStart(2, "0")).join("");
+console.log(JSON.stringify({
+  schema: "dcg-omp-bridge-replay-v1",
+  bridgeSha256,
+  bunVersion: Bun.version,
+  toolCaseIds,
+  transitionCaseIds,
+  terminationCaseIds,
+  framingCaseIds,
+  stdinCaseIds,
+  callbackCaseIds,
+  watchdogScheduleCount,
+  watchdogFireCount,
+  peakWatchdogCount,
+  unhandledRejectionCount: unhandledRejections.length,
+  spawnExecutable: observedExecutable,
+  stubExports: [
+    "@oh-my-pi/pi-coding-agent/config/settings:settings",
+    "@oh-my-pi/pi-coding-agent/tools/path-utils:resolveToCwd",
+    "@oh-my-pi/pi-coding-agent/tools/shell-tokenize:extractLeadingCdTarget",
+    "@oh-my-pi/pi-utils:procmgr",
+  ],
+  probeComplete: true,
+}));
+"#,
+        )
+        .expect("write Bun replay runner");
+    }
+
+    fn run_omp_bridge_bun_fixture(
+        bun: &std::path::Path,
+        root: &std::path::Path,
+        source: &str,
+    ) -> std::process::Output {
+        write_omp_bridge_bun_fixture(root, source);
+        std::process::Command::new(bun)
+            .args(["run", "./runner.ts"])
+            .current_dir(root)
+            .env("DCG_BIN", root.join("ambient-decoy-dcg"))
+            .env_remove("PI_NO_PTY")
+            .output()
+            .expect("launch Bun OMP bridge replay")
+    }
+
+    /// Translation-validates the exact generated module in Bun. This is an
+    /// explicit opt-in gate because the Rust project does not otherwise depend
+    /// on Bun: invoke it with
+    /// `DCG_OMP_REPLAY_ROOT=/fresh/persistent/path cargo test --lib cli::tests::omp_generated_extension_executes_replay_certificate -- --ignored --exact --nocapture`.
+    /// The same corpus must reject a one-cell transition mutant, which proves
+    /// the replay is sensitive to the safety behavior it certifies.
+    #[test]
+    #[ignore = "requires Bun to execute the generated OMP TypeScript bridge"]
+    fn omp_generated_extension_executes_replay_certificate() {
+        use sha2::Digest as _;
+        use std::fmt::Write as _;
+
+        let bun = which_executable("bun").expect(
+            "Bun is required for the OMP bridge replay certificate; install Bun or run this gate on an OMP-capable host",
+        );
+        let executable = current_dcg_executable().expect("current executable");
+        let source = build_omp_extension_source(&executable).expect("extension generation");
+        let temporary_root;
+        let replay_root = if let Some(path) = std::env::var_os("DCG_OMP_REPLAY_ROOT") {
+            let root = std::path::PathBuf::from(path);
+            std::fs::create_dir(&root).expect("create fresh persistent bridge replay root");
+            temporary_root = None;
+            root
+        } else {
+            let root = tempfile::tempdir().expect("temporary bridge replay root");
+            let path = root.path().to_path_buf();
+            temporary_root = Some(root);
+            path
+        };
+        let _temporary_root_guard = temporary_root;
+        let exact_root = replay_root.join("exact");
+        std::fs::create_dir_all(&exact_root).expect("create exact replay root");
+
+        let output = run_omp_bridge_bun_fixture(&bun, &exact_root, &source);
+        assert!(
+            output.status.success(),
+            "exact generated bridge replay failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "callback diagnostics must be captured inside the runner, not contaminate the certificate stream: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let certificate: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("single JSON replay certificate");
+        assert_eq!(
+            certificate
+                .get("schema")
+                .and_then(serde_json::Value::as_str),
+            Some("dcg-omp-bridge-replay-v1")
+        );
+        assert_eq!(
+            certificate
+                .get("probeComplete")
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "a runner that dies before the complete corpus must not certify the bridge"
+        );
+        let digest = sha2::Sha256::digest(source.as_bytes());
+        let mut expected_digest = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            let _ = write!(expected_digest, "{byte:02x}");
+        }
+        assert_eq!(
+            certificate
+                .get("bridgeSha256")
+                .and_then(serde_json::Value::as_str),
+            Some(expected_digest.as_str()),
+            "Bun must execute the exact bytes emitted by the Rust generator"
+        );
+        assert!(
+            certificate
+                .get("bunVersion")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|version| !version.is_empty()),
+            "certificate must identify the Bun runtime"
+        );
+        let executable_text = executable.to_string_lossy();
+        assert_eq!(
+            certificate
+                .get("spawnExecutable")
+                .and_then(serde_json::Value::as_str),
+            Some(executable_text.as_ref()),
+            "the hermetic replay must exercise the generator's embedded executable, not an ambient DCG_BIN override"
+        );
+
+        let string_array = |field: &str| {
+            certificate
+                .get(field)
+                .and_then(serde_json::Value::as_array)
+                .unwrap_or_else(|| panic!("certificate field {field} must be an array"))
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .unwrap_or_else(|| panic!("certificate field {field} must contain strings"))
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            string_array("toolCaseIds"),
+            [
+                "tool/null-event",
+                "tool/array-event",
+                "tool/primitive-event",
+                "tool/missing-name",
+                "tool/name-case",
+                "tool/other-name",
+                "tool/null-input",
+                "tool/array-input",
+                "tool/missing-command",
+                "tool/null-command",
+                "tool/numeric-command",
+                "tool/empty-command",
+                "tool/whitespace-command",
+                "tool/string-command",
+            ]
+            .map(str::to_string)
+        );
+        let expected_transition_ids = [
+            "spawn-throw",
+            "exit-0",
+            "exit-1",
+            "exit-2",
+            "exit-other",
+            "signal",
+        ]
+        .into_iter()
+        .flat_map(|outcome| {
+            [
+                "empty",
+                "malformed",
+                "allow",
+                "deny",
+                "ask",
+                "indeterminate",
+                "unknown",
+            ]
+            .into_iter()
+            .map(move |verdict| format!("transition/{outcome}/{verdict}"))
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(string_array("transitionCaseIds"), expected_transition_ids);
+        assert_eq!(
+            string_array("terminationCaseIds"),
+            [
+                "termination/exit-0",
+                "termination/exit-1",
+                "termination/exit-2",
+                "termination/exit-9",
+                "termination/normal-exit-137",
+                "termination/sigkill",
+                "termination/numeric-signal",
+                "termination/signal-beats-exit-0",
+                "termination/exit-1-beats-signal",
+                "termination/undefined-exit",
+                "termination/null-exit",
+                "termination/string-exit",
+                "termination/fractional-exit",
+                "termination/nan-exit",
+                "termination/empty-signal",
+                "termination/control-signal",
+                "termination/lowercase-signal",
+                "termination/bare-sig",
+                "termination/oversized-signal",
+                "termination/object-signal",
+            ]
+            .map(str::to_string)
+        );
+        let expected_framing_ids = [
+            "framing/deny-before-partial-junk",
+            "framing/ask-before-partial-junk",
+            "framing/indeterminate-before-partial-junk",
+            "framing/allow-then-deny",
+            "framing/deny-then-allow",
+            "framing/junk-then-deny",
+            "framing/partial-deny-then-deny",
+            "framing/deny-crlf-before-partial-junk",
+            "framing/partial-deny-then-allow",
+            "framing/allow-before-partial-junk",
+            "framing/deny-prefix-incomplete-json",
+            "framing/ask-prefix-incomplete-json",
+            "framing/indeterminate-prefix-incomplete-json",
+            "framing/deny-with-same-line-junk",
+        ]
+        .into_iter()
+        .flat_map(|case_id| {
+            [
+                "spawn-throw",
+                "exit-0",
+                "exit-1",
+                "exit-2",
+                "exit-other",
+                "signal",
+            ]
+            .into_iter()
+            .map(move |outcome| format!("{case_id}/{outcome}"))
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(string_array("framingCaseIds"), expected_framing_ids);
+        assert_eq!(
+            string_array("stdinCaseIds"),
+            [
+                "stdin/direct-controls",
+                "stdin/direct-astral",
+                "stdin/direct-lone-high",
+                "stdin/direct-lone-low",
+                "stdin/stream-just-over",
+                "stdin/stream-astral-boundary",
+                "stdin/stream-lone-high-boundary",
+                "stdin/stream-lone-low-boundary",
+                "stdin/stream-reversed-surrogates",
+            ]
+            .map(str::to_string)
+        );
+        assert_eq!(
+            string_array("callbackCaseIds"),
+            [
+                "callback/other-tool",
+                "callback/malformed-bash",
+                "callback/empty-command",
+                "callback/whitespace-allow",
+                "callback/stdin-newline-only",
+                "callback/stdin-crlf-only",
+                "callback/stdin-controls",
+                "callback/stdin-astral-boundary",
+                "callback/stdin-lone-high-direct",
+                "callback/stdin-lone-high-stream",
+                "callback/exit-zero-deny",
+                "callback/oversized-deny",
+                "callback/oversized-non-verdict",
+                "callback/deny-then-stdout-fault",
+                "callback/framed-deny-split-junk-fault",
+                "callback/allow-then-stdout-fault",
+                "callback/malformed-exit-zero-visible",
+                "callback/unknown-exit-two-visible",
+                "callback/stderr-overflow",
+                "callback/stderr-json-is-diagnostic",
+                "callback/exit-one-stderr-only",
+                "callback/stderr-reject-deny",
+                "callback/stdout-reject-exit-one",
+                "callback/exit-reject-deny",
+                "callback/signal-reject-deny",
+                "callback/signal-reject-exit-one",
+                "callback/stdout-reject-exit-zero",
+                "callback/exit-reject-no-verdict",
+                "callback/exit-reject-late-sigkill-deny",
+                "callback/exit-two-deny",
+                "callback/infrastructure-exit",
+                "callback/exit-nine-after-deny",
+                "callback/normal-exit-137",
+                "callback/normal-exit-137-after-deny",
+                "callback/sigkill-no-verdict",
+                "callback/sigkill-after-deny",
+                "callback/exit-one-beats-signal",
+                "callback/undefined-exit",
+                "callback/null-exit",
+                "callback/control-exit",
+                "callback/oversized-exit",
+                "callback/hostile-object-exit",
+                "callback/invalid-signal",
+                "callback/control-signal",
+                "callback/oversized-signal",
+                "callback/pipe-deadline-before-deny",
+                "callback/pipe-deadline-after-deny",
+                "callback/stderr-pipe-deadline-after-deny",
+                "callback/pipe-deadline-after-overflow",
+                "callback/cancel-reject-after-deny",
+                "callback/cancel-reject-after-overflow",
+                "callback/exit-one-tick-before-hard-deadline",
+                "callback/exit-reject-kill-failure",
+                "callback/hard-deadline-after-deny",
+                "callback/timeout-no-verdict",
+                "callback/timeout-after-deny",
+                "callback/spawn-throw",
+            ]
+            .map(str::to_string)
+        );
+        assert_eq!(
+            certificate
+                .get("unhandledRejectionCount")
+                .and_then(serde_json::Value::as_u64),
+            Some(0),
+            "late child settlement must not create an unhandled rejection"
+        );
+        assert!(
+            certificate
+                .get("watchdogScheduleCount")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|count| count > 0),
+            "the exact replay must exercise production watchdog scheduling"
+        );
+        assert!(
+            certificate
+                .get("watchdogFireCount")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|count| count >= 5),
+            "the exact replay must execute pipe, hard, and compressed native-timeout observation boundaries"
+        );
+        assert_eq!(
+            certificate
+                .get("peakWatchdogCount")
+                .and_then(serde_json::Value::as_u64),
+            Some(1),
+            "the bridge must never own more than one active observation watchdog"
+        );
+        assert_eq!(
+            string_array("stubExports"),
+            [
+                "@oh-my-pi/pi-coding-agent/config/settings:settings",
+                "@oh-my-pi/pi-coding-agent/tools/path-utils:resolveToCwd",
+                "@oh-my-pi/pi-coding-agent/tools/shell-tokenize:extractLeadingCdTarget",
+                "@oh-my-pi/pi-utils:procmgr",
+            ]
+            .map(str::to_string)
+        );
+
+        let exit_zero_row = r#""exit-0": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }"#;
+        let mutated_exit_zero_row = r#""exit-0": { empty: "allow", malformed: "allow", allow: "allow", deny: "allow", ask: "block", indeterminate: "block", unknown: "allow" }"#;
+        assert_eq!(
+            source.matches(exit_zero_row).count(),
+            1,
+            "mutation witness must identify exactly one production transition row"
+        );
+        let mutant = source.replacen(exit_zero_row, mutated_exit_zero_row, 1);
+        let mutant_root = replay_root.join("mutant-exit-zero-deny");
+        std::fs::create_dir_all(&mutant_root).expect("create mutant replay root");
+        let mutant_output = run_omp_bridge_bun_fixture(&bun, &mutant_root, &mutant);
+        assert!(
+            !mutant_output.status.success(),
+            "the executable corpus vacuously accepted an exit-0 deny-to-allow mutation\nstdout:\n{}",
+            String::from_utf8_lossy(&mutant_output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&mutant_output.stderr)
+                .contains("transition/exit-0/deny/action"),
+            "mutant red must identify the changed transition cell\nstderr:\n{}",
+            String::from_utf8_lossy(&mutant_output.stderr)
+        );
+
+        let signal_classifier = r#"if (isDcgSignalCode(signalCode)) return "signal";"#;
+        let signal_collapse_mutant = r#"if (isDcgSignalCode(signalCode)) return "exit-other";"#;
+        assert_eq!(
+            source.matches(signal_classifier).count(),
+            1,
+            "signal mutation witness must identify exactly one provenance classifier"
+        );
+        let signal_mutant = source.replacen(signal_classifier, signal_collapse_mutant, 1);
+        let signal_mutant_root = replay_root.join("mutant-collapse-signal-provenance");
+        std::fs::create_dir_all(&signal_mutant_root)
+            .expect("create signal-provenance mutant replay root");
+        let signal_mutant_output =
+            run_omp_bridge_bun_fixture(&bun, &signal_mutant_root, &signal_mutant);
+        assert!(
+            !signal_mutant_output.status.success(),
+            "the executable corpus vacuously accepted collapsing SIGKILL into ordinary exit 137\nstdout:\n{}",
+            String::from_utf8_lossy(&signal_mutant_output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&signal_mutant_output.stderr)
+                .contains("termination/sigkill/outcome"),
+            "signal mutant red must identify lost signal provenance\nstderr:\n{}",
+            String::from_utf8_lossy(&signal_mutant_output.stderr)
+        );
+
+        let safe_signal_name_predicate =
+            r#"(typeof signalCode === "string" && isDcgSignalName(signalCode)) ||"#;
+        let unsafe_signal_name_predicate =
+            r#"(typeof signalCode === "string" && signalCode.length > 0) ||"#;
+        assert_eq!(
+            source.matches(safe_signal_name_predicate).count(),
+            1,
+            "signal-name mutation witness must identify exactly one safe string predicate"
+        );
+        let unsafe_signal_mutant =
+            source.replacen(safe_signal_name_predicate, unsafe_signal_name_predicate, 1);
+        let unsafe_signal_mutant_root = replay_root.join("mutant-unsafe-signal-name");
+        std::fs::create_dir_all(&unsafe_signal_mutant_root)
+            .expect("create unsafe-signal-name mutant replay root");
+        let unsafe_signal_mutant_output =
+            run_omp_bridge_bun_fixture(&bun, &unsafe_signal_mutant_root, &unsafe_signal_mutant);
+        assert!(
+            !unsafe_signal_mutant_output.status.success(),
+            "the executable corpus vacuously accepted control characters in signal diagnostics\nstdout:\n{}",
+            String::from_utf8_lossy(&unsafe_signal_mutant_output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&unsafe_signal_mutant_output.stderr)
+                .contains("termination/control-signal/outcome"),
+            "unsafe signal-name mutant red must identify the control-injection case\nstderr:\n{}",
+            String::from_utf8_lossy(&unsafe_signal_mutant_output.stderr)
+        );
+
+        let safe_invalid_exit_detail = r"return ` (exit status invalid: ${typeof exitCode})`;";
+        let unsafe_invalid_exit_detail = r"return ` (exit status ${typeof exitCode} ${describeChildCollectionFailure(exitCode)})`;";
+        assert_eq!(
+            source.matches(safe_invalid_exit_detail).count(),
+            1,
+            "invalid-exit mutation witness must identify exactly one type-only diagnostic"
+        );
+        let unsafe_exit_mutant =
+            source.replacen(safe_invalid_exit_detail, unsafe_invalid_exit_detail, 1);
+        let unsafe_exit_mutant_root = replay_root.join("mutant-echo-invalid-exit");
+        std::fs::create_dir_all(&unsafe_exit_mutant_root)
+            .expect("create unsafe invalid-exit mutant replay root");
+        let unsafe_exit_mutant_output =
+            run_omp_bridge_bun_fixture(&bun, &unsafe_exit_mutant_root, &unsafe_exit_mutant);
+        assert!(
+            !unsafe_exit_mutant_output.status.success(),
+            "the executable corpus vacuously accepted echoing hostile exit-status bytes\nstdout:\n{}",
+            String::from_utf8_lossy(&unsafe_exit_mutant_output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&unsafe_exit_mutant_output.stderr)
+                .contains("callback/control-exit/diagnostics"),
+            "unsafe invalid-exit mutant red must identify the control-injection callback\nstderr:\n{}",
+            String::from_utf8_lossy(&unsafe_exit_mutant_output.stderr)
+        );
+
+        let abnormal_exit_clause = "      childOutcome === \"exit-other\" ||\n";
+        assert_eq!(
+            source.matches(abnormal_exit_clause).count(),
+            1,
+            "abnormal-exit mutation witness must identify exactly one visibility clause"
+        );
+        let silent_abnormal_exit_mutant = source.replacen(abnormal_exit_clause, "", 1);
+        let silent_abnormal_exit_mutant_root = replay_root.join("mutant-silent-abnormal-exit");
+        std::fs::create_dir_all(&silent_abnormal_exit_mutant_root)
+            .expect("create silent abnormal-exit mutant replay root");
+        let silent_abnormal_exit_mutant_output = run_omp_bridge_bun_fixture(
+            &bun,
+            &silent_abnormal_exit_mutant_root,
+            &silent_abnormal_exit_mutant,
+        );
+        assert!(
+            !silent_abnormal_exit_mutant_output.status.success(),
+            "the executable corpus vacuously accepted hiding an abnormal exit behind a deny\nstdout:\n{}",
+            String::from_utf8_lossy(&silent_abnormal_exit_mutant_output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&silent_abnormal_exit_mutant_output.stderr)
+                .contains("callback/exit-nine-after-deny/diagnostics"),
+            "silent abnormal-exit mutant red must identify the missing exit diagnostic\nstderr:\n{}",
+            String::from_utf8_lossy(&silent_abnormal_exit_mutant_output.stderr)
+        );
+
+        let framed_block_return = "return { ...candidate, framedBlockingWitness: true };";
+        assert_eq!(
+            source.matches(framed_block_return).count(),
+            1,
+            "framing mutation witness must identify exactly one blocking-frame recovery"
+        );
+        let framing_mutant = source.replacen(framed_block_return, "return parsed;", 1);
+        let framing_mutant_root = replay_root.join("mutant-drop-framed-block");
+        std::fs::create_dir_all(&framing_mutant_root).expect("create framing mutant replay root");
+        let framing_mutant_output =
+            run_omp_bridge_bun_fixture(&bun, &framing_mutant_root, &framing_mutant);
+        assert!(
+            !framing_mutant_output.status.success(),
+            "the executable corpus vacuously accepted dropping a complete framed block\nstdout:\n{}",
+            String::from_utf8_lossy(&framing_mutant_output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&framing_mutant_output.stderr)
+                .contains("framing/deny-before-partial-junk/spawn-throw/parsed-verdict"),
+            "framing mutant red must identify the erased complete deny witness\nstderr:\n{}",
+            String::from_utf8_lossy(&framing_mutant_output.stderr)
+        );
+
+        let parsed_candidate = "const candidate = parseDcgJson(frame);";
+        let prefix_only_candidate = r#"const candidate = {
+        verdict: frame.startsWith('{"decision":"deny"')
+          ? "deny" as const
+          : frame.startsWith('{"decision":"ask"')
+            ? "ask" as const
+            : "indeterminate" as const,
+      };"#;
+        assert_eq!(
+            source.matches(parsed_candidate).count(),
+            1,
+            "prefix-only mutation witness must identify exactly one parsed blocking candidate"
+        );
+        let prefix_only_mutant = source.replacen(parsed_candidate, prefix_only_candidate, 1);
+        let prefix_only_mutant_root = replay_root.join("mutant-prefix-only-framing");
+        std::fs::create_dir_all(&prefix_only_mutant_root)
+            .expect("create prefix-only framing mutant replay root");
+        let prefix_only_mutant_output =
+            run_omp_bridge_bun_fixture(&bun, &prefix_only_mutant_root, &prefix_only_mutant);
+        assert!(
+            !prefix_only_mutant_output.status.success(),
+            "the executable corpus vacuously accepted prefix-only blocking-frame recovery\nstdout:\n{}",
+            String::from_utf8_lossy(&prefix_only_mutant_output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&prefix_only_mutant_output.stderr)
+                .contains("framing/deny-prefix-incomplete-json/spawn-throw/parsed-verdict"),
+            "prefix-only mutant red must identify delimiter-complete invalid JSON\nstderr:\n{}",
+            String::from_utf8_lossy(&prefix_only_mutant_output.stderr)
+        );
+
+        let settled_collector = r"    const [stdoutResult, stderrResult, exitResult] = await Promise.allSettled([
+      observeChildCapability(() => collectBoundedText(
+        proc.stdout,
+        DCG_STDOUT_MAX_BYTES,
+        observationAbort.signal,
+      )),
+      observeChildCapability(() => collectBoundedText(
+        proc.stderr,
+        DCG_STDERR_MAX_BYTES,
+        observationAbort.signal,
+      )),
+      observeChildCapabilityUntil(rawExitObservation, observationAbort.signal),
+    ]);";
+        let fail_fast_collector = r#"    const [stdoutValue, stderrValue, exitValue] = await Promise.all([
+      observeChildCapability(() => collectBoundedText(
+        proc.stdout,
+        DCG_STDOUT_MAX_BYTES,
+        observationAbort.signal,
+      )),
+      observeChildCapability(() => collectBoundedText(
+        proc.stderr,
+        DCG_STDERR_MAX_BYTES,
+        observationAbort.signal,
+      )),
+      observeChildCapabilityUntil(rawExitObservation, observationAbort.signal),
+    ]);
+    const stdoutResult = { status: "fulfilled" as const, value: stdoutValue };
+    const stderrResult = { status: "fulfilled" as const, value: stderrValue };
+    const exitResult = { status: "fulfilled" as const, value: exitValue };"#;
+        assert_eq!(
+            source.matches(settled_collector).count(),
+            1,
+            "collection mutation witness must identify exactly one settled capability collector"
+        );
+        let collection_mutant = source.replacen(settled_collector, fail_fast_collector, 1);
+        let collection_mutant_root = replay_root.join("mutant-fail-fast-collection");
+        std::fs::create_dir_all(&collection_mutant_root)
+            .expect("create fail-fast collection mutant replay root");
+        let collection_mutant_output =
+            run_omp_bridge_bun_fixture(&bun, &collection_mutant_root, &collection_mutant);
+        assert!(
+            !collection_mutant_output.status.success(),
+            "the executable corpus vacuously accepted fail-fast child collection\nstdout:\n{}",
+            String::from_utf8_lossy(&collection_mutant_output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&collection_mutant_output.stderr)
+                .contains("synthetic exit status failure"),
+            "collector mutant red must reach the rejected exit-status promise that erases a completed deny\nstderr:\n{}",
+            String::from_utf8_lossy(&collection_mutant_output.stderr)
+        );
+
+        let plain_unbounded_collector = r"    const [stdoutResult, stderrResult, exitResult] = await Promise.allSettled([
+      observeChildCapability(() => collectBoundedText(proc.stdout, DCG_STDOUT_MAX_BYTES)),
+      observeChildCapability(() => collectBoundedText(proc.stderr, DCG_STDERR_MAX_BYTES)),
+      rawExitObservation,
+    ]);";
+        let unbounded_observation_mutant =
+            source.replacen(settled_collector, plain_unbounded_collector, 1);
+        let unbounded_observation_mutant_root =
+            replay_root.join("mutant-plain-all-settled-unbounded-observation");
+        std::fs::create_dir_all(&unbounded_observation_mutant_root)
+            .expect("create plain-allSettled observation mutant replay root");
+        let unbounded_observation_mutant_output = run_omp_bridge_bun_fixture(
+            &bun,
+            &unbounded_observation_mutant_root,
+            &unbounded_observation_mutant,
+        );
+        assert!(
+            !unbounded_observation_mutant_output.status.success(),
+            "the executable corpus vacuously accepted plain allSettled without observation cancellation\nstdout:\n{}",
+            String::from_utf8_lossy(&unbounded_observation_mutant_output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&unbounded_observation_mutant_output.stderr)
+                .contains("callback/pipe-deadline-before-deny/result"),
+            "plain-allSettled mutant red must identify a verdict admitted after the pipe deadline\nstderr:\n{}",
+            String::from_utf8_lossy(&unbounded_observation_mutant_output.stderr)
+        );
+
+        let absolute_clamped_rearm = r#"    const remainingHardBudget = Math.max(0, observationDeadline - performance.now());
+    const pipeDrainWins = remainingHardBudget > DCG_CHILD_PIPE_DRAIN_GRACE_MS;
+    observationTimer = setTimeout(
+      () => abortObservation(pipeDrainWins ? "pipe-drain" : "hard-deadline", false),
+      Math.min(DCG_CHILD_PIPE_DRAIN_GRACE_MS, remainingHardBudget),
+    );"#;
+        let relative_drain_rearm = r#"    observationTimer = setTimeout(
+      () => abortObservation("pipe-drain", false),
+      DCG_CHILD_PIPE_DRAIN_GRACE_MS,
+    );"#;
+        assert_eq!(
+            source.matches(absolute_clamped_rearm).count(),
+            1,
+            "absolute-deadline mutation witness must identify exactly one clamped rearm"
+        );
+        let relative_deadline_mutant =
+            source.replacen(absolute_clamped_rearm, relative_drain_rearm, 1);
+        let relative_deadline_mutant_root = replay_root.join("mutant-relative-post-exit-deadline");
+        std::fs::create_dir_all(&relative_deadline_mutant_root)
+            .expect("create relative post-exit deadline mutant replay root");
+        let relative_deadline_mutant_output = run_omp_bridge_bun_fixture(
+            &bun,
+            &relative_deadline_mutant_root,
+            &relative_deadline_mutant,
+        );
+        assert!(
+            !relative_deadline_mutant_output.status.success(),
+            "the executable corpus vacuously accepted a fresh post-exit grace beyond the absolute deadline\nstdout:\n{}",
+            String::from_utf8_lossy(&relative_deadline_mutant_output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&relative_deadline_mutant_output.stderr)
+                .contains("callback/exit-one-tick-before-hard-deadline/absolute-virtual-deadline"),
+            "relative-deadline mutant red must identify the original hard deadline overrun\nstderr:\n{}",
+            String::from_utf8_lossy(&relative_deadline_mutant_output.stderr)
+        );
+
+        let retained_collector_result = "  return { text, overflowed, readFailure };";
+        let dropped_retained_collector_result =
+            "  return { text: cancellationRequested ? \"\" : text, overflowed, readFailure };";
+        assert_eq!(
+            source.matches(retained_collector_result).count(),
+            1,
+            "retention mutation witness must identify exactly one bounded collector result"
+        );
+        let dropped_retained_mutant = source.replacen(
+            retained_collector_result,
+            dropped_retained_collector_result,
+            1,
+        );
+        let dropped_retained_mutant_root = replay_root.join("mutant-drop-retained-block-on-cancel");
+        std::fs::create_dir_all(&dropped_retained_mutant_root)
+            .expect("create retained-block cancellation mutant replay root");
+        let dropped_retained_mutant_output = run_omp_bridge_bun_fixture(
+            &bun,
+            &dropped_retained_mutant_root,
+            &dropped_retained_mutant,
+        );
+        assert!(
+            !dropped_retained_mutant_output.status.success(),
+            "the executable corpus vacuously accepted erasing a retained block on cancellation\nstdout:\n{}",
+            String::from_utf8_lossy(&dropped_retained_mutant_output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&dropped_retained_mutant_output.stderr)
+                .contains("callback/exit-reject-late-sigkill-deny/result"),
+            "retained-block mutant red must identify the first canceled complete deny\nstderr:\n{}",
+            String::from_utf8_lossy(&dropped_retained_mutant_output.stderr)
+        );
+
+        let cleared_watchdog = r"  } finally {
+    observationFinished = true;
+    clearTimeout(observationTimer);
+  }";
+        let uncleared_watchdog = r"  } finally {
+    observationFinished = true;
+  }";
+        assert_eq!(
+            source.matches(cleared_watchdog).count(),
+            1,
+            "watchdog mutation witness must identify exactly one cleanup boundary"
+        );
+        let uncleared_watchdog_mutant = source.replacen(cleared_watchdog, uncleared_watchdog, 1);
+        let uncleared_watchdog_mutant_root = replay_root.join("mutant-uncleared-watchdog");
+        std::fs::create_dir_all(&uncleared_watchdog_mutant_root)
+            .expect("create uncleared-watchdog mutant replay root");
+        let uncleared_watchdog_mutant_output = run_omp_bridge_bun_fixture(
+            &bun,
+            &uncleared_watchdog_mutant_root,
+            &uncleared_watchdog_mutant,
+        );
+        assert!(
+            !uncleared_watchdog_mutant_output.status.success(),
+            "the executable corpus vacuously accepted a live post-callback watchdog\nstdout:\n{}",
+            String::from_utf8_lossy(&uncleared_watchdog_mutant_output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&uncleared_watchdog_mutant_output.stderr)
+                .contains("callback/whitespace-allow/watchdog-cleared"),
+            "uncleared-watchdog mutant red must identify the first leaked callback timer\nstderr:\n{}",
+            String::from_utf8_lossy(&uncleared_watchdog_mutant_output.stderr)
+        );
+
+        let exit_fault_kill = r"  rawExitObservation.then(
+    () => armPipeDrainDeadline(false),
+    () => armPipeDrainDeadline(true),
+  );";
+        let exit_fault_without_kill = r"  rawExitObservation.then(
+    () => armPipeDrainDeadline(false),
+    () => armPipeDrainDeadline(false),
+  );";
+        assert_eq!(
+            source.matches(exit_fault_kill).count(),
+            1,
+            "exit-fault mutation witness must identify exactly one rejection branch"
+        );
+        let exit_fault_without_kill_mutant =
+            source.replacen(exit_fault_kill, exit_fault_without_kill, 1);
+        let exit_fault_without_kill_mutant_root =
+            replay_root.join("mutant-exit-rejection-without-kill");
+        std::fs::create_dir_all(&exit_fault_without_kill_mutant_root)
+            .expect("create exit-rejection kill mutant replay root");
+        let exit_fault_without_kill_mutant_output = run_omp_bridge_bun_fixture(
+            &bun,
+            &exit_fault_without_kill_mutant_root,
+            &exit_fault_without_kill_mutant,
+        );
+        assert!(
+            !exit_fault_without_kill_mutant_output.status.success(),
+            "the executable corpus vacuously accepted an exit-observation rejection without direct-child kill\nstdout:\n{}",
+            String::from_utf8_lossy(&exit_fault_without_kill_mutant_output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&exit_fault_without_kill_mutant_output.stderr)
+                .contains("callback/exit-reject-deny/direct-child-kill"),
+            "exit-rejection mutant red must identify the missing direct-child kill\nstderr:\n{}",
+            String::from_utf8_lossy(&exit_fault_without_kill_mutant_output.stderr)
+        );
+
+        let bounded_stdin_dispatch = r"  return command.length <= DCG_STDIN_CHUNK_CODE_UNITS
+    ? new TextEncoder().encode(command)
+    : commandUtf8Stream(command);";
+        let unbounded_stdin_dispatch = r"  return new TextEncoder().encode(command);";
+        assert_eq!(
+            source.matches(bounded_stdin_dispatch).count(),
+            1,
+            "stdin mutation witness must identify exactly one bounded dispatch"
+        );
+        let stdin_mutant = source.replacen(bounded_stdin_dispatch, unbounded_stdin_dispatch, 1);
+        let stdin_mutant_root = replay_root.join("mutant-unbounded-stdin");
+        std::fs::create_dir_all(&stdin_mutant_root).expect("create stdin mutant replay root");
+        let stdin_mutant_output =
+            run_omp_bridge_bun_fixture(&bun, &stdin_mutant_root, &stdin_mutant);
+        assert!(
+            !stdin_mutant_output.status.success(),
+            "the executable corpus vacuously accepted command-sized stdin encoding\nstdout:\n{}",
+            String::from_utf8_lossy(&stdin_mutant_output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&stdin_mutant_output.stderr)
+                .contains("stdin/large-stream-path"),
+            "stdin mutant red must identify the lost large-command stream path\nstderr:\n{}",
+            String::from_utf8_lossy(&stdin_mutant_output.stderr)
+        );
+    }
+
+    /// OMP 18's ordinary and managed-async BashTool routes execute in the
+    /// embedded Brush shell even on Windows. Only an eligible local PTY uses
+    /// OMP's configured external shell, which may be cmd.exe or PowerShell.
+    /// Keep this source contract mutation-sensitive: replacing the dynamic
+    /// argument with a blanket posix/unknown dialect must fail this test.
+    #[test]
+    fn omp_extension_source_selects_dialect_only_for_eligible_local_pty() {
+        let executable = current_dcg_executable().expect("current executable");
+        let source = build_omp_extension_source(&executable).expect("extension generation");
+
+        assert!(
+            source.contains("import type { ExtensionAPI } from \"@oh-my-pi/pi-coding-agent\";")
+        );
+        assert!(
+            source.contains(
+                "import { settings } from \"@oh-my-pi/pi-coding-agent/config/settings\";"
+            )
+        );
+        assert!(source.contains("import { procmgr } from \"@oh-my-pi/pi-utils\";"));
+        assert!(
+            source.contains("command?: unknown; cwd?: unknown; async?: unknown; pty?: unknown")
+        );
+        assert!(source.contains(
+            "toolInput?.pty === true && toolInput?.async !== true && ctx.hasUI && process.env.PI_NO_PTY !== \"1\""
+        ));
+        assert!(source.contains(
+            "procmgr.isCmdShell(shell) ? \"cmd\" : procmgr.isPowerShell(shell) ? \"ps\" : \"posix\""
+        ));
+        assert!(source.contains("settings.getShellConfig().shell"));
+        assert!(source.contains("\"--dialect\", shellDialect"));
+        assert!(
+            !source.contains("\"--dialect\", \"posix\""),
+            "a hard-coded POSIX argument leaves eligible native-Windows PTY calls open to cmd/PowerShell evasions"
+        );
+        assert!(
+            !source.contains("ctx.mode ===") && !source.contains("ctx.mode !=="),
+            "ACP and JSON-RPC both expose mode=rpc; guessing the hidden ACP terminal capability would overmatch POSIX-only RPC execution"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn generated_javascript_rejects_a_lossy_executable_path() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid = std::ffi::OsString::from_vec(b"/tmp/dcg-\xff".to_vec());
+        let error = executable_javascript_literal(std::path::Path::new(&invalid))
+            .expect_err("non-UTF-8 paths cannot be represented faithfully in JavaScript");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn omp_agent_dir_override_rejects_non_utf8_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+
+        assert_eq!(
+            omp_coding_agent_dir_env_value(Some(std::ffi::OsString::from("relative-agent")))
+                .expect("Unicode override"),
+            Some(std::ffi::OsString::from("relative-agent"))
+        );
+        assert_eq!(
+            omp_coding_agent_dir_env_value(Some(std::ffi::OsString::new()))
+                .expect("empty override"),
+            Some(std::ffi::OsString::new()),
+            "the downstream default-profile resolver owns empty-value handling"
+        );
+        assert_eq!(
+            omp_coding_agent_dir_env_value(None).expect("absent override"),
+            None
+        );
+
+        let invalid = std::ffi::OsString::from_vec(b"agent-\xff".to_vec());
+        let error = omp_coding_agent_dir_env_value(Some(invalid))
+            .expect_err("OMP cannot address a raw-byte-only extension directory");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("PI_CODING_AGENT_DIR"));
+        assert!(error.to_string().contains("valid UTF-8 on Unix"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn omp_agent_dir_override_preserves_native_windows_wide_values() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+        let units = [0x0061, 0x0067, 0x0065, 0x006e, 0x0074, 0xd800];
+        let value = std::ffi::OsString::from_wide(&units);
+        assert!(
+            value.to_str().is_none(),
+            "fixture must not coerce to String"
+        );
+        let preserved = omp_coding_agent_dir_env_value(Some(value.clone()))
+            .expect("Windows override")
+            .expect("present override");
+        assert_eq!(preserved, value);
+        assert_eq!(preserved.encode_wide().collect::<Vec<_>>(), units);
+    }
+
+    #[test]
+    fn omp_profile_names_follow_upstream_safety_contract() {
+        assert_eq!(
+            normalize_omp_profile_name("work").expect("valid profile"),
+            Some("work".to_string())
+        );
+        assert_eq!(
+            normalize_omp_profile_name(" team-1.dev ").expect("trimmed valid profile"),
+            Some("team-1.dev".to_string())
+        );
+        for default in ["", "  ", "default", " default "] {
+            assert_eq!(
+                normalize_omp_profile_name(default).expect("default profile sentinel"),
+                None,
+                "{default:?}"
+            );
+        }
+        for invalid in [".", "..", "Upper", "../escape", "NUL", "con.txt", "lpt9"] {
+            let error = normalize_omp_profile_name(invalid)
+                .expect_err("invalid explicit profile must not become the default");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn omp_config_root_rejects_windows_drive_qualified_overrides() {
+        let home = std::path::Path::new("/test-home");
+        for invalid in [r"C:\omp", "c:omp", r"\D:\profiles"] {
+            let error = omp_config_root_from(home, invalid, true)
+                .expect_err("Windows drive-qualified config names must be rejected");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
+
+        assert_eq!(
+            omp_config_root_from(home, "/etc/omp-cfg", true).expect("separator-rooted name"),
+            home.join("etc/omp-cfg")
+        );
+        assert_eq!(
+            omp_config_root_from(home, r"C:\omp", false).expect("valid POSIX child name"),
+            home.join(r"C:\omp")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn omp_config_root_matches_node_posix_join_oracle() {
+        let home = std::path::Path::new("/home/u");
+        let cases = [
+            (".omp", "/home/u/.omp/agent"),
+            ("default", "/home/u/default/agent"),
+            (r"\.omp", r"/home/u/\.omp/agent"),
+            ("/.omp", "/home/u/.omp/agent"),
+            ("//.omp", "/home/u/.omp/agent"),
+            ("a//b", "/home/u/a/b/agent"),
+            ("a/./b", "/home/u/a/b/agent"),
+            ("a/../b", "/home/u/b/agent"),
+            ("a/../../b", "/home/b/agent"),
+            ("../../../../../x", "/x/agent"),
+            ("a/", "/home/u/a/agent"),
+            ("/", "/home/u/agent"),
+            (".", "/home/u/agent"),
+            ("..", "/home/agent"),
+            (r"C:\omp", r"/home/u/C:\omp/agent"),
+        ];
+
+        for (config_name, expected_agent) in cases {
+            let root = omp_config_root_from(home, config_name, false).expect(config_name);
+            assert_eq!(root.join("agent"), std::path::Path::new(expected_agent));
+        }
+
+        let normalized = omp_config_root_from(home, "a/../b", false).expect("normalized root");
+        let upstream_derived = std::path::Path::new("/home/u/b/profiles/work/agent");
+        assert_eq!(
+            omp_default_agent_dir_from(
+                &normalized,
+                Some(upstream_derived.as_os_str()),
+                Some("work")
+            ),
+            std::path::Path::new("/home/u/b/agent"),
+            "stale provenance must be derived from Node's normalized config root"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn omp_config_root_matches_node_win32_join_oracle() {
+        let home = std::path::Path::new(r"C:\Users\u");
+        let cases = [
+            (".omp", r"C:\Users\u\.omp\agent"),
+            ("default", r"C:\Users\u\default\agent"),
+            (r"\.omp", r"C:\Users\u\.omp\agent"),
+            ("/.omp", r"C:\Users\u\.omp\agent"),
+            ("a//b", r"C:\Users\u\a\b\agent"),
+            ("a/./b", r"C:\Users\u\a\b\agent"),
+            ("a/../b", r"C:\Users\u\b\agent"),
+            ("a/../../b", r"C:\Users\b\agent"),
+            ("../../../../../x", r"C:\x\agent"),
+            ("a/", r"C:\Users\u\a\agent"),
+            ("/", r"C:\Users\u\agent"),
+            (".", r"C:\Users\u\agent"),
+            ("..", r"C:\Users\agent"),
+            (r"\\srv\share\omp", r"C:\Users\u\srv\share\omp\agent"),
+        ];
+
+        for (config_name, expected_agent) in cases {
+            let root = omp_config_root_from(home, config_name, true).expect(config_name);
+            assert_eq!(root.join("agent"), std::path::Path::new(expected_agent));
+        }
+
+        let normalized = omp_config_root_from(home, "a/../b", true).expect("normalized root");
+        let upstream_derived = std::path::Path::new(r"C:\Users\u\b\profiles\work\agent");
+        assert_eq!(
+            omp_default_agent_dir_from(
+                &normalized,
+                Some(upstream_derived.as_os_str()),
+                Some("work")
+            ),
+            std::path::Path::new(r"C:\Users\u\b\agent"),
+            "stale provenance must be derived from Node's normalized config root"
+        );
+    }
+
+    #[test]
+    fn omp_default_agent_dir_suppresses_only_profile_derived_overrides() {
+        let config_root = std::path::Path::new("/test-home/.custom-omp");
+        let default_agent = config_root.join("agent");
+        let derived_work_agent = config_root.join("profiles").join("work").join("agent");
+        let custom_agent = std::path::Path::new("/srv/omp-agent");
+
+        assert_eq!(
+            omp_default_agent_dir_from(
+                config_root,
+                Some(derived_work_agent.as_os_str()),
+                Some("work")
+            ),
+            default_agent,
+            "an exact lower-profile derivation is stale in default mode"
+        );
+        assert_eq!(
+            omp_default_agent_dir_from(config_root, Some(derived_work_agent.as_os_str()), None),
+            derived_work_agent,
+            "the same path without validated profile provenance is a custom override"
+        );
+        assert_eq!(
+            omp_default_agent_dir_from(config_root, Some(custom_agent.as_os_str()), Some("work")),
+            custom_agent,
+            "a genuine custom override survives lower-profile provenance"
+        );
+
+        for near_match in [
+            config_root
+                .join("profiles")
+                .join("work")
+                .join("agent-sibling"),
+            config_root.join("profiles").join("work2").join("agent"),
+            config_root
+                .join("profiles")
+                .join("work")
+                .join("agent")
+                .join("child"),
+            config_root
+                .join("profiles")
+                .join(".")
+                .join("work")
+                .join("agent"),
+            config_root.join("profiles").join("Work").join("agent"),
+        ] {
+            let resolved =
+                omp_default_agent_dir_from(config_root, Some(near_match.as_os_str()), Some("work"));
+            assert_eq!(
+                resolved.as_os_str(),
+                near_match.as_os_str(),
+                "only exact profile-derived bytes may be suppressed"
+            );
+        }
+
+        let mut repeated_separator = config_root.join("profiles").join("work").into_os_string();
+        repeated_separator.push(std::path::MAIN_SEPARATOR_STR);
+        repeated_separator.push(std::path::MAIN_SEPARATOR_STR);
+        repeated_separator.push("agent");
+        let repeated_separator = std::path::PathBuf::from(repeated_separator);
+        let resolved = omp_default_agent_dir_from(
+            config_root,
+            Some(repeated_separator.as_os_str()),
+            Some("work"),
+        );
+        assert_eq!(
+            resolved.as_os_str(),
+            repeated_separator.as_os_str(),
+            "component-equivalent spelling is not exact JS string provenance"
+        );
+
+        let mut trailing_separator = derived_work_agent.clone().into_os_string();
+        trailing_separator.push(std::path::MAIN_SEPARATOR_STR);
+        let trailing_separator = std::path::PathBuf::from(trailing_separator);
+        let resolved = omp_default_agent_dir_from(
+            config_root,
+            Some(trailing_separator.as_os_str()),
+            Some("work"),
+        );
+        assert_eq!(
+            resolved.as_os_str(),
+            trailing_separator.as_os_str(),
+            "a trailing separator is not exact JS string provenance"
+        );
+
+        assert_eq!(
+            omp_default_agent_dir_from(config_root, None, Some("work")),
+            default_agent
+        );
+        assert_eq!(
+            omp_default_agent_dir_from(config_root, Some(std::ffi::OsStr::new("")), Some("work")),
+            default_agent
+        );
     }
 
     #[test]
@@ -19465,8 +24637,7 @@ exclude = ["target/**"]
     // ========================================================================
 
     fn init_temp_git_repo(dir: &std::path::Path) {
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
+        let output = git_command(dir)
             .args(["init", "-q"])
             .output()
             .expect("git init");
@@ -19475,6 +24646,124 @@ exclude = ["target/**"]
             "git init failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn temporary_git_commands_ignore_ambient_global_and_system_config() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let fake_home = tmp.path().join("ambient-home");
+        std::fs::create_dir_all(&fake_home).expect("create fake home");
+        std::fs::write(
+            fake_home.join(".gitconfig"),
+            "[core]\n\thooksPath = ambient-hooks\n[dcg]\n\tambientGlobal = visible\n",
+        )
+        .expect("write ambient global git config");
+        let ambient_system_config = tmp.path().join("ambient-system.gitconfig");
+        std::fs::write(&ambient_system_config, "[dcg]\n\tambientSystem = visible\n")
+            .expect("write ambient system git config");
+
+        for key in ["core.hooksPath", "dcg.ambientGlobal", "dcg.ambientSystem"] {
+            let output = git_command(tmp.path())
+                .env("HOME", &fake_home)
+                .env("USERPROFILE", &fake_home)
+                .env("XDG_CONFIG_HOME", &fake_home)
+                .env("GIT_CONFIG_SYSTEM", &ambient_system_config)
+                .args(["config", "--get", key])
+                .output()
+                .expect("query isolated git config");
+
+            assert!(
+                !output.status.success(),
+                "temporary git command inherited {key}: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert!(
+                output.stdout.is_empty(),
+                "temporary git command printed ambient {key}: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+    }
+
+    #[test]
+    fn scan_pre_commit_ignores_ambient_command_scope_git_config() {
+        const CHILD_MARKER: &str = "DCG_TEST_AMBIENT_GIT_CONFIG_CHILD";
+        const CHILD_COMPLETION: &str = "dcg-ambient-git-config-child-complete";
+        const REDIRECTED_HOOKS_PATH: &str = "ambient-hooks";
+
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let test_exe = std::env::current_exe().expect("current test executable");
+
+            for config_source in ["count", "parameters"] {
+                let mut child = std::process::Command::new(&test_exe);
+                child
+                    .args([
+                        "--exact",
+                        "cli::tests::scan_pre_commit_ignores_ambient_command_scope_git_config",
+                        "--nocapture",
+                    ])
+                    .env(CHILD_MARKER, "1")
+                    .env_remove("GIT_CONFIG_COUNT")
+                    .env_remove("GIT_CONFIG_KEY_0")
+                    .env_remove("GIT_CONFIG_VALUE_0")
+                    .env_remove("GIT_CONFIG_PARAMETERS");
+
+                match config_source {
+                    "count" => {
+                        child
+                            .env("GIT_CONFIG_COUNT", "1")
+                            .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+                            .env("GIT_CONFIG_VALUE_0", REDIRECTED_HOOKS_PATH);
+                    }
+                    "parameters" => {
+                        child.env(
+                            "GIT_CONFIG_PARAMETERS",
+                            format!("'core.hooksPath={REDIRECTED_HOOKS_PATH}'"),
+                        );
+                    }
+                    _ => unreachable!("fixed config-source inventory"),
+                }
+
+                let output = child.output().expect("run isolated child test");
+                assert!(
+                    output.status.success(),
+                    "{config_source} child failed\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stdout).contains(CHILD_COMPLETION),
+                    "{config_source} child passed without executing the exact test\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+
+            return;
+        }
+
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        init_temp_git_repo(repo.path());
+        let redirected_hook = repo.path().join(REDIRECTED_HOOKS_PATH).join("pre-commit");
+
+        let hook_path = install_scan_pre_commit_hook_at(repo.path()).expect("install hook");
+        assert!(
+            hook_path.starts_with(repo.path()),
+            "hook escaped temporary repository: {}",
+            hook_path.display()
+        );
+        assert!(hook_path.exists(), "fixture hook should exist");
+        assert_ne!(hook_path, redirected_hook, "command-scope config won");
+        assert!(
+            !redirected_hook.exists(),
+            "ambient command-scope config redirected hook: {}",
+            redirected_hook.display()
+        );
+
+        let removed = uninstall_scan_pre_commit_hook_at(repo.path()).expect("uninstall hook");
+        assert_eq!(removed.as_deref(), Some(hook_path.as_path()));
+        assert!(!hook_path.exists(), "fixture hook should be removed");
+        println!("{CHILD_COMPLETION}");
     }
 
     #[test]
@@ -19683,6 +24972,47 @@ exclude = ["target/**"]
             Cli::try_parse_from(["dcg", "test", "--dialect", "klingon", "git status"]).is_err(),
             "an unknown dialect must be rejected rather than silently ignored"
         );
+    }
+
+    #[test]
+    fn omp_bridge_output_requires_robot_and_explicit_omp_agent() {
+        let cli = Cli::try_parse_from([
+            "dcg",
+            "--robot",
+            "test",
+            "--stdin",
+            "--agent",
+            "omp",
+            "--omp-bridge-output",
+        ])
+        .expect("the private OMP protocol accepts the global robot flag");
+        let Some(Command::TestCommand {
+            omp_bridge_output, ..
+        }) = cli.command
+        else {
+            unreachable!("Expected TestCommand");
+        };
+        assert!(omp_bridge_output);
+
+        let without_robot = Cli::try_parse_from([
+            "dcg",
+            "test",
+            "--stdin",
+            "--agent",
+            "omp",
+            "--omp-bridge-output",
+        ])
+        .expect("the runtime validator owns the global/subcommand dependency");
+        assert!(!robot_mode_enabled(without_robot.robot));
+        assert!(validate_omp_bridge_output_agent(true, false, true).is_err());
+        for agent in ["omp", "OMP", "oh-my-pi", "oh_my_pi", "ohmypi"] {
+            assert!(is_explicit_omp_agent(Some(agent)));
+            assert!(validate_omp_bridge_output_agent(true, true, true).is_ok());
+        }
+        assert!(!is_explicit_omp_agent(None));
+        assert!(!is_explicit_omp_agent(Some("codex")));
+        assert!(validate_omp_bridge_output_agent(true, true, false).is_err());
+        assert!(validate_omp_bridge_output_agent(false, false, false).is_ok());
     }
 
     #[test]
@@ -19963,11 +25293,7 @@ exclude = ["target/**"]
     // ========================================================================
 
     fn run_git(cwd: &std::path::Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .current_dir(cwd)
-            .args(args)
-            .output()
-            .expect("run git");
+        let output = git_command(cwd).args(args).output().expect("run git");
 
         assert!(
             output.status.success(),
@@ -19997,21 +25323,34 @@ exclude = ["target/**"]
     }
 
     #[test]
-    fn get_staged_files_handles_spaces_and_newlines() {
+    fn get_staged_files_handles_spaces() {
         let repo = init_fixture_repo();
 
         std::fs::write(repo.path().join("hello world.rs"), "x").expect("write");
-        std::fs::write(repo.path().join("weird\nname.rs"), "y").expect("write");
-        run_git(repo.path(), &["add", "hello world.rs", "weird\nname.rs"]);
+        run_git(repo.path(), &["add", "hello world.rs"]);
 
         let paths = get_staged_files_at(repo.path()).expect("staged files");
-        let rendered: Vec<String> = paths
-            .iter()
-            .map(|p| p.to_string_lossy().to_string())
-            .collect();
+        assert!(
+            paths
+                .iter()
+                .any(|path| path == std::path::Path::new("hello world.rs"))
+        );
+    }
 
-        assert!(rendered.contains(&"hello world.rs".to_string()));
-        assert!(rendered.contains(&"weird\nname.rs".to_string()));
+    #[cfg(unix)]
+    #[test]
+    fn get_staged_files_handles_newlines() {
+        let repo = init_fixture_repo();
+
+        std::fs::write(repo.path().join("weird\nname.rs"), "y").expect("write");
+        run_git(repo.path(), &["add", "weird\nname.rs"]);
+
+        let paths = get_staged_files_at(repo.path()).expect("staged files");
+        assert!(
+            paths
+                .iter()
+                .any(|path| path == std::path::Path::new("weird\nname.rs"))
+        );
     }
 
     #[test]
@@ -21098,6 +26437,194 @@ exclude = ["target/**"]
             .and_then(|arr| arr.as_array())
             .is_some_and(|a| a.iter().any(is_dcg_hook_entry));
         assert!(is_registered, "hook should be repaired once lock is free");
+    }
+
+    /// A dcg hook whose only difference from the desired one is a host-owned
+    /// field (#345): the operator's `timeout` bound.
+    fn dcg_hook_with_timeout(command: &str, timeout: u64) -> serde_json::Value {
+        let mut hook = claude_dcg_hook().expect("current executable resolves");
+        hook["command"] = serde_json::Value::String(command.to_string());
+        hook["timeout"] = serde_json::json!(timeout);
+        hook
+    }
+
+    fn canonical_dcg_hook(settings: &serde_json::Value) -> &serde_json::Value {
+        settings["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("PreToolUse array")
+            .iter()
+            .find(|entry| entry["matcher"] == CLAUDE_SHELL_MATCHER)
+            .and_then(|entry| entry["hooks"].as_array())
+            .and_then(|hooks| {
+                hooks
+                    .iter()
+                    .find(|hook| hook["command"].as_str().is_some_and(is_dcg_command))
+            })
+            .expect("a dcg hook under the canonical matcher")
+    }
+
+    #[test]
+    fn self_heal_keeps_operator_timeout_when_hook_is_current() {
+        // Regression for #345: an operator-set `timeout` on the current dcg
+        // hook must not make it look stale. Both the lock-free fast path and
+        // the merge must report "nothing to do".
+        let desired = claude_dcg_hook().unwrap();
+        let current_command = desired["command"].as_str().unwrap().to_string();
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": CLAUDE_SHELL_MATCHER,
+                    "hooks": [dcg_hook_with_timeout(&current_command, 10)]
+                }]
+            }
+        });
+
+        assert!(
+            settings_has_exact_dcg_hook(&settings, &desired),
+            "a current hook with a host-owned timeout is not stale"
+        );
+        let changed = install_dcg_hook_into_settings(&mut settings, false).unwrap();
+        assert!(!changed, "no repair when only host-owned fields differ");
+        assert_eq!(canonical_dcg_hook(&settings)["timeout"], 10);
+    }
+
+    #[test]
+    fn self_heal_repair_carries_operator_timeout_forward() {
+        // Regression for #345: repairing a stale command path must keep the
+        // operator's timeout on the rewritten hook, on both the self-heal and
+        // the `dcg install --force` paths.
+        let desired = claude_dcg_hook().unwrap();
+        let current_command = desired["command"].as_str().unwrap().to_string();
+        for force in [false, true] {
+            let mut settings = serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": CLAUDE_SHELL_MATCHER,
+                        "hooks": [
+                            dcg_hook_with_timeout("/stale/path/to/dcg", 10),
+                            { "type": "command", "command": "other-hook" }
+                        ]
+                    }]
+                }
+            });
+
+            assert!(!settings_has_exact_dcg_hook(&settings, &desired));
+            let changed = install_dcg_hook_into_settings(&mut settings, force).unwrap();
+            assert!(changed, "stale command must be repaired (force={force})");
+
+            let hook = canonical_dcg_hook(&settings);
+            assert_eq!(hook["command"].as_str(), Some(current_command.as_str()));
+            assert_eq!(
+                hook["timeout"], 10,
+                "timeout lost on repair (force={force})"
+            );
+            assert_eq!(hook["type"], "command");
+
+            let hooks = settings["hooks"]["PreToolUse"][0]["hooks"]
+                .as_array()
+                .unwrap();
+            assert_eq!(
+                hooks.len(),
+                2,
+                "exactly one dcg hook plus the coexisting hook"
+            );
+            assert!(hooks.iter().any(|hook| hook["command"] == "other-hook"));
+            assert!(
+                settings_has_exact_dcg_hook(&settings, &desired),
+                "repaired settings pass the fast path (force={force})"
+            );
+        }
+    }
+
+    #[test]
+    fn self_heal_repair_carries_timeout_from_legacy_matcher() {
+        // A hook migrating off the legacy matcher keeps its host-owned fields.
+        let desired = claude_dcg_hook().unwrap();
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": LEGACY_CLAUDE_SHELL_MATCHER,
+                    "hooks": [dcg_hook_with_timeout("/stale/path/to/dcg", 7)]
+                }]
+            }
+        });
+
+        let changed = install_dcg_hook_into_settings(&mut settings, false).unwrap();
+        assert!(changed);
+        let hook = canonical_dcg_hook(&settings);
+        assert_eq!(hook["command"], desired["command"]);
+        assert_eq!(hook["timeout"], 7);
+        let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert!(
+            pre.iter()
+                .all(|entry| entry["matcher"] != LEGACY_CLAUDE_SHELL_MATCHER),
+            "emptied legacy entry is dropped"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn self_heal_repair_drops_foreign_dcg_owned_fields() {
+        // `shell` is dcg-owned (only the Windows hook emits it). A settings.json
+        // restored from another OS must not carry it onto the repaired Unix
+        // hook, while the host-owned timeout still survives.
+        let desired = claude_dcg_hook().unwrap();
+        let mut hook = dcg_hook_with_timeout(desired["command"].as_str().unwrap(), 10);
+        hook["shell"] = serde_json::json!("powershell");
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{ "matcher": CLAUDE_SHELL_MATCHER, "hooks": [hook] }]
+            }
+        });
+
+        assert!(
+            !settings_has_exact_dcg_hook(&settings, &desired),
+            "a foreign dcg-owned field marks the hook stale"
+        );
+        let changed = install_dcg_hook_into_settings(&mut settings, false).unwrap();
+        assert!(changed);
+        let repaired = canonical_dcg_hook(&settings);
+        assert!(
+            repaired.get("shell").is_none(),
+            "foreign shell field dropped"
+        );
+        assert_eq!(repaired["timeout"], 10);
+    }
+
+    #[test]
+    fn self_heal_at_preserves_operator_timeout_end_to_end() {
+        // The reporter's repro for #345: seed a stale hook that carries
+        // `"timeout": 10`, run the real repair path, and read the file back.
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let lock_path = dir.path().join("selfheal.lock");
+        let settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": CLAUDE_SHELL_MATCHER,
+                    "hooks": [dcg_hook_with_timeout("/stale/path/to/dcg", 10)]
+                }]
+            }
+        });
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+
+        ensure_hook_registered_at(&settings_path, &lock_path).unwrap();
+
+        let healed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let desired = claude_dcg_hook().unwrap();
+        let hook = canonical_dcg_hook(&healed);
+        assert_eq!(hook["command"], desired["command"]);
+        assert_eq!(hook["timeout"], 10, "self-heal must not drop the timeout");
+
+        // And a second pass is a no-op: the timeout does not re-trigger repair.
+        let before = std::fs::read_to_string(&settings_path).unwrap();
+        ensure_hook_registered_at(&settings_path, &lock_path).unwrap();
+        assert_eq!(before, std::fs::read_to_string(&settings_path).unwrap());
     }
 
     #[test]

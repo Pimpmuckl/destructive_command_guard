@@ -23,7 +23,7 @@ enabled = ["kubernetes", "database", "containers"]
 | [cloud](cloud.md) | 3 | AWS CLI, Google Cloud SDK, Azure CLI |
 | [containers](containers.md) | 3 | Docker, Docker Compose, Podman |
 | [core](core.md) | 2 | Core Git, Core Filesystem |
-| [database](database.md) | 8 | PostgreSQL, MySQL/MariaDB, MongoDB, ... |
+| [database](database.md) | 9 | PostgreSQL, MySQL/MariaDB, MongoDB, ... |
 | [dns](dns.md) | 3 | Cloudflare DNS, AWS Route53, Generic DNS Tools |
 | [email](email.md) | 4 | AWS SES, SendGrid, Mailgun, ... |
 | [featureflags](featureflags.md) | 4 | Flipt, LaunchDarkly, Split.io, ... |
@@ -37,7 +37,8 @@ enabled = ["kubernetes", "database", "containers"]
 | [platform](platform.md) | 5 | GitHub Platform, GitLab Platform, Railway Platform, ... |
 | [remote](remote.md) | 3 | rsync, ssh, scp |
 | [search](search.md) | 4 | Elasticsearch, OpenSearch, Algolia, ... |
-| [secrets](secrets.md) | 4 | HashiCorp Vault, AWS Secrets Manager, 1Password CLI, ... |
+| [secret_disclosure](secret_disclosure.md) | 1 | Secret Value Disclosure |
+| [secrets](secrets.md) | 5 | HashiCorp Vault, AWS Secrets Manager, 1Password CLI, ... |
 | [storage](storage.md) | 4 | AWS S3, Google Cloud Storage, MinIO, ... |
 | [strict_git](strict_git.md) | 1 | Strict Git |
 | [system](system.md) | 3 | Disk Operations, Permissions, Services |
@@ -62,6 +63,8 @@ enabled = ["kubernetes", "database", "containers"]
 - [`secrets.aws_secrets`](secrets.md#secretsaws_secrets)
 - [`secrets.onepassword`](secrets.md#secretsonepassword)
 - [`secrets.doppler`](secrets.md#secretsdoppler)
+- [`secrets.infisical`](secrets.md#secretsinfisical)
+- [`secret_disclosure`](secret_disclosure.md#secret_disclosure)
 - [`platform.github`](platform.md#platformgithub)
 - [`platform.gitlab`](platform.md#platformgitlab)
 - [`platform.railway`](platform.md#platformrailway)
@@ -108,6 +111,7 @@ enabled = ["kubernetes", "database", "containers"]
 - [`database.redis`](database.md#databaseredis)
 - [`database.sqlite`](database.md#databasesqlite)
 - [`database.bigquery`](database.md#databasebigquery)
+- [`database.databricks`](database.md#databasedatabricks)
 - [`database.snowflake`](database.md#databasesnowflake)
 - [`database.supabase`](database.md#databasesupabase)
 - [`containers.docker`](containers.md#containersdocker)

@@ -238,6 +238,8 @@ CURSOR_VERSION=""
 COPILOT_VERSION=""
 HERMES_VERSION=""
 POSIT_ASSISTANT_VERSION=""
+OPENCODE_VERSION=""
+OMP_VERSION=""
 
 print_agent_scan_notice() {
   [ "$QUIET" -eq 1 ] && return 0
@@ -298,6 +300,85 @@ posit_assistant_installed() {
   [ -d "$HOME/.posit/assistant" ] ||
     [ -d "$HOME/.positai" ] ||
     command -v pa >/dev/null 2>&1
+}
+
+# Validate the complete profile value as one ASCII pathname component. A
+# line-oriented grep would accept a valid first line and ignore an injected
+# second line, so keep this check inside Bash's whole-string pattern matcher.
+omp_profile_has_ascii_shape() {
+  local profile="$1"
+  case "$profile" in
+    [abcdefghijklmnopqrstuvwxyz0123456789]*)
+      case "$profile" in
+        *[!abcdefghijklmnopqrstuvwxyz0123456789._-]*) return 1 ;;
+        *) return 0 ;;
+      esac
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# Mirror Node's POSIX `path.join(HOME, PI_CONFIG_DIR || ".omp")` without
+# requiring Node to be installed. This is lexical by design: repeated `/`, `.`
+# and `..` components are normalized, extra parents stop at `/`, and a leading
+# backslash remains an ordinary filename byte on POSIX.
+resolve_omp_config_root() {
+  local config_name="${PI_CONFIG_DIR:-.omp}"
+  local remaining="$HOME/$config_name"
+  local absolute=0
+  local segment
+  local component
+  local result=""
+  local count
+  local last
+  local -a components=()
+
+  case "$remaining" in
+    /*) absolute=1 ;;
+  esac
+
+  while [ -n "$remaining" ]; do
+    case "$remaining" in
+      */*)
+        segment="${remaining%%/*}"
+        remaining="${remaining#*/}"
+        ;;
+      *)
+        segment="$remaining"
+        remaining=""
+        ;;
+    esac
+    case "$segment" in
+      "" | .) ;;
+      ..)
+        count=${#components[@]}
+        if [ "$count" -gt 0 ]; then
+          last=$((count - 1))
+          if [ "${components[$last]}" != ".." ]; then
+            unset "components[$last]"
+          elif [ "$absolute" -eq 0 ]; then
+            components[${#components[@]}]=".."
+          fi
+        elif [ "$absolute" -eq 0 ]; then
+          components[0]=".."
+        fi
+        ;;
+      *) components[${#components[@]}]="$segment" ;;
+    esac
+  done
+
+  [ "$absolute" -eq 1 ] && result="/"
+  for component in ${components[@]+"${components[@]}"}; do
+    if [ "$result" = "/" ]; then
+      result="/$component"
+    elif [ -z "$result" ]; then
+      result="$component"
+    else
+      result="$result/$component"
+    fi
+  done
+  [ -n "$result" ] || result="."
+  printf '%s\n' "$result"
 }
 
 detect_agents() {
@@ -379,6 +460,18 @@ detect_agents() {
     DETECTED_AGENTS+=("opencode")
     OPENCODE_VERSION=$(try_version opencode)
   fi
+
+  # Oh My Pi (`omp`) — require an external executable on PATH. Config/profile
+  # state can outlive an uninstall, while command lookup also accepts aliases
+  # and functions that the non-interactive installer cannot safely identify as
+  # OMP. Resolve the exact disk candidate once, require a regular executable,
+  # and use that path for version lookup.
+  local omp_bin
+  omp_bin=$(builtin type -P omp 2>/dev/null || true)
+  if [[ -n "$omp_bin" && -f "$omp_bin" && -x "$omp_bin" ]]; then
+    DETECTED_AGENTS+=("omp")
+    OMP_VERSION=$(try_version "$omp_bin")
+  fi
 }
 
 print_detected_agents() {
@@ -446,6 +539,11 @@ print_detected_agents() {
           [[ -n "$OPENCODE_VERSION" ]] && ver_info=" (${OPENCODE_VERSION})"
           gum style --foreground 42 "  ✓ OpenCode${ver_info}"
           ;;
+        omp)
+          local ver_info=""
+          [[ -n "$OMP_VERSION" ]] && ver_info=" (${OMP_VERSION})"
+          gum style --foreground 42 "  ✓ Oh My Pi (omp)${ver_info}"
+          ;;
       esac
     done
     echo ""
@@ -503,6 +601,11 @@ print_detected_agents() {
           local ver_info=""
           [[ -n "$OPENCODE_VERSION" ]] && ver_info=" (${OPENCODE_VERSION})"
           echo -e "  \033[0;32m✓\033[0m OpenCode${ver_info}"
+          ;;
+        omp)
+          local ver_info=""
+          [[ -n "$OMP_VERSION" ]] && ver_info=" (${OMP_VERSION})"
+          echo -e "  \033[0;32m✓\033[0m Oh My Pi (omp)${ver_info}"
           ;;
       esac
     done
@@ -1527,15 +1630,51 @@ if [ "$NO_CHECKSUM" -eq 1 ]; then
   warn "Verification skipped (--no-verify)"
 else
   if [ -z "$CHECKSUM" ]; then
+    # Resolution order mirrors install.ps1: (1) per-artifact `<asset>.sha256`
+    # (or --checksum-url); (2) aggregate `SHA256SUMS.txt` / `SHA256SUMS` in
+    # the same release, selecting the row whose filename matches the asset.
+    # Releases produced by the manual/DSR pipeline publish only the aggregate
+    # manifest, so the per-artifact 404 must not abort the install (#342).
+    CHECKSUM_FILE="$TMP/checksum.sha256"
+    EXPLICIT_CHECKSUM_URL="$CHECKSUM_URL"
     [ -z "$CHECKSUM_URL" ] && CHECKSUM_URL="${URL}.sha256"
     info "Fetching checksum from ${CHECKSUM_URL}"
-    CHECKSUM_FILE="$TMP/checksum.sha256"
-    if ! curl -fsSL "$CHECKSUM_URL" -o "$CHECKSUM_FILE"; then
-      err "Checksum required and could not be fetched"
+    if curl -fsSL "$CHECKSUM_URL" -o "$CHECKSUM_FILE"; then
+      CHECKSUM=$(awk 'NF { print $1; exit }' "$CHECKSUM_FILE")
+    elif [ -n "$EXPLICIT_CHECKSUM_URL" ]; then
+      # An operator-supplied URL that fails is an error, not a fallback case.
+      err "Checksum could not be fetched from --checksum-url ${EXPLICIT_CHECKSUM_URL}"
       err "Use --no-verify to skip checksum verification (not recommended)"
       exit 1
+    else
+      RELEASE_BASE_URL="${URL%/*}"
+      MANIFEST_FILE="$TMP/SHA256SUMS"
+      for MANIFEST_NAME in SHA256SUMS.txt SHA256SUMS; do
+        MANIFEST_URL="${RELEASE_BASE_URL}/${MANIFEST_NAME}"
+        info "Per-artifact checksum not published; trying ${MANIFEST_URL}"
+        if ! curl -fsSL "$MANIFEST_URL" -o "$MANIFEST_FILE"; then
+          continue
+        fi
+        # Manifest rows are `<hash>  <file>` (optionally `*<file>` for
+        # binary mode); match on the basename so `dir/file` rows work too.
+        CHECKSUM=$(awk -v want="$TAR" '
+          NF >= 2 {
+            file = $2
+            sub(/^\*/, "", file)
+            sub(/^.*\//, "", file)
+            if (file == want && $1 ~ /^[0-9a-fA-F]{64}$/) { print $1; exit }
+          }' "$MANIFEST_FILE")
+        if [ -n "$CHECKSUM" ]; then
+          break
+        fi
+      done
+      if [ -z "$CHECKSUM" ]; then
+        err "Checksum required and could not be fetched"
+        err "Tried ${URL}.sha256 and the release SHA256SUMS manifest"
+        err "Use --no-verify to skip checksum verification (not recommended)"
+        exit 1
+      fi
     fi
-    CHECKSUM=$(awk '{print $1}' "$CHECKSUM_FILE")
     if [ -z "$CHECKSUM" ]; then
       err "Empty checksum file"
       exit 1
@@ -1707,6 +1846,8 @@ POSIT_ASSISTANT_STATUS=""  # "created"|"merged"|"already"|"skipped"|"failed"
 POSIT_ASSISTANT_FAILURE_REASON=""
 OPENCODE_STATUS=""  # "created"|"merged"|"skipped"|"failed"|"conflict"
 OPENCODE_FAILURE_REASON=""
+OMP_STATUS=""  # "created"|"merged"|"skipped"|"failed"|"conflict"
+OMP_FAILURE_REASON=""
 POSIT_ASSISTANT_BACKUP=""
 CLAUDE_BACKUP=""
 GEMINI_BACKUP=""
@@ -3829,6 +3970,107 @@ configure_opencode() {
   return 1
 }
 
+resolve_omp_agent_dir() {
+  # Keep the shell installer's status probe in lock-step with OMP/dcg's active
+  # profile resolver. In particular, named profiles ignore the legacy
+  # PI_CODING_AGENT_DIR override and OMP_PROFILE (even empty) wins PI_PROFILE.
+  local config_root
+  # Command substitution strips every trailing LF. Keep a non-LF sentinel
+  # after the resolver's framing newline, then remove exactly the sentinel and
+  # framing byte so LF bytes belonging to the path remain intact.
+  config_root=$(resolve_omp_config_root; printf '\034')
+  config_root="${config_root%$'\034'}"
+  config_root="${config_root%$'\n'}"
+  local profile=""
+  if [ "${OMP_PROFILE+x}" = "x" ]; then
+    profile="$OMP_PROFILE"
+  elif [ "${PI_PROFILE+x}" = "x" ]; then
+    profile="$PI_PROFILE"
+  fi
+  profile=$(printf '%s' "$profile" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  local profile_base="${profile%%.*}"
+  local profile_reserved=0
+  case "$profile_base" in
+    con|prn|aux|nul|com[0-9]|lpt[0-9]) profile_reserved=1 ;;
+  esac
+  if [ -n "$profile" ] && [ "$profile" != "default" ] &&
+     [ "${profile%.}" = "$profile" ] && [ "${#profile}" -le 64 ] &&
+     [ "$profile_reserved" -eq 0 ] &&
+     omp_profile_has_ascii_shape "$profile"; then
+    printf '%s\n' "$config_root/profiles/$profile/agent"
+  elif [ -n "${PI_CODING_AGENT_DIR:-}" ]; then
+    # OMP's setProfile() exports its derived profile path through this legacy
+    # variable. If OMP_PROFILE later selects default mode, PI_PROFILE can be a
+    # lower-priority provenance tag for a now-stale value. Suppress only that
+    # exact derivation; path-shaped and near-match overrides remain custom.
+    local legacy_profile="${PI_PROFILE-}"
+    legacy_profile=$(printf '%s' "$legacy_profile" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    local legacy_profile_base="${legacy_profile%%.*}"
+    local legacy_profile_reserved=0
+    case "$legacy_profile_base" in
+      con|prn|aux|nul|com[0-9]|lpt[0-9]) legacy_profile_reserved=1 ;;
+    esac
+    if { [ -z "$profile" ] || [ "$profile" = "default" ]; } &&
+       [ -n "$legacy_profile" ] && [ "$legacy_profile" != "default" ] &&
+       [ "${legacy_profile%.}" = "$legacy_profile" ] &&
+       [ "${#legacy_profile}" -le 64 ] &&
+       [ "$legacy_profile_reserved" -eq 0 ] &&
+       omp_profile_has_ascii_shape "$legacy_profile" &&
+       [ "$PI_CODING_AGENT_DIR" = "$config_root/profiles/$legacy_profile/agent" ]; then
+      printf '%s\n' "$config_root/agent"
+    else
+      printf '%s\n' "$PI_CODING_AGENT_DIR"
+    fi
+  else
+    printf '%s\n' "$config_root/agent"
+  fi
+}
+
+configure_omp() {
+  # The freshly installed dcg binary generates OMP's native ExtensionAPI
+  # module. `--force` refreshes only marker-owned files, which also keeps the
+  # embedded absolute binary path current after upgrades.
+  if ! is_agent_detected "omp"; then
+    OMP_STATUS="skipped"
+    return 0
+  fi
+
+  local dcg_bin="$DEST/dcg"
+  if [ ! -x "$dcg_bin" ]; then
+    OMP_STATUS="failed"
+    OMP_FAILURE_REASON="dcg binary not found at $dcg_bin"
+    return 1
+  fi
+
+  local agent_dir
+  agent_dir=$(resolve_omp_agent_dir; printf '\034')
+  agent_dir="${agent_dir%$'\034'}"
+  agent_dir="${agent_dir%$'\n'}"
+  local extension_path="$agent_dir/extensions/dcg-guard.ts"
+  local existed=0
+  [ -f "$extension_path" ] && existed=1
+
+  local output
+  if output=$("$dcg_bin" install --omp --force 2>&1); then
+    if [ "$existed" -eq 1 ]; then
+      OMP_STATUS="merged"
+    else
+      OMP_STATUS="created"
+    fi
+    AUTO_CONFIGURED=1
+    return 0
+  fi
+
+  if printf '%s' "$output" | grep -q "was not generated by dcg"; then
+    OMP_STATUS="conflict"
+    OMP_FAILURE_REASON="existing OMP dcg-guard.ts is not dcg-owned"
+  else
+    OMP_STATUS="failed"
+    OMP_FAILURE_REASON=$(printf '%s' "$output" | tail -n 1)
+  fi
+  return 1
+}
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Run Auto-Configuration
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3905,6 +4147,11 @@ if [ "$NO_CONFIGURE" -eq 0 ]; then
 
   # Configure OpenCode (if installed)
   configure_opencode
+
+  # Configure Oh My Pi (if installed)
+  # A refusal/failure is a terminal OMP_STATUS state rendered in the summary;
+  # do not let `set -e` erase that truthful result or abort other install work.
+  configure_omp || true
 else
   info "Skipping agent configuration (--no-configure)"
 fi
@@ -4175,6 +4422,29 @@ case "$OPENCODE_STATUS" in
       summary_lines+=("OpenCode:    Configuration failed ($OPENCODE_FAILURE_REASON)")
     else
       summary_lines+=("OpenCode:    Configuration failed")
+    fi
+    ;;
+esac
+
+case "$OMP_STATUS" in
+  created)
+    summary_lines+=("Oh My Pi:    Installed native tool_call extension (dcg-guard.ts)")
+    summary_lines+=("              Restart omp to load it")
+    ;;
+  merged)
+    summary_lines+=("Oh My Pi:    Refreshed dcg-owned extension (dcg-guard.ts)")
+    ;;
+  skipped|"")
+    summary_lines+=("Oh My Pi:    Not installed (skipped)")
+    ;;
+  conflict)
+    summary_lines+=("Oh My Pi:    Skipped — existing dcg-guard.ts is not dcg-owned ($OMP_FAILURE_REASON)")
+    ;;
+  failed)
+    if [ -n "$OMP_FAILURE_REASON" ]; then
+      summary_lines+=("Oh My Pi:    Configuration failed ($OMP_FAILURE_REASON)")
+    else
+      summary_lines+=("Oh My Pi:    Configuration failed")
     fi
     ;;
 esac

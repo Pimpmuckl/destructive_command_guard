@@ -19,6 +19,7 @@ trust to well-behaved agents while maintaining strict controls for unknown ones.
 | Cursor IDE | Environment | `CURSOR_IDE=1` (set by dcg's hook script) |
 | Hermes Agent | Environment | `HERMES_AGENT=1` or `HERMES_SESSION_ID` |
 | Grok (xAI) | Environment | `GROK_SESSION_ID`, `GROK_HOOK_EVENT`, or `GROK_WORKSPACE_ROOT` |
+| Oh My Pi (`omp`) | Explicit bridge / process | Generated extension passes `--agent omp`; exact `omp` and `oh-my-pi` process names are fallback matches |
 | Pi | Environment | `PI_CODING_AGENT=true` |
 | Posit Assistant | Environment | `PA_PROJECT_DIR` (set in hook subprocesses; checked last among environment markers so agents with their own markers win — environment detection still precedes parent-process detection) |
 
@@ -30,6 +31,122 @@ Agent detection follows this priority order:
 2. **Environment variables**: Most agents set identifying env vars
 3. **Parent process inspection**: Fallback check of process tree
 4. **Unknown**: Default when no agent is detected
+
+### Oh My Pi (`omp`)
+
+Install dcg's native OMP ExtensionAPI module with:
+
+```bash
+dcg install --omp
+```
+
+The default user path is `~/.omp/agent/extensions/dcg-guard.ts`. OMP named
+profiles use `~/.omp/profiles/<name>/agent/extensions/dcg-guard.ts`; dcg follows
+OMP's `OMP_PROFILE`-before-`PI_PROFILE` precedence and honors
+`PI_CONFIG_DIR` for a config directory name relative to the user's home plus
+`PI_CODING_AGENT_DIR` for the default profile. Drive-qualified
+`PI_CONFIG_DIR` values are rejected on Windows because Rust would otherwise
+resolve them differently from OMP's home-relative `path.join` behavior. Use
+`dcg install --omp --project` to install `<cwd>/.omp/extensions/dcg-guard.ts`
+instead. OMP checks only the current working directory for native project
+extensions; it neither requires Git nor walks to an ancestor, so launch OMP
+from that same directory.
+
+The extension uses OMP's pre-execution `tool_call` event and sends each `bash`
+command to `dcg --robot test --stdin --agent omp --format json` with the dialect
+selected by OMP's execution route. Pinning the private bridge format prevents
+ambient `DCG_FORMAT` from redirecting or invalidating its compact protocol
+without removing that variable from supported environment-conditioned policy.
+The embedded install-time absolute dcg pathname is authoritative: ambient
+`DCG_BIN` cannot redirect the marker-owned guard. This binds a pathname, not a
+hash, inode/file ID, signature, or immutable executable object. Bun resolves
+that pathname again for each tool call, so moving or removing the file produces
+a visible infrastructure failure, while replacing bytes at the same pathname
+changes what a later callback executes. `dcg doctor` compares the marker-owned
+extension with source generated for the doctor process's pathname at inspection
+time; it does not attest binary contents or an extension already loaded by a
+running OMP session. To rebind deliberately, run
+`/desired/path/dcg install --omp --force` (add `--project` for project scope)
+and restart OMP. Protect the binary, extension, and their parent directories
+from writers not trusted to control OMP execution; a writer that can replace the
+extension can already run code inside OMP. Ordinary and managed-async calls use
+OMP's embedded Brush shell and pass `--dialect posix`, including on native
+Windows. An eligible local `pty: true` call instead maps OMP's configured
+external shell to `--dialect posix`, `cmd`, or `ps`; `PI_NO_PTY=1` disables that
+PTY route. A dcg deny, ask, or indeterminate result returns
+`{ block: true, reason }` to OMP.
+Because the bridge supplies `--agent omp` explicitly, OMP remains distinct from
+legacy Pi even when OMP exposes Pi-family compatibility variables. The
+canonical profile key is `agents.omp`; `oh-my-pi` is accepted as an alias.
+When `[history] enabled = true`, these robot-boundary evaluations are persisted
+with the canonical `agent_type = "omp"`; ordinary human `dcg test` diagnostics
+remain outside command history.
+
+The bridge spawns dcg directly, without a shell, and gives Bun a 30-second
+parent-side timeout with a hard kill signal. Immediately after a successful
+spawn it records one monotonic absolute deadline 30.5 seconds away and arms one
+observation watchdog. A direct child can exit while a descendant still holds
+its stdout or stderr descriptor, so exit settlement rearms that sole timer for
+the lesser of a 250-millisecond pipe-drain grace and the remaining absolute
+budget. If the remaining hard budget wins, expiry retains hard-deadline
+provenance. Exit-observation rejection attempts one direct-child `SIGKILL` and
+uses the same clamped drain; neither rearm kills again. Every active watchdog is
+cleared when observation finishes, and late exit settlement or rejection
+remains consumed. There is no retry, replacement process, or second
+concurrently active bridge watchdog.
+
+This is the finite child-observation lineage:
+
+| Current state + event | Process action | Pipe/clock action | Result invariant |
+|---|---|---|---|
+| `Bun.spawn` throws | No child exists | No watchdog is armed | One visible spawn diagnostic; fail open |
+| Spawn succeeds | Bun owns the 30-second direct-child timeout | Record and arm the monotonic 30.5-second absolute observation deadline; read both capped pipes and exit concurrently | No classification before the bounded observation settles |
+| Complete deny/ask/indeterminate frame or stdout overflow arrives | None | Retain the frame or capped overflow evidence while observation continues | Blocking evidence is absorbing |
+| Exit resolves before the hard deadline | None; the direct child is already gone | Rearm for `min(250 ms, remaining hard budget)` | Bytes already read remain eligible evidence; the absolute deadline cannot move |
+| Exit rejects before the hard deadline | Attempt one direct-child `SIGKILL` | Rearm for `min(250 ms, remaining hard budget)` without another kill | The exit fault and any kill fault remain visible; kill request alone does not prove a signal |
+| Drain grace expires | The direct child has exited or already received the rejection-path kill | Cancel both local readers | Retained block/overflow still blocks; missing evidence follows visible infrastructure fail-open |
+| Hard observation deadline expires | Attempt one direct-child `SIGKILL` | Cancel both readers and the local exit wrapper | Retained block/overflow still blocks; deadline remains visible |
+| All three observations settle first | None | Clear the active watchdog | Read signal provenance, classify once, and emit each owned diagnostic once |
+
+If a blocking frame and a deadline become runnable together, JavaScript's event
+loop imposes a total order: bytes delivered before reader cancellation are
+retained and absorbing; bytes delivered after cancellation are outside the
+observation boundary. The stdout and stderr caps bound retained memory, and the
+outer/deferred deadlines bound a standards-compliant asynchronous observation.
+If an underlying WHATWG cancellation algorithm rejects, the stream is still
+closed and pending reads settle; the bridge consumes the cancellation promise's
+rejection while retaining prior deny/ask/indeterminate and overflow evidence.
+The backstops sit above dcg's ordinary 1-second evaluator default and the broad
+Windows preset's 3-second default, not in place of those configurable budgets.
+An explicit evaluator budget above 30 seconds is nevertheless capped on this
+OMP bridge; direct hook and diagnostic invocations retain their configured
+budget.
+
+Two seams remain fundamentally outside this in-process boundary. A synchronous
+stall inside `Bun.spawn` (or any JavaScript/event-loop stall) prevents a timer
+from starting or firing. Bun's `proc.kill()` targets the direct child, not a
+process group, so it cannot prove that descendants were terminated or release
+their unrelated resources; local reader cancellation bounds the callback even
+when an inherited pipe holder survives. A non-standard stream whose synchronous
+cancel path throws without settling a pending read is likewise outside the Web
+Streams contract and cannot be bounded by another JavaScript promise. After
+observation, the bridge reads Bun's `signalCode` and reports an exact signal
+only when Bun actually exposes one; a successful `proc.kill("SIGKILL")` request
+does not itself forge SIGKILL provenance. This keeps an ordinary numeric exit
+137 distinct from an observed timeout or other observed `SIGKILL`.
+A complete deny, ask, or indeterminate verdict already written to stdout
+remains authoritative regardless of signal, cancellation, stream/exit fault,
+or deadline; stdout overflow and dcg's independent blocking exit 1 are likewise
+absorbing. Other abnormal statuses and infrastructure faults remain visible
+even when blocking evidence controls the action.
+
+OMP's public ExtensionAPI does not expose its ACP client-terminal capability or
+selected backend, and both ACP and JSON-RPC surface as `mode: "rpc"`. The bridge
+therefore does not infer a Windows dialect from mode: non-PTY RPC calls remain
+POSIX-scoped so ordinary JSON-RPC execution does not gain Cmd/PowerShell false
+positives. As a result, an ACP client-terminal call does not yet receive exact
+Cmd/PowerShell-specific coverage; closing that residual requires OMP to expose
+the actual BashTool route before the `tool_call` handler runs.
 
 ## Trust Levels
 
@@ -113,6 +230,10 @@ Configure agent profiles in your `config.toml`:
 [agents.claude-code]
 trust_level = "high"
 additional_allowlist = ["npm run build", "cargo test"]
+
+[agents.omp]
+trust_level = "medium"
+extra_packs = ["strict_git"]
 
 # Restrict unknown agents
 [agents.unknown]

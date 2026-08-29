@@ -694,8 +694,15 @@ impl ConfigLayer {
         } = self;
 
         let general = general.and_then(|general| {
-            (general.fail_closed == Some(true)).then(|| GeneralConfigLayer {
-                fail_closed: Some(true),
+            // Only monotonic tightenings survive: a repository may opt the
+            // session INTO fail-closed or deny-on-unverified, never out.
+            let fail_closed = (general.fail_closed == Some(true)).then_some(true);
+            let unverified_decision = (general.unverified_decision
+                == Some(UnverifiedDecision::Deny))
+            .then_some(UnverifiedDecision::Deny);
+            (fail_closed.is_some() || unverified_decision.is_some()).then(|| GeneralConfigLayer {
+                fail_closed,
+                unverified_decision,
                 ..GeneralConfigLayer::default()
             })
         });
@@ -802,6 +809,7 @@ struct GeneralConfigLayer {
     max_command_bytes: Option<usize>,
     max_findings_per_command: Option<usize>,
     fail_closed: Option<bool>,
+    unverified_decision: Option<UnverifiedDecision>,
     update_pin: Option<bool>,
 }
 
@@ -1772,6 +1780,19 @@ pub struct GeneralConfig {
     /// (a truthy value forces fail-closed, a falsy value forces fail-open).
     pub fail_closed: bool,
 
+    /// Decision published when dcg cannot verify a command at all (#338):
+    /// the evaluation deadline expired, or the command exceeds
+    /// `max_command_bytes`.
+    ///
+    /// The default `ask` routes the command to an explicit operator decision
+    /// on review-capable protocols (Claude-compatible, Copilot); protocols
+    /// without an `ask` decision always block. Set `deny` for unattended or
+    /// autonomous sessions, where nobody is present to answer the prompt and
+    /// an auto-approver would otherwise wave through exactly the commands dcg
+    /// declined to inspect. Override at runtime with
+    /// `DCG_UNVERIFIED_DECISION=deny|ask`.
+    pub unverified_decision: UnverifiedDecision,
+
     /// Pin the installed binary against `dcg update` (#320).
     ///
     /// When `true`, `dcg update` refuses to replace the installed binary
@@ -1782,6 +1803,29 @@ pub struct GeneralConfig {
     /// guard coverage. Override at runtime with `DCG_UPDATE_PIN`.
     /// Default: false.
     pub update_pin: bool,
+}
+
+/// Fallback decision for a command dcg could not verify (#338): evaluation
+/// deadline exhausted, or command over `general.max_command_bytes`.
+///
+/// This is deliberately a two-value enum rather than `PolicyMode`: an
+/// unverified command has no matched rule to warn or log about, so the only
+/// meaningful choices are routing it to an operator (`ask`) or refusing it
+/// (`deny`).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum UnverifiedDecision {
+    /// Route the unverified command to an explicit operator decision on
+    /// review-capable protocols. Protocols without an `ask` decision block.
+    #[default]
+    Ask,
+    /// Refuse the unverified command on every protocol. The right posture for
+    /// unattended sessions: the denial reason is actionable (shrink or split
+    /// the command), while an unanswered `ask` stalls or — worse — gets
+    /// auto-approved without inspection.
+    Deny,
 }
 
 /// Default limits for input size (used when not configured).
@@ -1802,6 +1846,7 @@ impl Default for GeneralConfig {
             check_updates: true,
             self_heal_hook: true,
             fail_closed: false,
+            unverified_decision: UnverifiedDecision::Ask,
             update_pin: false,
         }
     }
@@ -3635,10 +3680,37 @@ pub enum PatternKind {
 
 impl CompiledOverrides {
     /// Check allow overrides. Returns true if command should be allowed.
+    ///
+    /// Allow patterns are substring-matched, and this check runs *before* pack
+    /// evaluation, so on a compound command a single matching entry used to
+    /// return `allowed` for text it never examined: an entry naming a scratch
+    /// path allowed that path plus whatever followed the `&&` (#340). A
+    /// safe segment silencing a destructive one is the same bypass class
+    /// `split_command_segments` already closes for pack patterns, so allow
+    /// overrides now clear each segment on its own terms.
+    ///
+    /// A single-segment command keeps the historical whole-string semantics.
+    /// A compound command is allowed only when every segment is itself
+    /// allowed; an entry that covers one segment no longer speaks for the
+    /// rest, and anything uncovered falls through to normal evaluation.
+    /// Anchored entries compose across a chain for the first time as a
+    /// result — previously `^a$` and `^b$` allowed neither half of `a && b`.
     #[inline]
     #[must_use]
     pub fn check_allow(&self, command: &str) -> bool {
-        self.allow.iter().any(|o| o.matches(command))
+        if self.allow.is_empty() {
+            return false;
+        }
+
+        let segments = crate::packs::split_command_segments(command);
+        if segments.len() <= 1 {
+            return self.allow.iter().any(|o| o.matches(command));
+        }
+
+        segments.iter().all(|segment| {
+            let segment = segment.trim();
+            segment.is_empty() || self.allow.iter().any(|o| o.matches(segment))
+        })
     }
 
     /// Check block overrides. Returns the reason if command should be blocked.
@@ -4225,6 +4297,9 @@ impl Config {
         }
         if let Some(fail_closed) = general.fail_closed {
             self.general.fail_closed = fail_closed;
+        }
+        if let Some(unverified_decision) = general.unverified_decision {
+            self.general.unverified_decision = unverified_decision;
         }
         if let Some(update_pin) = general.update_pin {
             self.general.update_pin = update_pin;
@@ -4839,6 +4914,24 @@ impl Config {
         self.general.fail_closed
     }
 
+    /// Whether an unverified command (deadline exhausted, or over the command
+    /// size limit) must be denied instead of routed to `ask` (#338).
+    ///
+    /// The `DCG_UNVERIFIED_DECISION` environment variable overrides the
+    /// configured `general.unverified_decision`: `deny` forces denial, `ask`
+    /// forces the default review routing, anything else is ignored.
+    #[must_use]
+    pub fn unverified_denies(&self) -> bool {
+        if let Ok(value) = env::var(format!("{ENV_PREFIX}_UNVERIFIED_DECISION")) {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "deny" => return true,
+                "ask" => return false,
+                _ => {}
+            }
+        }
+        self.general.unverified_decision == UnverifiedDecision::Deny
+    }
+
     /// Get the effective pack configuration for a specific project path.
     #[must_use]
     pub fn effective_packs_for_project(&self, project_path: &Path) -> PacksConfig {
@@ -4963,6 +5056,49 @@ impl Config {
         packs.insert("core".to_string());
 
         packs
+    }
+
+    /// Remove an agent profile's pack exclusions from an already-expanded set.
+    ///
+    /// [`Self::enabled_pack_ids_for_agent`] applies profile exclusions to the
+    /// configured built-in packs. Callers then auto-enable external packs, so
+    /// those later contributions need the same final exclusion pass. Core
+    /// packs remain mandatory regardless of profile settings.
+    pub fn remove_disabled_packs_for_agent(
+        &self,
+        enabled_packs: &mut HashSet<String>,
+        agent: &crate::agent::Agent,
+    ) {
+        let profile = self.agents.profile_for_agent(agent);
+        for disabled in &profile.disabled_packs {
+            if disabled == "core" || disabled.starts_with("core.") {
+                continue;
+            }
+            enabled_packs.remove(disabled);
+            enabled_packs.retain(|pack| !pack.starts_with(&format!("{disabled}.")));
+        }
+    }
+
+    /// Apply an agent profile to already-loaded project/user/system allowlists.
+    ///
+    /// Disabling allowlists is deliberately absolute: it removes both the
+    /// loaded layers and the profile's own additional exact commands. When
+    /// enabled, agent commands are prepended as the highest-precedence layer.
+    #[must_use]
+    pub fn apply_agent_allowlist_profile(
+        &self,
+        agent: &crate::agent::Agent,
+        mut allowlists: crate::allowlist::LayeredAllowlist,
+    ) -> crate::allowlist::LayeredAllowlist {
+        if self.allowlist_disabled_for_agent(agent) {
+            return crate::allowlist::LayeredAllowlist::default();
+        }
+
+        allowlists.prepend_agent_exact_commands(
+            agent.config_key(),
+            self.additional_allowlist_for_agent(agent),
+        );
+        allowlists
     }
 
     /// Get additional allowlist entries for an agent.
@@ -6206,6 +6342,50 @@ batch_flush_interval_ms = 29
         );
         // Sibling field from the same section is honored too (sanity).
         assert!(config.general.verbose);
+    }
+
+    #[test]
+    fn unverified_decision_defaults_to_ask_and_merges_from_config_file() {
+        // #338: the unverified fallback is `ask` unless configured.
+        let config = Config::default();
+        assert_eq!(config.general.unverified_decision, UnverifiedDecision::Ask);
+
+        let layer: ConfigLayer =
+            toml::from_str("[general]\nunverified_decision = \"deny\"\n").expect("layer parses");
+        let mut config = Config::default();
+        config.merge_layer(layer);
+        assert_eq!(
+            config.general.unverified_decision,
+            UnverifiedDecision::Deny,
+            "unverified_decision from a config file must survive the layer merge"
+        );
+
+        // An explicit `ask` in a later layer relaxes an earlier `deny` (both
+        // came from operator-owned layers; only repo configs are restricted).
+        let layer: ConfigLayer =
+            toml::from_str("[general]\nunverified_decision = \"ask\"\n").expect("layer parses");
+        config.merge_layer(layer);
+        assert_eq!(config.general.unverified_decision, UnverifiedDecision::Ask);
+    }
+
+    #[test]
+    fn unverified_decision_from_repo_config_is_tighten_only() {
+        // #338 + repo-config threat model: an attacker-controlled `.dcg.toml`
+        // may opt a session INTO deny-on-unverified, never out of it.
+        let deny_layer: ConfigLayer =
+            toml::from_str("[general]\nunverified_decision = \"deny\"\nverbose = true\n")
+                .expect("layer parses");
+        let restricted = deny_layer.into_restricted_project_policy();
+        let general = restricted.general.expect("deny retained");
+        assert_eq!(general.unverified_decision, Some(UnverifiedDecision::Deny));
+        assert_eq!(general.verbose, None, "non-security fields are dropped");
+
+        let ask_layer: ConfigLayer =
+            toml::from_str("[general]\nunverified_decision = \"ask\"\n").expect("layer parses");
+        assert!(
+            ask_layer.into_restricted_project_policy().general.is_none(),
+            "a repository must not be able to relax deny back to ask"
+        );
     }
 
     #[test]
@@ -7525,6 +7705,73 @@ enabled = false
         assert!(!compiled.check_allow("git status"));
     }
 
+    /// #340: an unanchored allow entry is substring-matched against the whole
+    /// command, and `check_allow` short-circuits before pack evaluation. One
+    /// matching segment therefore used to carry every other segment with it.
+    #[test]
+    fn unanchored_allow_override_does_not_launder_later_segments() {
+        let overrides = OverridesConfig {
+            allow: vec![AllowOverride::Simple(
+                "git stash list /srv/scratch/build".to_string(),
+            )],
+            block: vec![],
+            ..Default::default()
+        };
+        let compiled = overrides.compile();
+
+        // The entry still allows exactly what it names.
+        assert!(compiled.check_allow("git stash list /srv/scratch/build"));
+
+        // But it no longer speaks for a second segment it never matched.
+        for command in [
+            "git stash list /srv/scratch/build && git reset --hard",
+            "git stash list /srv/scratch/build; git reset --hard",
+            "git stash list /srv/scratch/build || git reset --hard",
+            "git stash list /srv/scratch/build | git reset --hard",
+        ] {
+            assert!(
+                !compiled.check_allow(command),
+                "allow entry laundered a trailing segment: {command}"
+            );
+        }
+    }
+
+    /// A command substitution is returned as its own segment, so a safe outer
+    /// command cannot carry a destructive inner one past the allow check.
+    #[test]
+    fn allow_override_does_not_launder_command_substitution() {
+        let overrides = OverridesConfig {
+            allow: vec![AllowOverride::Simple("echo".to_string())],
+            block: vec![],
+            ..Default::default()
+        };
+        let compiled = overrides.compile();
+
+        assert!(compiled.check_allow("echo hello"));
+        assert!(!compiled.check_allow("echo $(git reset --hard)"));
+    }
+
+    /// Every segment being independently allowed is still allowed, and anchored
+    /// entries now compose across a chain (previously neither half matched the
+    /// whole string, so the compound was denied).
+    #[test]
+    fn allow_override_permits_fully_covered_compound() {
+        let overrides = OverridesConfig {
+            allow: vec![
+                AllowOverride::Simple("^git stash list$".to_string()),
+                AllowOverride::Simple("^git status$".to_string()),
+            ],
+            block: vec![],
+            ..Default::default()
+        };
+        let compiled = overrides.compile();
+
+        assert!(compiled.check_allow("git stash list"));
+        assert!(compiled.check_allow("git stash list && git status"));
+        assert!(compiled.check_allow("git status; git stash list"));
+        assert!(!compiled.check_allow("git stash list && git reset --hard"));
+    }
+
     #[test]
     fn test_compile_block_override() {
         let overrides = OverridesConfig {
@@ -8694,6 +8941,14 @@ enabled = false
                 ..Default::default()
             },
         );
+        config.profiles.insert(
+            "oh-my-pi".to_string(),
+            AgentProfile {
+                trust_level: TrustLevel::High,
+                additional_allowlist: vec!["cargo test".to_string()],
+                ..Default::default()
+            },
+        );
 
         let codex_profile = config.profile_for_agent(&Agent::CodexCli);
         assert_eq!(codex_profile.trust_level, TrustLevel::High);
@@ -8706,6 +8961,14 @@ enabled = false
         let claude_profile = config.profile_for("claude-code");
         assert_eq!(claude_profile.trust_level, TrustLevel::Low);
         assert!(claude_profile.disabled_allowlist);
+
+        let omp_profile = config.profile_for_agent(&Agent::Omp);
+        assert_eq!(omp_profile.trust_level, TrustLevel::High);
+        assert!(
+            omp_profile
+                .additional_allowlist
+                .contains(&"cargo test".to_string())
+        );
     }
 
     #[test]
@@ -9321,9 +9584,17 @@ low = "disabled"
             ConfigFileAuthority::EnforcementOnly,
             true,
         );
-        assert!(traced_layer.is_some());
         let traced_outcome = traced_outcome.expect("tracing requested");
-        assert_eq!(traced_outcome.status, ConfigFileStatus::Loaded);
+        #[cfg(unix)]
+        {
+            assert!(traced_layer.is_some());
+            assert_eq!(traced_outcome.status, ConfigFileStatus::Loaded);
+        }
+        #[cfg(not(unix))]
+        {
+            assert!(traced_layer.is_none());
+            assert_eq!(traced_outcome.status, ConfigFileStatus::IgnoredUnsupported);
+        }
         assert_eq!(
             traced_outcome.authority,
             ConfigFileAuthority::EnforcementOnly

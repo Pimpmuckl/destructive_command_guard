@@ -6,25 +6,103 @@
 #![allow(clippy::doc_markdown, clippy::uninlined_format_args)]
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Path to the DCG binary (uses same target directory as the test binary).
+/// The denial path writes an allow-once record. Parallel cases must not race
+/// each other for the same bounded store lock and then mistake the deliberate
+/// code-less contention fallback for a wire-schema regression.
+static HOOK_PROCESS_LOCK: Mutex<()> = Mutex::new(());
+
+fn test_state_stem() -> &'static Path {
+    static STATE_STEM: OnceLock<PathBuf> = OnceLock::new();
+    STATE_STEM
+        .get_or_init(|| {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock must be after the Unix epoch")
+                .as_nanos();
+            std::env::temp_dir().join(format!(
+                "dcg-agent-hook-output-{}-{nonce}",
+                std::process::id()
+            ))
+        })
+        .as_path()
+}
+
+fn test_state_path(suffix: &str) -> PathBuf {
+    let mut path = test_state_stem().as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
+/// Fence hook subprocesses away from the caller's dcg state.
+///
+/// The explicit pending/allow-once paths are the causal isolation for these
+/// tests: denial metadata is omitted by design when the bounded pending-store
+/// lock cannot be acquired. The HOME-family variables keep the subprocess from
+/// reading the caller's ordinary user configuration on platforms where those
+/// variables define it; they are not intended to replace the explicit store
+/// paths.
+fn configure_isolated_hook_child(command: &mut Command) {
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_string_lossy()
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("DCG_"))
+        {
+            command.env_remove(key);
+        }
+    }
+
+    let test_home = test_state_path("-home");
+    let test_config =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/e2e/fixtures/configs/minimal.toml");
+    assert!(
+        test_config.is_file(),
+        "isolated hook config fixture is missing: {}",
+        test_config.display()
+    );
+    command
+        .env("HOME", &test_home)
+        .env("USERPROFILE", &test_home)
+        .env("XDG_CONFIG_HOME", test_home.join(".config"))
+        .env("XDG_DATA_HOME", test_home.join(".local/share"))
+        .env("APPDATA", test_home.join("AppData/Roaming"))
+        .env("LOCALAPPDATA", test_home.join("AppData/Local"))
+        .env("ProgramData", &test_home)
+        .env("DCG_CONFIG", test_config)
+        .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        .env("DCG_HISTORY_DISABLED", "1")
+        .env("DCG_SELF_HEAL_HOOK", "0")
+        .env(
+            "DCG_PENDING_EXCEPTIONS_PATH",
+            test_state_path("-pending-exceptions.jsonl"),
+        )
+        .env("DCG_ALLOW_ONCE_PATH", test_state_path("-allow-once.jsonl"));
+}
+
+/// Path to the exact DCG binary Cargo built for this integration test.
 fn dcg_binary() -> std::path::PathBuf {
-    let mut path = std::env::current_exe().unwrap();
-    path.pop(); // Remove test binary name
-    path.pop(); // Remove deps/
-    path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
-    path
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_dcg"))
 }
 
 /// Run dcg in hook mode with the given command as JSON input.
 fn run_hook_mode(command: &str) -> (String, String, i32) {
+    let _guard = HOOK_PROCESS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let input = format!(
         r#"{{"tool_name":"Bash","tool_input":{{"command":"{}"}}}}"#,
         command.replace('\\', "\\\\").replace('"', "\\\"")
     );
 
-    let mut child = Command::new(dcg_binary())
+    let mut child_command = Command::new(dcg_binary());
+    configure_isolated_hook_child(&mut child_command);
+    let mut child = child_command
+        .args(["--agent", "claude-code"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -84,10 +162,9 @@ fn test_hook_output_contains_permission_decision() {
         "permissionDecision field required in output"
     );
 
-    let decision = hook_output["permissionDecision"].as_str().unwrap();
-    assert!(
-        decision == "allow" || decision == "deny",
-        "permissionDecision should be 'allow' or 'deny', got: {decision}"
+    assert_eq!(
+        hook_output["permissionDecision"], "deny",
+        "git reset --hard must be denied"
     );
 }
 
@@ -100,19 +177,17 @@ fn test_hook_output_deny_has_rule_id() {
 
     let hook_output = &json["hookSpecificOutput"];
 
-    // For denied commands, ruleId should be present
-    if hook_output["permissionDecision"] == "deny" {
-        assert!(
-            hook_output.get("ruleId").is_some(),
-            "ruleId field should be present for denied commands"
-        );
+    assert_eq!(hook_output["permissionDecision"], "deny");
+    assert!(
+        hook_output.get("ruleId").is_some(),
+        "ruleId field should be present for denied commands"
+    );
 
-        let rule_id = hook_output["ruleId"].as_str().unwrap();
-        assert!(
-            rule_id.contains(':'),
-            "ruleId should have format 'packId:patternName', got: {rule_id}"
-        );
-    }
+    let rule_id = hook_output["ruleId"].as_str().unwrap();
+    assert!(
+        rule_id.contains(':'),
+        "ruleId should have format 'packId:patternName', got: {rule_id}"
+    );
 }
 
 #[test]
@@ -124,15 +199,14 @@ fn test_hook_output_deny_has_pack_id() {
 
     let hook_output = &json["hookSpecificOutput"];
 
-    if hook_output["permissionDecision"] == "deny" {
-        assert!(
-            hook_output.get("packId").is_some(),
-            "packId field should be present for denied commands"
-        );
+    assert_eq!(hook_output["permissionDecision"], "deny");
+    assert!(
+        hook_output.get("packId").is_some(),
+        "packId field should be present for denied commands"
+    );
 
-        let pack_id = hook_output["packId"].as_str().unwrap();
-        assert!(!pack_id.is_empty(), "packId should not be empty");
-    }
+    let pack_id = hook_output["packId"].as_str().unwrap();
+    assert!(!pack_id.is_empty(), "packId should not be empty");
 }
 
 #[test]
@@ -144,20 +218,19 @@ fn test_hook_output_deny_has_severity() {
 
     let hook_output = &json["hookSpecificOutput"];
 
-    if hook_output["permissionDecision"] == "deny" {
-        assert!(
-            hook_output.get("severity").is_some(),
-            "severity field should be present for denied commands"
-        );
+    assert_eq!(hook_output["permissionDecision"], "deny");
+    assert!(
+        hook_output.get("severity").is_some(),
+        "severity field should be present for denied commands"
+    );
 
-        let severity = hook_output["severity"].as_str().unwrap();
-        let valid_severities = ["critical", "high", "medium", "low"];
-        assert!(
-            valid_severities.contains(&severity),
-            "severity should be one of {:?}, got: {severity}",
-            valid_severities
-        );
-    }
+    let severity = hook_output["severity"].as_str().unwrap();
+    let valid_severities = ["critical", "high", "medium", "low"];
+    assert!(
+        valid_severities.contains(&severity),
+        "severity should be one of {:?}, got: {severity}",
+        valid_severities
+    );
 }
 
 #[test]
@@ -168,25 +241,26 @@ fn test_hook_output_deny_has_remediation() {
         serde_json::from_str(&stdout).expect("hook output should be valid JSON");
 
     let hook_output = &json["hookSpecificOutput"];
+    assert_eq!(
+        hook_output["permissionDecision"], "deny",
+        "git reset --hard must exercise the denial metadata path"
+    );
+    assert!(
+        hook_output.get("remediation").is_some(),
+        "remediation field should be present for denied commands"
+    );
 
-    if hook_output["permissionDecision"] == "deny" {
-        assert!(
-            hook_output.get("remediation").is_some(),
-            "remediation field should be present for denied commands"
-        );
+    let remediation = &hook_output["remediation"];
 
-        let remediation = &hook_output["remediation"];
-
-        // Verify remediation structure
-        assert!(
-            remediation.get("explanation").is_some(),
-            "remediation.explanation should be present"
-        );
-        assert!(
-            remediation.get("allowOnceCommand").is_some(),
-            "remediation.allowOnceCommand should be present"
-        );
-    }
+    // Verify remediation structure on an uncontended isolated store.
+    assert!(
+        remediation.get("explanation").is_some(),
+        "remediation.explanation should be present"
+    );
+    assert!(
+        remediation.get("allowOnceCommand").is_some(),
+        "remediation.allowOnceCommand should be present"
+    );
 }
 
 #[test]
@@ -197,29 +271,31 @@ fn test_hook_output_deny_has_allow_once_code() {
         serde_json::from_str(&stdout).expect("hook output should be valid JSON");
 
     let hook_output = &json["hookSpecificOutput"];
+    assert_eq!(
+        hook_output["permissionDecision"], "deny",
+        "git reset --hard must exercise the allow-once metadata path"
+    );
+    assert!(
+        hook_output.get("allowOnceCode").is_some(),
+        "allowOnceCode should be present for denied commands"
+    );
 
-    if hook_output["permissionDecision"] == "deny" {
-        assert!(
-            hook_output.get("allowOnceCode").is_some(),
-            "allowOnceCode should be present for denied commands"
-        );
+    let code = hook_output["allowOnceCode"].as_str().unwrap();
+    assert!(!code.is_empty(), "allowOnceCode should not be empty");
 
-        let code = hook_output["allowOnceCode"].as_str().unwrap();
-        assert!(!code.is_empty(), "allowOnceCode should not be empty");
-
-        // Also verify the remediation includes the allow-once command
-        if let Some(remediation) = hook_output.get("remediation") {
-            let allow_cmd = remediation["allowOnceCommand"].as_str().unwrap();
-            assert!(
-                allow_cmd.contains("dcg allow-once"),
-                "allowOnceCommand should contain 'dcg allow-once'"
-            );
-            assert!(
-                allow_cmd.contains(code),
-                "allowOnceCommand should contain the allowOnceCode"
-            );
-        }
-    }
+    // On an uncontended isolated store, remediation must carry the same code.
+    let remediation = hook_output
+        .get("remediation")
+        .expect("remediation should accompany an allowOnceCode");
+    let allow_cmd = remediation["allowOnceCommand"].as_str().unwrap();
+    assert!(
+        allow_cmd.contains("dcg allow-once"),
+        "allowOnceCommand should contain 'dcg allow-once'"
+    );
+    assert!(
+        allow_cmd.contains(code),
+        "allowOnceCommand should contain the allowOnceCode"
+    );
 }
 
 #[test]
@@ -242,13 +318,11 @@ fn test_hook_output_permission_decision_reason() {
         "permissionDecisionReason should not be empty"
     );
 
-    // For denied commands, reason should be descriptive
-    if hook_output["permissionDecision"] == "deny" {
-        assert!(
-            reason.contains("BLOCKED") || reason.contains("Reason:"),
-            "permissionDecisionReason for deny should explain the block"
-        );
-    }
+    assert_eq!(hook_output["permissionDecision"], "deny");
+    assert!(
+        reason.contains("BLOCKED") || reason.contains("Reason:"),
+        "permissionDecisionReason for deny should explain the block"
+    );
 }
 
 #[test]
@@ -314,24 +388,23 @@ fn test_hook_output_multiple_destructive_commands() {
             "hook mode should exit 0 for cmd: {cmd}\nstderr: {stderr}"
         );
 
-        if !stdout.is_empty() {
-            let json: serde_json::Value = serde_json::from_str(&stdout)
-                .unwrap_or_else(|e| panic!("invalid JSON for cmd '{cmd}': {e}\nstdout: {stdout}"));
+        assert!(!stdout.is_empty(), "destructive command was allowed: {cmd}");
+        let json: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("invalid JSON for cmd '{cmd}': {e}\nstdout: {stdout}"));
 
-            let hook_output = &json["hookSpecificOutput"];
-
-            // All denied commands should have these fields
-            if hook_output["permissionDecision"] == "deny" {
-                assert!(
-                    hook_output.get("ruleId").is_some() || hook_output.get("packId").is_some(),
-                    "denied command should have ruleId or packId: {cmd}"
-                );
-                assert!(
-                    hook_output.get("severity").is_some(),
-                    "denied command should have severity: {cmd}"
-                );
-            }
-        }
+        let hook_output = &json["hookSpecificOutput"];
+        assert_eq!(
+            hook_output["permissionDecision"], "deny",
+            "destructive command was not denied: {cmd}"
+        );
+        assert!(
+            hook_output.get("ruleId").is_some() || hook_output.get("packId").is_some(),
+            "denied command should have ruleId or packId: {cmd}"
+        );
+        assert!(
+            hook_output.get("severity").is_some(),
+            "denied command should have severity: {cmd}"
+        );
     }
 }
 
@@ -344,26 +417,23 @@ fn test_hook_output_rule_id_format() {
 
     let hook_output = &json["hookSpecificOutput"];
 
-    if let Some(rule_id) = hook_output.get("ruleId") {
-        let rule_id_str = rule_id.as_str().unwrap();
+    assert_eq!(hook_output["permissionDecision"], "deny");
+    let rule_id_str = hook_output["ruleId"]
+        .as_str()
+        .expect("denial must include a string ruleId");
 
-        // Rule ID format: "{packId}:{patternName}"
-        let parts: Vec<&str> = rule_id_str.split(':').collect();
-        assert_eq!(
-            parts.len(),
-            2,
-            "ruleId should have format 'packId:patternName', got: {rule_id_str}"
-        );
+    // Rule ID format: "{packId}:{patternName}"
+    let parts: Vec<&str> = rule_id_str.split(':').collect();
+    assert_eq!(
+        parts.len(),
+        2,
+        "ruleId should have format 'packId:patternName', got: {rule_id_str}"
+    );
 
-        // The pack_id in ruleId should match packId field
-        if let Some(pack_id) = hook_output.get("packId") {
-            assert_eq!(
-                parts[0],
-                pack_id.as_str().unwrap(),
-                "ruleId pack portion should match packId"
-            );
-        }
-    }
+    let pack_id = hook_output["packId"]
+        .as_str()
+        .expect("denial must include a string packId");
+    assert_eq!(parts[0], pack_id, "ruleId pack portion should match packId");
 }
 
 #[test]
@@ -374,6 +444,12 @@ fn test_hook_output_remediation_safe_alternative() {
         serde_json::from_str(&stdout).expect("hook output should be valid JSON");
 
     let hook_output = &json["hookSpecificOutput"];
+
+    assert_eq!(hook_output["permissionDecision"], "deny");
+    assert!(
+        hook_output.get("remediation").is_some(),
+        "denial must include remediation"
+    );
 
     if let Some(remediation) = hook_output.get("remediation") {
         // safeAlternative is optional but when present should be helpful
@@ -403,7 +479,12 @@ fn test_hook_output_remediation_safe_alternative() {
 
 /// Run dcg in hook mode with a raw JSON envelope (for non-Claude wire shapes).
 fn run_hook_mode_raw(input: &str) -> (String, String, i32) {
-    let mut child = Command::new(dcg_binary())
+    let _guard = HOOK_PROCESS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut child_command = Command::new(dcg_binary());
+    configure_isolated_hook_child(&mut child_command);
+    let mut child = child_command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -477,16 +558,8 @@ fn test_antigravity_envelope_allows_safe_command() {
 
     let (stdout, stderr, exit_code) = run_hook_mode_raw(input);
     assert_eq!(exit_code, 0, "safe command must exit 0\nstderr: {stderr}");
-
-    // dcg emits nothing (allow) or an explicit non-block decision for safe
-    // commands; in either case there must be no "block"/"deny" decision.
-    if !stdout.trim().is_empty() {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
-            let decision = json.get("decision").and_then(|d| d.as_str());
-            assert!(
-                decision != Some("block") && decision != Some("deny"),
-                "safe command must not be blocked, got decision: {decision:?}"
-            );
-        }
-    }
+    assert!(
+        stdout.trim().is_empty(),
+        "safe agy hook output must be silent, got: {stdout}"
+    );
 }

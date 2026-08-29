@@ -1,6 +1,6 @@
 {
   "name": "destructive-command-guard",
-  "version": "0.12.5-codexpp.1",
+  "version": "0.13.9-codexpp.1",
   "description": "Review destructive shell commands with Destructive Command Guard.",
   "author": {
     "name": "Pimpmuckl",
