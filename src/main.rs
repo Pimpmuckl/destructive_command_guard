@@ -554,6 +554,9 @@ fn try_deny_oversized_input(
     // scan. Codex++ deadline exhaustion is itself a dcg intervention and must
     // reach Guardian; other protocols retain upstream's fail-open fallback.
     for command in &commands {
+        if deadline.is_exceeded() && hook_protocol != hook::HookProtocol::CodexAsk {
+            break;
+        }
         // Windows made of pure padding carry no enabled keyword; skipping
         // them keeps the multi-window scan a substring search per megabyte
         // rather than a full evaluation per window.
