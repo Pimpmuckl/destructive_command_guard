@@ -312,7 +312,9 @@ fn test_audit_backtracking_requirements() {
                 "mv-tmpdir",
                 "mv-tmpdir-brace",
                 "mv-to-trash",
+                "mv-to-trash-quoted",
                 "mv-var-tmp",
+                "mv-within-home",
                 "redirect-truncate-dynamic-path",
                 "redirect-truncate-root-home",
                 "rsync-sensitive-then-delete",
@@ -350,6 +352,8 @@ fn test_audit_backtracking_requirements() {
                 "restore-staged-long",
                 "restore-staged-short",
                 "restore-worktree",
+                // Backreference pins redirect target == shown path (#373).
+                "show-redirect-overwrite-source",
             ]),
         ),
         (
