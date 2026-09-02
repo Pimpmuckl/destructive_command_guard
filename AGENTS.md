@@ -50,6 +50,7 @@ rules.
 
 ## Validate the fork contract
 
+- If Review Suite is installed, run it only in `fast` mode.
 - When the Codex decision path changes, run `cargo test --lib hook::` and
   `cargo test --test codex_hook_protocol`.
 - Follow the existing compiler, Clippy, and formatting requirements below for
